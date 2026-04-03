@@ -1,0 +1,59 @@
+# paths
+model_name:
+data_path:
+ckpt_dir:
+resume_checkpoint: null
+
+# training
+epochs: 100
+batch_size: 3
+valid_every: 1
+grad_acc: 60
+max_grad_norm: 1e2
+
+# model
+bin_num: 5
+gene_num:
+seed: 2021
+dim: 200
+depth: 6
+heads: 10
+dim_head: 64
+ff_mult: 4
+nb_features: null
+feature_redraw_interval: 1000
+ff_chunks: 1
+ff_glu: False
+emb_dropout: 0.
+ff_dropout: 0.
+attn_dropout: 0.
+use_scalenorm: False
+use_rezero: False
+no_projection: False
+tie_embed: False
+g2v_position_emb: True
+auto_check_redraw: True
+qkv_bias: True
+
+# data
+validation_split: 0.05
+mask_prob: 0.15
+replace_prob: 0.9
+random_token_prob: 0.
+mask-ignore_ids: [0]
+
+#optimizer
+learning_rate: 1e-4
+first_cycle_steps: 15
+cycle_mult: 2
+min_lr: 1e-6
+warmup_steps: 5
+gamma: 0.9
+
+
+
+
+
+
+
+

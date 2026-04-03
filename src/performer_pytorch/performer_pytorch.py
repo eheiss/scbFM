@@ -483,3 +483,4 @@ class PerformerLM(nn.Module):
                 return x
 
             return x @ self.token_emb.weight.t()
+        
