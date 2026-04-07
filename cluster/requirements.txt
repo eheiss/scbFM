@@ -1,0 +1,11 @@
+hydra-core
+omegaconf
+numpy
+scipy
+scikit-learn
+scanpy
+anndata
+h5py
+pandas
+einops
+requests

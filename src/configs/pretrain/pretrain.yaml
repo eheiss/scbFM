@@ -6,7 +6,7 @@ resume_checkpoint: null
 
 # training
 epochs: 100
-batch_size: 3
+batch_size: 1
 valid_every: 1
 grad_acc: 60
 max_grad_norm: 1e2
@@ -31,7 +31,7 @@ use_scalenorm: False
 use_rezero: False
 no_projection: False
 tie_embed: False
-g2v_position_emb: True
+g2v_position_emb: False
 auto_check_redraw: True
 qkv_bias: True
 
@@ -40,7 +40,7 @@ validation_split: 0.05
 mask_prob: 0.15
 replace_prob: 0.9
 random_token_prob: 0.
-mask-ignore_ids: [0]
+mask_ignore_token_ids: [0]
 
 #optimizer
 learning_rate: 1e-4

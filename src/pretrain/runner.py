@@ -348,12 +348,12 @@ class PreTrainRunner:
             if use_no_sync:
                 with self.model.no_sync():
                     logits = self.model(masked_batch)
-                    loss = self.loss_fn(logits.transpose(1, 2), labels) / grad_acc_steps
-                    loss.backward()
+                    loss = self.loss_fn(logits.transpose(1, 2), labels)
+                    (loss / grad_acc_steps).backward()
             else:
                 logits = self.model(masked_batch)
-                loss = self.loss_fn(logits.transpose(1, 2), labels) / grad_acc_steps
-                loss.backward()
+                loss = self.loss_fn(logits.transpose(1, 2), labels)
+                (loss / grad_acc_steps).backward()
 
             if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
