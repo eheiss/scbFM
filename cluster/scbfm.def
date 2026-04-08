@@ -5,9 +5,6 @@ From: pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
     Author Enrico Heiss
     Application scbFM
 
-%files
-    requirements.txt /tmp/requirements.txt
-
 %environment
     export LC_ALL=C.UTF-8
     export LANG=C.UTF-8
@@ -15,17 +12,19 @@ From: pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
     export PYTHONDONTWRITEBYTECODE=1
 
 %post
-    apt-get update
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        libglib2.0-0 \
-        libgl1 \
-        libhdf5-dev
-    rm -rf /var/lib/apt/lists/*
-
     python -m pip install --upgrade pip
-    python -m pip install --no-cache-dir -r /tmp/requirements.txt
+    python -m pip install --no-cache-dir \
+        hydra-core \
+        omegaconf \
+        numpy \
+        scipy \
+        scikit-learn \
+        scanpy \
+        anndata \
+        h5py \
+        pandas \
+        einops \
+        requests
 
 %runscript
     exec "$@"
