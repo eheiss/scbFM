@@ -15,7 +15,7 @@ from scipy import sparse
 # Paths
 # =========================
 
-GENE_LIST_PATH = Path("/cluster/work/boeva/eheiss/datasets/gene_list.txt")
+GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 GTEX_PATH = Path("/cluster/work/boeva/eheiss/datasets/GTEx/gtex.h5ad")
 ARCHS4_PATH = Path("/cluster/work/boeva/eheiss/datasets/ARCHS4/human_gene_v2.latest.h5")
 

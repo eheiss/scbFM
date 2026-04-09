@@ -4,6 +4,8 @@ from collections import defaultdict
 from pathlib import Path
 import gc
 import json
+import math
+import time
 
 import anndata as ad
 import numpy as np
@@ -23,9 +25,9 @@ except ImportError as exc:
 # Paths
 # =========================
 
-GENE_LIST_PATH = Path("/cluster/work/boeva/eheiss/datasets/gene_list.txt")
+GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 
-OUT_DIR = Path("/cluster/work/boeva/eheiss/datasets/preprocessed_sc")
+OUT_DIR = Path("/Users/enricoheiss/Downloads/preprocessed_sc")
 CHUNK_DIR = OUT_DIR / "census_chunks"
 MERGE_TMP_DIR = OUT_DIR / "merge_tmp"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,10 +49,12 @@ CENSUS_VERSION = "2025-11-08"
 BIN_NUM = 5
 MIN_GENES = 200
 TARGET_SUM = 1e4
-TARGET_TOTAL_CELLS = 100000
-DOWNLOAD_CHUNK_SIZE = 2000
+TARGET_TOTAL_CELLS = 700000
+DOWNLOAD_CHUNK_SIZE = 50000
 MERGE_BATCH_SIZE = 16
 RANDOM_SEED = 2021
+INITIAL_OVERDRAW_FACTOR = 1.10
+MAX_SAMPLING_ATTEMPTS = 4
 
 TILEDB_CONFIG = {
     "py.init_buffer_bytes": 256 * 1024**2,
@@ -168,7 +172,7 @@ def iter_obs_tables(census, column_names: list[str]):
     return exp.obs.read(
         column_names=column_names,
         value_filter="is_primary_data == True",
-    ).tables()
+    )
 
 
 def build_var_coords(census, gene_list: list[str]) -> tuple[list[int], list[str]]:
@@ -263,20 +267,32 @@ def reservoir_sample_cells(census, group_quotas: dict[tuple[str, str, str], int]
 
     sampled_rows = [row for reservoir in reservoirs.values() for row in reservoir]
     sampled_meta = pd.DataFrame(sampled_rows)
-    sampled_meta = sampled_meta.sample(frac=1.0, random_state=RANDOM_SEED).reset_index(drop=True)
+    sampled_meta = sampled_meta.sort_values("soma_joinid").reset_index(drop=True)
     sampled_meta.to_csv(SAMPLING_PLAN_OUT, index=False)
     return sampled_meta
 
 
-def download_and_preprocess_chunks(census, sampled_meta: pd.DataFrame, var_coords: list[int], gene_list: list[str]) -> list[Path]:
+def download_and_preprocess_chunks(
+    census,
+    sampled_meta: pd.DataFrame,
+    var_coords: list[int],
+    gene_list: list[str],
+    target_total: int,
+    attempt_id: int,
+) -> tuple[list[Path], int]:
     chunk_paths: list[Path] = []
+    kept_total = 0
 
     for chunk_id, start in enumerate(range(0, sampled_meta.shape[0], DOWNLOAD_CHUNK_SIZE)):
+        if kept_total >= target_total:
+            break
+
         end = min(start + DOWNLOAD_CHUNK_SIZE, sampled_meta.shape[0])
         meta_chunk = sampled_meta.iloc[start:end].copy()
         obs_coords = meta_chunk["soma_joinid"].astype(np.int64).tolist()
 
         print(f"Downloading CELLxGENE chunk {chunk_id}: sampled cells {start}:{end}")
+        t0 = time.perf_counter()
         adata = cellxgene_census.get_anndata(
             census=census,
             organism=ORGANISM,
@@ -284,6 +300,11 @@ def download_and_preprocess_chunks(census, sampled_meta: pd.DataFrame, var_coord
             var_coords=var_coords,
             obs_column_names=OBS_SAMPLE_COLUMNS,
             var_column_names=["feature_id"],
+        )
+        t1 = time.perf_counter()
+        print(
+            f"Chunk {chunk_id}: download finished in {t1 - t0:.1f}s "
+            f"with shape {adata.n_obs} x {adata.n_vars}"
         )
 
         feature_ids = adata.var["feature_id"].astype(str).tolist()
@@ -294,19 +315,30 @@ def download_and_preprocess_chunks(census, sampled_meta: pd.DataFrame, var_coord
 
         adata = adata[:, reorder_idx].copy()
         adata.var_names = pd.Index(gene_list, dtype=str)
+        t2 = time.perf_counter()
+        print(f"Chunk {chunk_id}: reorder finished in {t2 - t1:.1f}s")
 
         if sparse.issparse(adata.X):
             x = adata.X.toarray().astype(np.float32)
         else:
             x = np.asarray(adata.X, dtype=np.float32)
+        t3 = time.perf_counter()
+        print(f"Chunk {chunk_id}: dense conversion finished in {t3 - t2:.1f}s")
 
         x, keep_mask = preprocess_dense_block(x)
         if x.shape[0] == 0:
             del adata, x
             gc.collect()
             continue
+        t4 = time.perf_counter()
+        print(f"Chunk {chunk_id}: preprocessing finished in {t4 - t3:.1f}s")
 
         obs = adata.obs.iloc[np.where(keep_mask)[0]].copy()
+        remaining = target_total - kept_total
+        if x.shape[0] > remaining:
+            x = x[:remaining]
+            obs = obs.iloc[:remaining].copy()
+
         obs["dataset"] = "CELLxGENE_Census"
         obs.index = pd.Index([f"cellxgene:{x}" for x in obs["soma_joinid"].astype(str)], name="cell_id")
         var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
@@ -314,14 +346,20 @@ def download_and_preprocess_chunks(census, sampled_meta: pd.DataFrame, var_coord
         out = ad.AnnData(X=sparse.csr_matrix(x), obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
 
-        out_path = CHUNK_DIR / f"cellxgene_chunk_{chunk_id:05d}.h5ad"
+        out_path = CHUNK_DIR / f"cellxgene_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
         out.write(out_path)
         chunk_paths.append(out_path)
+        kept_total += out.n_obs
+        t5 = time.perf_counter()
+        print(
+            f"Chunk {chunk_id}: write finished in {t5 - t4:.1f}s "
+            f"(kept {out.n_obs}, cumulative {kept_total}/{target_total})"
+        )
 
         del adata, x, obs, var, out
         gc.collect()
 
-    return chunk_paths
+    return chunk_paths, kept_total
 
 
 def merge_chunks(chunk_paths: list[Path]) -> Path:
@@ -375,27 +413,74 @@ def main() -> None:
             )
 
         dataset_counts, group_counts_by_dataset = count_sampling_groups(census)
-        dataset_quotas, group_quotas = build_group_quotas(
-            target_total,
-            dataset_counts,
-            group_counts_by_dataset,
-        )
-        sampled_meta = reservoir_sample_cells(census, group_quotas)
+        attempt_summaries = []
+        chunk_paths = []
+
+        for attempt_id in range(MAX_SAMPLING_ATTEMPTS):
+            overdraw_factor = INITIAL_OVERDRAW_FACTOR * (2 ** attempt_id)
+            candidate_total = math.ceil(target_total * overdraw_factor)
+            print(
+                f"Sampling attempt {attempt_id + 1}/{MAX_SAMPLING_ATTEMPTS}: "
+                f"{candidate_total} candidate cells (factor {overdraw_factor:.2f})"
+            )
+
+            dataset_quotas, group_quotas = build_group_quotas(
+                candidate_total,
+                dataset_counts,
+                group_counts_by_dataset,
+            )
+            sampled_meta = reservoir_sample_cells(census, group_quotas)
+            chunk_paths, kept_total = download_and_preprocess_chunks(
+                census,
+                sampled_meta,
+                var_coords,
+                gene_list,
+                target_total=target_total,
+                attempt_id=attempt_id,
+            )
+
+            attempt_summary = {
+                "attempt_id": attempt_id,
+                "overdraw_factor": overdraw_factor,
+                "candidate_total_requested": int(candidate_total),
+                "candidate_total_sampled": int(sampled_meta.shape[0]),
+                "kept_total_after_filtering": int(kept_total),
+                "datasets_sampled": int((dataset_quotas > 0).sum()),
+                "sampling_groups_sampled": int(sum(q > 0 for q in group_quotas.values())),
+            }
+            attempt_summaries.append(attempt_summary)
+
+            if kept_total >= target_total:
+                break
+
+        if not chunk_paths or attempt_summaries[-1]["kept_total_after_filtering"] < target_total:
+            write_json(
+                {
+                    "census_version": CENSUS_VERSION,
+                    "target_total_cells": int(target_total),
+                    "target_gene_count": int(len(gene_list)),
+                    "available_primary_cells": int(dataset_counts.sum()),
+                    "datasets_seen": int(dataset_counts.shape[0]),
+                    "missing_genes": int(len(missing_genes)),
+                    "attempts": attempt_summaries,
+                },
+                SAMPLING_SUMMARY_OUT,
+            )
+            raise RuntimeError(
+                f"Unable to retain {target_total} cells after filtering. "
+                f"Last kept count: {attempt_summaries[-1]['kept_total_after_filtering']}."
+            )
 
         summary = {
             "census_version": CENSUS_VERSION,
             "target_total_cells": int(target_total),
-            "sampled_total_cells": int(sampled_meta.shape[0]),
             "target_gene_count": int(len(gene_list)),
             "available_primary_cells": int(dataset_counts.sum()),
             "datasets_seen": int(dataset_counts.shape[0]),
-            "datasets_sampled": int((dataset_quotas > 0).sum()),
-            "sampling_groups_sampled": int(sum(q > 0 for q in group_quotas.values())),
             "missing_genes": int(len(missing_genes)),
+            "attempts": attempt_summaries,
         }
         write_json(summary, SAMPLING_SUMMARY_OUT)
-
-        chunk_paths = download_and_preprocess_chunks(census, sampled_meta, var_coords, gene_list)
 
     merge_chunks(chunk_paths)
 

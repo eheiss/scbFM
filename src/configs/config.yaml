@@ -1,3 +1,6 @@
 defaults:
   - pretrain: pretrain
-  - model: null
+  - finetune:
+      - canc_type_class
+
+task: pretrain
