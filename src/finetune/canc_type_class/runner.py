@@ -39,22 +39,42 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_COHORTS = ["BRCA", "BLCA", "GBM", "LGG", "LUAD", "UCEC"]
 TASK_NAME = "canc_type_class"
 
 
 class CancTypePredHead(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
+    def __init__(
+        self,
+        seq_len: int,
+        embedding_dim: int,
+        output_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 256, bias=True)
-        self.fc2 = nn.Linear(256, 128, bias=True)
-        self.fc3 = nn.Linear(128, output_dim, bias=True)
-        self.act = nn.SELU()
+        self.conv1 = nn.Conv2d(1, 1, (1, embedding_dim))
+        self.act = nn.ReLU()
+        self.fc1 = nn.Linear(seq_len, 512, bias=True)
+        self.act1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(512, hidden_dim, bias=True)
+        self.act2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc3 = nn.Linear(hidden_dim, output_dim, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.fc1(x))
-        x = self.act(self.fc2(x))
+        x = x[:, None, :, :]
+        x = self.conv1(x)
+        x = self.act(x)
+        x = x.view(x.shape[0], -1)
+        x = self.fc1(x)
+        x = self.act1(x)
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        x = self.act2(x)
+        x = self.dropout2(x)
         return self.fc3(x)
 
 
@@ -118,13 +138,11 @@ class CancTypeClassRunner:
 
     @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
-        if "canc_type_class" in cfg and cfg.canc_type_class is not None:
-            return cfg.canc_type_class
         if "finetune" in cfg and cfg.finetune is not None and "canc_type_class" in cfg.finetune:
             return cfg.finetune.canc_type_class
         raise ValueError(
             "Could not find a cancer type classification config. "
-            "Expected cfg.canc_type_class."
+            "Expected cfg.finetune.canc_type_class."
         )
 
     @staticmethod
@@ -193,7 +211,7 @@ class CancTypeClassRunner:
         if gene_list_path:
             resolved_path = Path(hydra.utils.to_absolute_path(str(gene_list_path)))
         else:
-            resolved_path = ROOT / "data" / "gene_list.txt"
+            resolved_path = ROOT / "scbFM" / "data" / "gene_list.txt"
         with resolved_path.open() as handle:
             gene_order = [line.strip() for line in handle if line.strip()]
         if not gene_order:
@@ -383,14 +401,20 @@ class CancTypeClassRunner:
         model.load_state_dict(state_dict)
         log.info("Loaded pretrained checkpoint from %s", resolved_path)
 
+        model.to_out = CancTypePredHead(
+            seq_len=int(self.model_cfg.gene_num) + 1,
+            embedding_dim=int(self.model_cfg.dim),
+            output_dim=len(self.label_dict),
+        )
+
         if finetune_mode == "head_only":
             for param in model.parameters():
                 param.requires_grad = False
-            model.to_out = CancTypePredHead(int(self.model_cfg.dim), len(self.label_dict))
+            for param in model.to_out.parameters():
+                param.requires_grad = True
         elif finetune_mode == "full_ft":
             for param in model.parameters():
                 param.requires_grad = True
-            model.to_out = CancTypePredHead(int(self.model_cfg.dim), len(self.label_dict))
 
         model = model.to(self.device)
         if self.is_distributed:
@@ -441,7 +465,7 @@ class CancTypeClassRunner:
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
 
             with sync_context:
-                logits = self.model(data)[:, -1, :]
+                logits = self.model(data)
                 loss = self.loss_fn(logits, labels)
                 (loss / grad_acc_steps).backward()
 
@@ -477,7 +501,7 @@ class CancTypeClassRunner:
             for data, labels in self.test_loader:
                 data = data.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
-                logits = self.model(data)[:, -1, :]
+                logits = self.model(data)
                 loss = self.loss_fn(logits, labels)
                 running_loss += loss.item()
                 predictions.append(logits.argmax(dim=-1))
@@ -533,12 +557,6 @@ class CancTypeClassRunner:
         if not self.is_master:
             return None
 
-        ckpt_dir = getattr(self.task_cfg, "ckpt_dir", None)
-        if not ckpt_dir:
-            return None
-
-        checkpoint_dir = Path(hydra.utils.to_absolute_path(str(ckpt_dir)))
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
         if not self.pretrained_model_stem:
             raise RuntimeError("Pretrained model stem is unavailable. Build the model before saving.")
@@ -547,9 +565,10 @@ class CancTypeClassRunner:
             "train_test_split_version",
             getattr(self.task_cfg, "random_seed", 42),
         )
-        checkpoint_name = (
-            f"{self.pretrained_model_stem}_{TASK_NAME}_{finetune_mode}_v{split_version}.pth"
-        )
+        model_name = f"{self.pretrained_model_stem}_{TASK_NAME}_{finetune_mode}_v{split_version}"
+        checkpoint_dir = ROOT / "output" / model_name / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_name = f"{model_name}.pth"
         checkpoint_path = checkpoint_dir / checkpoint_name
 
         model = self.model.module if isinstance(self.model, DDP) else self.model

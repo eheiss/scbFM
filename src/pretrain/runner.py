@@ -30,6 +30,7 @@ from utils import (
 )
 
 log = logging.getLogger(__name__)
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def prob_mask_like(tensor, prob):
@@ -303,9 +304,9 @@ class PreTrainRunner:
         if not self.is_master:
             return None
 
-        checkpoint_dir = Path(hydra.utils.to_absolute_path(self.pretrain_cfg.ckpt_dir))
+        model_name = str(self.pretrain_cfg.model_name)
+        checkpoint_dir = ROOT / "output" / model_name / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model_name = self.pretrain_cfg.model_name
         checkpoint_path = checkpoint_dir / f"{model_name}_{epoch}.pth"
 
         model = self.model.module if isinstance(self.model, DDP) else self.model

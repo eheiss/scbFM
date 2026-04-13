@@ -1,6 +1,6 @@
 defaults:
+  - _self_
   - pretrain: pretrain
-  - finetune:
-      - canc_type_class
+  - finetune@finetune.canc_type_class: canc_type_class
 
 task: pretrain

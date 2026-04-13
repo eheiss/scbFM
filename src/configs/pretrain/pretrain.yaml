@@ -1,7 +1,6 @@
 # paths
 model_name:
 data_path:
-ckpt_dir:
 resume_checkpoint: null
 
 # training
@@ -49,7 +48,6 @@ cycle_mult: 2
 min_lr: 1e-6
 warmup_steps: 5
 gamma: 0.9
-
 
 
 

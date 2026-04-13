@@ -5,6 +5,7 @@ from pathlib import Path
 import gc
 import json
 import math
+import os
 import time
 
 import anndata as ad
@@ -49,9 +50,10 @@ CENSUS_VERSION = "2025-11-08"
 BIN_NUM = 5
 MIN_GENES = 200
 TARGET_SUM = 1e4
-TARGET_TOTAL_CELLS = 700000
-DOWNLOAD_CHUNK_SIZE = 50000
-MERGE_BATCH_SIZE = 16
+TARGET_TOTAL_CELLS = int(os.getenv("SCBFM_TARGET_TOTAL_CELLS", "700000"))
+DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_DOWNLOAD_CHUNK_SIZE", "5000"))
+PROCESS_BATCH_SIZE = int(os.getenv("SCBFM_PROCESS_BATCH_SIZE", "2048"))
+MERGE_BATCH_SIZE = int(os.getenv("SCBFM_MERGE_BATCH_SIZE", "4"))
 RANDOM_SEED = 2021
 INITIAL_OVERDRAW_FACTOR = 1.10
 MAX_SAMPLING_ATTEMPTS = 4
@@ -112,6 +114,22 @@ def preprocess_dense_block(
     return x, keep_mask
 
 
+def bin_dense_block(
+    x: np.ndarray,
+    target_sum: float = TARGET_SUM,
+    bin_num: int = BIN_NUM,
+) -> np.ndarray:
+    if x.shape[0] == 0:
+        return np.zeros((0, x.shape[1]), dtype=np.uint8)
+
+    libsize = x.sum(axis=1, keepdims=True)
+    libsize[libsize == 0] = 1.0
+    x = x / libsize * target_sum
+    x = np.log1p(x) / np.log(2.0)
+    x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
+    return x
+
+
 def write_json(data, out_path: Path) -> None:
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -154,6 +172,10 @@ def allocate_quotas(available: pd.Series, target_total: int) -> pd.Series:
             break
 
     return pd.Series(quotas, index=available.index, dtype=int)
+
+
+def estimate_dense_chunk_gib(n_obs: int, n_vars: int, dtype_bytes: int = 4) -> float:
+    return n_obs * n_vars * dtype_bytes / 1024**3
 
 
 def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
@@ -318,32 +340,67 @@ def download_and_preprocess_chunks(
         t2 = time.perf_counter()
         print(f"Chunk {chunk_id}: reorder finished in {t2 - t1:.1f}s")
 
-        if sparse.issparse(adata.X):
-            x = adata.X.toarray().astype(np.float32)
-        else:
-            x = np.asarray(adata.X, dtype=np.float32)
-        t3 = time.perf_counter()
-        print(f"Chunk {chunk_id}: dense conversion finished in {t3 - t2:.1f}s")
+        estimated_dense_gib = estimate_dense_chunk_gib(adata.n_obs, adata.n_vars)
+        print(
+            f"Chunk {chunk_id}: full dense float32 materialization would require "
+            f"~{estimated_dense_gib:.2f} GiB; processing in row batches of {PROCESS_BATCH_SIZE}"
+        )
 
-        x, keep_mask = preprocess_dense_block(x)
-        if x.shape[0] == 0:
-            del adata, x
+        x_blocks: list[sparse.csr_matrix] = []
+        obs_blocks: list[pd.DataFrame] = []
+
+        for batch_start in range(0, adata.n_obs, PROCESS_BATCH_SIZE):
+            batch_end = min(batch_start + PROCESS_BATCH_SIZE, adata.n_obs)
+            x_batch = adata.X[batch_start:batch_end]
+            obs_batch = adata.obs.iloc[batch_start:batch_end]
+
+            if sparse.issparse(x_batch):
+                keep_mask = np.asarray((x_batch > 0).sum(axis=1)).ravel() >= MIN_GENES
+                if not keep_mask.any():
+                    continue
+                x_dense = x_batch[keep_mask].toarray().astype(np.float32, copy=False)
+            else:
+                x_dense = np.asarray(x_batch, dtype=np.float32)
+                x_dense, keep_mask = preprocess_dense_block(x_dense)
+                if x_dense.shape[0] == 0:
+                    continue
+                x_blocks.append(sparse.csr_matrix(x_dense))
+                obs_blocks.append(obs_batch.iloc[np.where(keep_mask)[0]].copy())
+                continue
+
+            x_dense = bin_dense_block(x_dense)
+            x_blocks.append(sparse.csr_matrix(x_dense))
+            obs_blocks.append(obs_batch.iloc[np.where(keep_mask)[0]].copy())
+
+            del x_batch, obs_batch, x_dense, keep_mask
+            gc.collect()
+
+        t3 = time.perf_counter()
+        print(f"Chunk {chunk_id}: batched preprocessing finished in {t3 - t2:.1f}s")
+
+        if len(x_blocks) == 0:
+            del adata, x_blocks, obs_blocks
             gc.collect()
             continue
-        t4 = time.perf_counter()
-        print(f"Chunk {chunk_id}: preprocessing finished in {t4 - t3:.1f}s")
 
-        obs = adata.obs.iloc[np.where(keep_mask)[0]].copy()
+        x = sparse.vstack(x_blocks, format="csr")
+        obs = pd.concat(obs_blocks, axis=0).copy()
+        del x_blocks, obs_blocks
+        gc.collect()
+
+        t4 = time.perf_counter()
+        print(f"Chunk {chunk_id}: sparse assembly finished in {t4 - t3:.1f}s")
+
         remaining = target_total - kept_total
         if x.shape[0] > remaining:
             x = x[:remaining]
             obs = obs.iloc[:remaining].copy()
 
         obs["dataset"] = "CELLxGENE_Census"
-        obs.index = pd.Index([f"cellxgene:{x}" for x in obs["soma_joinid"].astype(str)], name="cell_id")
+        obs.index = pd.Index([f"cellxgene:{sid}" for sid in obs["soma_joinid"].astype(str)], name="cell_id")
         var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
 
-        out = ad.AnnData(X=sparse.csr_matrix(x), obs=obs, var=var)
+        out = ad.AnnData(X=x, obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
 
         out_path = CHUNK_DIR / f"cellxgene_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
