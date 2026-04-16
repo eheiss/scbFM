@@ -15,11 +15,13 @@ finetune_mode: head_only
 epochs: 10
 batch_size: 2
 grad_accumulation_steps: 3
-learning_rate: 1e-4
+head_learning_rate: 1e-4
+backbone_learning_rate: 1e-6
 max_grad_norm: 1e6
 
 first_cycle_steps: 15
 cycle_mult: 2
 min_lr: 1e-6
+min_lr_ratio:
 warmup_steps: 5
 gamma: 0.9

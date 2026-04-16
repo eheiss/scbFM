@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 from contextlib import nullcontext
 from pathlib import Path
@@ -30,7 +31,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from performer_pytorch import PerformerLM
 from utils import (
-    CosineAnnealingWarmupRestarts,
     SequentialDistributedSampler,
     distributed_concat,
     get_reduced,
@@ -76,6 +76,116 @@ class CancTypePredHead(nn.Module):
         x = self.act2(x)
         x = self.dropout2(x)
         return self.fc3(x)
+
+
+class GroupedCosineAnnealingWarmupRestarts:
+    """Cosine warmup scheduler that preserves per-parameter-group max LRs."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        first_cycle_steps: int,
+        max_lrs: list[float],
+        min_lr_ratio: float,
+        cycle_mult: float = 1.0,
+        warmup_steps: int = 0,
+        gamma: float = 1.0,
+    ) -> None:
+        if warmup_steps >= first_cycle_steps:
+            raise ValueError("warmup_steps must be smaller than first_cycle_steps.")
+        if len(max_lrs) != len(optimizer.param_groups):
+            raise ValueError("max_lrs must match optimizer.param_groups.")
+
+        self.optimizer = optimizer
+        self.first_cycle_steps = first_cycle_steps
+        self.cycle_mult = cycle_mult
+        self.base_max_lrs = [float(lr) for lr in max_lrs]
+        self.max_lrs = list(self.base_max_lrs)
+        self.min_lrs = [float(lr) * float(min_lr_ratio) for lr in self.base_max_lrs]
+        self.warmup_steps = warmup_steps
+        self.gamma = gamma
+        self.cur_cycle_steps = first_cycle_steps
+        self.cycle = 0
+        self.step_in_cycle = -1
+        self.last_epoch = -1
+        self._set_lrs(self.min_lrs)
+
+    def _set_lrs(self, lrs: list[float]) -> None:
+        for param_group, lr in zip(self.optimizer.param_groups, lrs):
+            param_group["lr"] = lr
+
+    def get_lr(self) -> list[float]:
+        if self.step_in_cycle == -1:
+            return self.min_lrs
+        if self.step_in_cycle < self.warmup_steps:
+            return [
+                min_lr + (max_lr - min_lr) * self.step_in_cycle / self.warmup_steps
+                for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
+            ]
+        return [
+            min_lr
+            + (max_lr - min_lr)
+            * (
+                1
+                + math.cos(
+                    math.pi
+                    * (self.step_in_cycle - self.warmup_steps)
+                    / (self.cur_cycle_steps - self.warmup_steps)
+                )
+            )
+            / 2
+            for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
+        ]
+
+    def step(self, epoch: int | None = None) -> None:
+        if epoch is None:
+            epoch = self.last_epoch + 1
+            self.step_in_cycle += 1
+            if self.step_in_cycle >= self.cur_cycle_steps:
+                self.cycle += 1
+                self.step_in_cycle -= self.cur_cycle_steps
+                self.cur_cycle_steps = int(
+                    (self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult
+                ) + self.warmup_steps
+        else:
+            if epoch >= self.first_cycle_steps:
+                if self.cycle_mult == 1.0:
+                    self.step_in_cycle = epoch % self.first_cycle_steps
+                    self.cycle = epoch // self.first_cycle_steps
+                else:
+                    self.cycle = int(
+                        math.log(
+                            epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1,
+                            self.cycle_mult,
+                        )
+                    )
+                    self.step_in_cycle = epoch - int(
+                        self.first_cycle_steps * (self.cycle_mult**self.cycle - 1)
+                        / (self.cycle_mult - 1)
+                    )
+                    self.cur_cycle_steps = self.first_cycle_steps * self.cycle_mult**self.cycle
+            else:
+                self.cur_cycle_steps = self.first_cycle_steps
+                self.step_in_cycle = epoch
+
+        self.max_lrs = [lr * (self.gamma**self.cycle) for lr in self.base_max_lrs]
+        self.last_epoch = math.floor(epoch)
+        self._set_lrs(self.get_lr())
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "first_cycle_steps": self.first_cycle_steps,
+            "cycle_mult": self.cycle_mult,
+            "base_max_lrs": self.base_max_lrs,
+            "max_lrs": self.max_lrs,
+            "min_lrs": self.min_lrs,
+            "warmup_steps": self.warmup_steps,
+            "gamma": self.gamma,
+            "cur_cycle_steps": self.cur_cycle_steps,
+            "cycle": self.cycle,
+            "step_in_cycle": self.step_in_cycle,
+            "last_epoch": self.last_epoch,
+        }
 
 
 class CancTypeClassDataset(Dataset):
@@ -426,19 +536,70 @@ class CancTypeClassRunner:
         self.model = model
 
     def _build_optimization(self) -> None:
-        learning_rate = float(getattr(self.task_cfg, "learning_rate", 1e-4))
-        trainable_parameters = [param for param in self.model.parameters() if param.requires_grad]
-        self.optimizer = Adam(trainable_parameters, lr=learning_rate)
-        self.scheduler = CosineAnnealingWarmupRestarts(
+        if not hasattr(self.task_cfg, "head_learning_rate"):
+            raise ValueError("finetune.canc_type_class.head_learning_rate must be set.")
+        if not hasattr(self.task_cfg, "backbone_learning_rate"):
+            raise ValueError("finetune.canc_type_class.backbone_learning_rate must be set.")
+        head_learning_rate = float(self.task_cfg.head_learning_rate)
+        backbone_learning_rate = float(self.task_cfg.backbone_learning_rate)
+
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        head_params = [param for param in model.to_out.parameters() if param.requires_grad]
+        head_param_ids = {id(param) for param in head_params}
+        backbone_params = [
+            param
+            for param in model.parameters()
+            if param.requires_grad and id(param) not in head_param_ids
+        ]
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append(
+                {
+                    "params": backbone_params,
+                    "lr": backbone_learning_rate,
+                    "name": "backbone",
+                }
+            )
+        if head_params:
+            param_groups.append(
+                {
+                    "params": head_params,
+                    "lr": head_learning_rate,
+                    "name": "head",
+                }
+            )
+        if not param_groups:
+            raise ValueError("No trainable parameters found for cancer type classification.")
+
+        max_lrs = [float(group["lr"]) for group in param_groups]
+        min_lr = float(getattr(self.task_cfg, "min_lr", 1e-6))
+        configured_min_lr_ratio = getattr(self.task_cfg, "min_lr_ratio", None)
+        min_lr_ratio = (
+            float(configured_min_lr_ratio)
+            if configured_min_lr_ratio is not None
+            else min_lr / max(head_learning_rate, 1e-12)
+        )
+
+        self.optimizer = Adam(param_groups)
+        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
             self.optimizer,
             first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 15)),
             cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 2)),
-            max_lr=learning_rate,
-            min_lr=float(getattr(self.task_cfg, "min_lr", 1e-6)),
+            max_lrs=max_lrs,
+            min_lr_ratio=min_lr_ratio,
             warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
             gamma=float(getattr(self.task_cfg, "gamma", 0.9)),
         )
         self.loss_fn = nn.CrossEntropyLoss().to(self.device)
+
+        if self.is_master:
+            group_summaries = [
+                f"{group.get('name', idx)}: params={sum(p.numel() for p in group['params'])}, "
+                f"max_lr={max_lr:.2e}, min_lr={max_lr * min_lr_ratio:.2e}"
+                for idx, (group, max_lr) in enumerate(zip(param_groups, max_lrs))
+            ]
+            log.info("Optimizer parameter groups: %s", "; ".join(group_summaries))
 
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         if self.is_distributed:
@@ -553,7 +714,12 @@ class CancTypeClassRunner:
             "n_test_samples": int(len(truths_np)),
         }
 
-    def _save_checkpoint(self, epoch: int, train_loss: float, test_metrics: dict) -> Path | None:
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        train_metrics: dict[str, float],
+        test_metrics: dict,
+    ) -> Path | None:
         if not self.is_master:
             return None
 
@@ -578,7 +744,7 @@ class CancTypeClassRunner:
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
-                "train_loss": train_loss,
+                "train_metrics": train_metrics,
                 "test_metrics": test_metrics,
                 "label_dict": self.label_dict.tolist(),
             },
@@ -618,7 +784,10 @@ class CancTypeClassRunner:
             test_metrics = self._evaluate()
             checkpoint_path = self._save_checkpoint(
                 epoch=epochs,
-                train_loss=float(last_train_metrics["loss"]),
+                train_metrics={
+                    "loss": float(last_train_metrics["loss"]),
+                    "accuracy": float(last_train_metrics["accuracy"]),
+                },
                 test_metrics=test_metrics,
             )
             if checkpoint_path is not None:
