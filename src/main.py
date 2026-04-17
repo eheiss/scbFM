@@ -4,6 +4,7 @@ import hydra
 from omegaconf import DictConfig
 
 from finetune.canc_type_class import CancTypeClassRunner
+from finetune.deconv import DeconvRunner
 from pretrain import PreTrainRunner
 
 
@@ -15,10 +16,12 @@ def main(cfg: DictConfig):
         runner = PreTrainRunner(cfg)
     elif task_name == "finetune.canc_type_class":
         runner = CancTypeClassRunner(cfg)
+    elif task_name == "finetune.deconv":
+        runner = DeconvRunner(cfg)
     else:
         raise ValueError(
             f"Unsupported task '{task_name}'. "
-            "Expected one of: ['pretrain', 'finetune.canc_type_class']."
+            "Expected one of: ['pretrain', 'finetune.canc_type_class', 'finetune.deconv']."
         )
     results = runner.run()
 

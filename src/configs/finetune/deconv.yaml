@@ -1,24 +1,25 @@
 pretrained_model_path:
-tcga_data_dir:
-gene_list_path: ../data/gene_list.txt
-
-
-cohorts: [BRCA, BLCA, GBM, LGG, LUAD, UCEC]
-merge_gbm_lgg: true
-normalized: false
-min_genes: 200
-test_size: 0.2
-random_seed: 42
-train_test_split_version: 1
+pseudo_bulk_data_path:
 
 finetune_mode: head_only
 burn_in_epochs: 3
+loss: kl
+
+test_size: 0.2
+split_by_context: true
+context_columns: [dataset_id, donor_id, tissue_general]
+random_seed: 42
+train_test_split_version: 1
+
 epochs: 10
 batch_size: 2
 grad_accumulation_steps: 3
 head_learning_rate: 1e-4
 backbone_learning_rate: 1e-6
 max_grad_norm: 1e6
+
+head_hidden_dim: 128
+head_dropout: 0.0
 
 first_cycle_steps: 15
 cycle_mult: 2

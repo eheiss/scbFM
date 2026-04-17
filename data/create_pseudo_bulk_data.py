@@ -14,13 +14,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-try:
-    import cellxgene_census
-except ImportError as exc:
-    raise ImportError(
-        "cellxgene_census is required for create_pseudo_bulk_data.py. "
-        "Run this script in the census environment where the notebook works."
-    ) from exc
+cellxgene_census = None
 
 
 # =========================
@@ -78,6 +72,7 @@ MAX_SOURCE_POOL_PER_CELLTYPE = int(
 SPARSE_SAMPLE_PROB = float(os.getenv("SCBFM_SPARSE_SAMPLE_PROB", "0.5"))
 TISSUE_COLUMN = os.getenv("SCBFM_TISSUE_COLUMN", "tissue_general")
 RESUME = os.getenv("SCBFM_PSEUDO_RESUME", "1") != "0"
+OFFLINE = os.getenv("SCBFM_PSEUDO_OFFLINE", "0") == "1"
 
 TILEDB_CONFIG = {
     "py.init_buffer_bytes": 256 * 1024**2,
@@ -110,6 +105,20 @@ def write_json(data, out_path: Path) -> None:
 def read_json(path: Path):
     with open(path) as f:
         return json.load(f)
+
+
+def require_cellxgene_census():
+    global cellxgene_census
+    if cellxgene_census is None:
+        try:
+            import cellxgene_census as census_module
+        except ImportError as exc:
+            raise ImportError(
+                "cellxgene_census is required unless SCBFM_PSEUDO_OFFLINE=1 and all "
+                "metadata/source chunks are already cached."
+            ) from exc
+        cellxgene_census = census_module
+    return cellxgene_census
 
 
 def normalize_obs_chunk(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -164,7 +173,8 @@ def iter_obs_tables(census, column_names: list[str]):
 
 
 def build_var_coords(census, gene_list: list[str]) -> tuple[list[int], list[str]]:
-    var_df = cellxgene_census.get_var(
+    census_api = require_cellxgene_census()
+    var_df = census_api.get_var(
         census=census,
         organism=ORGANISM,
         column_names=["soma_joinid", "feature_id"],
@@ -202,6 +212,16 @@ def build_proportion_column_map(cell_types: list[str]) -> dict[str, str]:
         used.add(column)
 
     return mapping
+
+
+def store_proportion_metadata(adata: ad.AnnData, proportion_column_map: dict[str, str]) -> None:
+    cell_types = sorted(proportion_column_map)
+    adata.uns["cell_type_proportion_cell_types"] = np.asarray(cell_types, dtype=object)
+    adata.uns["cell_type_proportion_obs_columns"] = np.asarray(
+        [proportion_column_map[cell_type] for cell_type in cell_types],
+        dtype=object,
+    )
+    adata.uns["cell_type_proportion_columns"] = proportion_column_map
 
 
 def parse_json_dict_column(value: object, cast):
@@ -526,6 +546,7 @@ def download_source_cells(
     var_coords: list[int],
     gene_list: list[str],
 ) -> ad.AnnData:
+    census_api = require_cellxgene_census()
     chunk_paths: list[Path] = []
 
     for chunk_id, start in enumerate(range(0, sampled_meta.shape[0], DOWNLOAD_CHUNK_SIZE)):
@@ -544,7 +565,7 @@ def download_source_cells(
 
         print(f"Downloading source CELLxGENE chunk {chunk_id}: cells {start}:{end}")
         t0 = time.perf_counter()
-        adata = cellxgene_census.get_anndata(
+        adata = census_api.get_anndata(
             census=census,
             organism=ORGANISM,
             obs_coords=obs_coords,
@@ -618,6 +639,62 @@ def build_source_row_index(
     }
 
 
+def get_source_chunk_paths(sampled_meta: pd.DataFrame) -> list[Path]:
+    chunk_paths = []
+    for chunk_id, _start in enumerate(range(0, sampled_meta.shape[0], DOWNLOAD_CHUNK_SIZE)):
+        chunk_path = SOURCE_CHUNK_DIR / f"source_cells_chunk_{chunk_id:05d}.h5ad"
+        if not chunk_path.exists():
+            raise FileNotFoundError(
+                f"Missing cached source chunk {chunk_path}. "
+                "Run the download stage with internet access first."
+            )
+        chunk_paths.append(chunk_path)
+    if not chunk_paths:
+        raise ValueError("No cached source chunks were found.")
+    return chunk_paths
+
+
+def build_source_chunk_index(
+    source_chunk_paths: list[Path],
+) -> dict[tuple[tuple[str, str, str], str], list[tuple[int, int]]]:
+    index: dict[tuple[tuple[str, str, str], str], list[tuple[int, int]]] = defaultdict(list)
+
+    for chunk_id, chunk_path in enumerate(source_chunk_paths):
+        adata = ad.read_h5ad(chunk_path, backed="r")
+        obs = normalize_obs_chunk(adata.obs.reset_index(drop=True), OBS_CONTEXT_COLUMNS)
+        for row_idx, row in enumerate(obs.itertuples(index=False)):
+            context_key = make_context_key(row)
+            index[(context_key, row.cell_type)].append((chunk_id, row_idx))
+        adata.file.close()
+        del adata, obs
+        gc.collect()
+
+    return index
+
+
+def aggregate_selected_cached_cells(
+    source_chunk_paths: list[Path],
+    selected_locations: list[tuple[int, int]],
+) -> sparse.csr_matrix:
+    rows_by_chunk: dict[int, list[int]] = defaultdict(list)
+    for chunk_id, row_idx in selected_locations:
+        rows_by_chunk[int(chunk_id)].append(int(row_idx))
+
+    aggregated = None
+    for chunk_id, row_indices in rows_by_chunk.items():
+        adata = ad.read_h5ad(source_chunk_paths[chunk_id])
+        selected = adata.X[np.asarray(row_indices, dtype=np.int64)]
+        chunk_sum = selected.sum(axis=0)
+        chunk_sum = sparse.csr_matrix(chunk_sum)
+        aggregated = chunk_sum if aggregated is None else aggregated + chunk_sum
+        del adata, selected, chunk_sum
+        gc.collect()
+
+    if aggregated is None:
+        raise ValueError("No source cells were selected for aggregation.")
+    return sparse.csr_matrix(aggregated)
+
+
 def generate_pseudo_bulk_chunks(
     source_adata: ad.AnnData,
     plan_rows: list[dict[str, object]],
@@ -684,7 +761,91 @@ def generate_pseudo_bulk_chunks(
 
         out = ad.AnnData(X=sparse.csr_matrix(x_binned), obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
-        out.uns["cell_type_proportion_columns"] = proportion_column_map
+        store_proportion_metadata(out, proportion_column_map)
+
+        out.write(out_path)
+        chunk_paths.append(out_path)
+
+        del raw_chunk, x_dense, x_binned, obs, var, out
+        gc.collect()
+
+        print(
+            f"Pseudo-bulk chunk {chunk_id}: wrote {chunk_paths[-1].name} "
+            f"for samples {start}:{end}"
+        )
+
+    return chunk_paths
+
+
+def generate_pseudo_bulk_chunks_from_cached_sources(
+    source_chunk_paths: list[Path],
+    plan_rows: list[dict[str, object]],
+    proportion_column_map: dict[str, str],
+    gene_list: list[str],
+) -> list[Path]:
+    source_index = build_source_chunk_index(source_chunk_paths)
+    chunk_paths: list[Path] = []
+
+    for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
+        end = min(start + WRITE_CHUNK_SIZE, len(plan_rows))
+        chunk_plan = plan_rows[start:end]
+        out_path = CHUNK_DIR / f"pseudo_bulk_chunk_{chunk_id:05d}.h5ad"
+        if RESUME and out_path.exists():
+            print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
+            chunk_paths.append(out_path)
+            continue
+
+        rng = np.random.default_rng(RANDOM_SEED + chunk_id)
+        aggregated_rows: list[sparse.csr_matrix] = []
+        obs_records: list[dict[str, object]] = []
+
+        for row in chunk_plan:
+            context_key = (row["dataset_id"], row["donor_id"], row[TISSUE_COLUMN])
+            selected_locations: list[tuple[int, int]] = []
+
+            for cell_type, count in row["cell_type_counts"].items():
+                pool = source_index.get((context_key, cell_type))
+                if not pool:
+                    raise ValueError(
+                        f"No cached source cells available for context={context_key}, cell_type={cell_type}."
+                    )
+                chosen_idx = rng.choice(len(pool), size=int(count), replace=len(pool) < int(count))
+                selected_locations.extend(pool[int(idx)] for idx in np.asarray(chosen_idx).ravel())
+
+            aggregated_rows.append(
+                aggregate_selected_cached_cells(source_chunk_paths, selected_locations)
+            )
+
+            obs_record = {
+                "dataset": "CELLxGENE_Census_pseudobulk",
+                "dataset_id": row["dataset_id"],
+                "donor_id": row["donor_id"],
+                TISSUE_COLUMN: row[TISSUE_COLUMN],
+                "total_cells": int(row["total_cells"]),
+                "n_cell_types": int(row["n_cell_types"]),
+            }
+            for column in proportion_column_map.values():
+                obs_record[column] = np.float32(0.0)
+            for cell_type, proportion in row["cell_type_proportions"].items():
+                obs_record[proportion_column_map[cell_type]] = np.float32(proportion)
+            obs_records.append(obs_record)
+
+        raw_chunk = sparse.vstack(aggregated_rows, format="csr")
+        x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
+        x_binned, keep_mask = preprocess_dense_block(x_dense)
+        if x_binned.shape[0] == 0:
+            continue
+
+        obs = pd.DataFrame(
+            obs_records,
+            index=pd.Index([row["sample_id"] for row in chunk_plan], name="sample_id"),
+        )
+        obs = obs.iloc[np.where(keep_mask)[0]].copy()
+        var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
+
+        out = ad.AnnData(X=sparse.csr_matrix(x_binned), obs=obs, var=var)
+        out.var_names = pd.Index(gene_list, dtype=str)
+        store_proportion_metadata(out, proportion_column_map)
 
         out.write(out_path)
         chunk_paths.append(out_path)
@@ -726,7 +887,7 @@ def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str])
 
     final_merged = ad.read_h5ad(current_paths[0])
     final_merged.obs_names_make_unique()
-    final_merged.uns["cell_type_proportion_columns"] = proportion_column_map
+    store_proportion_metadata(final_merged, proportion_column_map)
     final_merged.write(FINAL_OUT)
 
     del final_merged
@@ -761,7 +922,7 @@ def main() -> None:
         reservoir_quotas = {}
         all_cell_types = []
 
-    if RESUME and SOURCE_ADATA_OUT.exists():
+    if not OFFLINE and RESUME and SOURCE_ADATA_OUT.exists():
         print(f"Reusing downloaded source cells from {SOURCE_ADATA_OUT}")
         source_adata = ad.read_h5ad(SOURCE_ADATA_OUT)
     else:
@@ -774,13 +935,28 @@ def main() -> None:
         )
         plan_df.to_csv(PLAN_OUT, index=False)
 
-    if missing_genes is None and source_adata is not None:
+    if missing_genes is None and (source_adata is not None or OFFLINE):
         missing_genes = []
 
-    need_census = (not eligible_counts) or (source_adata is None)
+    if OFFLINE and not eligible_counts:
+        raise ValueError(
+            f"SCBFM_PSEUDO_OFFLINE=1 requires cached eligible contexts at {ELIGIBLE_CONTEXTS_OUT}."
+        )
+    if OFFLINE and not plan_rows:
+        raise ValueError(
+            f"SCBFM_PSEUDO_OFFLINE=1 requires cached sampling plan at {PLAN_OUT} "
+            f"and quotas at {SOURCE_POOL_QUOTAS_OUT}."
+        )
+    if OFFLINE and not SAMPLED_SOURCE_CELLS_OUT.exists():
+        raise ValueError(
+            f"SCBFM_PSEUDO_OFFLINE=1 requires cached source metadata at {SAMPLED_SOURCE_CELLS_OUT}."
+        )
+
+    need_census = (not OFFLINE) and ((not eligible_counts) or (source_adata is None))
 
     if need_census:
-        with cellxgene_census.open_soma(
+        census_api = require_cellxgene_census()
+        with census_api.open_soma(
             census_version=CENSUS_VERSION,
             tiledb_config=TILEDB_CONFIG,
         ) as census:
@@ -836,16 +1012,28 @@ def main() -> None:
         raise ValueError("No biologically feasible contexts were found.")
     if not plan_rows:
         raise ValueError("No pseudo-bulk plan is available.")
-    if source_adata is None:
-        raise ValueError("No source cells are available for pseudo-bulk generation.")
 
     proportion_column_map = build_proportion_column_map(all_cell_types)
-    chunk_paths = generate_pseudo_bulk_chunks(
-        source_adata,
-        plan_rows,
-        proportion_column_map,
-        gene_list,
-    )
+    if source_adata is None:
+        sampled_source_meta = load_sampled_source_meta(SAMPLED_SOURCE_CELLS_OUT)
+        source_chunk_paths = get_source_chunk_paths(sampled_source_meta)
+        chunk_paths = generate_pseudo_bulk_chunks_from_cached_sources(
+            source_chunk_paths,
+            plan_rows,
+            proportion_column_map,
+            gene_list,
+        )
+        sampled_source_cells = int(sampled_source_meta.shape[0])
+        source_mode = "cached_source_chunks"
+    else:
+        chunk_paths = generate_pseudo_bulk_chunks(
+            source_adata,
+            plan_rows,
+            proportion_column_map,
+            gene_list,
+        )
+        sampled_source_cells = int(source_adata.n_obs)
+        source_mode = "aligned_source_adata"
     merge_chunks(chunk_paths, proportion_column_map)
 
     summary = {
@@ -855,7 +1043,8 @@ def main() -> None:
         "cells_per_pseudo_bulk": CELLS_PER_PSEUDO_BULK,
         "target_gene_count": len(gene_list),
         "eligible_contexts": int(len(eligible_counts)),
-        "sampled_source_cells": int(source_adata.n_obs),
+        "sampled_source_cells": sampled_source_cells,
+        "source_mode": source_mode,
         "distinct_cell_types": int(len(all_cell_types)),
         "tissue_column": TISSUE_COLUMN,
         "min_context_cell_types": MIN_CONTEXT_CELL_TYPES,
@@ -869,10 +1058,12 @@ def main() -> None:
             "eligible_contexts_csv": str(ELIGIBLE_CONTEXTS_OUT),
             "source_pool_quotas_csv": str(SOURCE_POOL_QUOTAS_OUT),
             "sampled_source_cells_csv": str(SAMPLED_SOURCE_CELLS_OUT),
+            "source_cell_chunks_dir": str(SOURCE_CHUNK_DIR),
             "aligned_source_cells_h5ad": str(SOURCE_ADATA_OUT),
             "missing_genes_json": str(MISSING_GENES_OUT),
         },
         "resume_enabled": RESUME,
+        "offline_enabled": OFFLINE,
     }
     write_json(summary, SUMMARY_OUT)
 
