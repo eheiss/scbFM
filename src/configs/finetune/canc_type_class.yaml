@@ -1,4 +1,8 @@
-pretrained_model_path:
+pretrained_model_paths:
+  pretrain_sc:
+  pretrain_bulk:
+  preadapt_sc:
+  preadapt_bulk:
 tcga_data_dir:
 gene_list_path: ../data/gene_list.txt
 
@@ -7,9 +11,8 @@ cohorts: [BRCA, BLCA, GBM, LGG, LUAD, UCEC]
 merge_gbm_lgg: true
 normalized: false
 min_genes: 200
-test_size: 0.2
+cv_folds: 5
 random_seed: 42
-train_test_split_version: 1
 
 finetune_mode: head_only
 burn_in_epochs: 3

@@ -1,15 +1,18 @@
-pretrained_model_path:
+pretrained_model_paths:
+  pretrain_sc:
+  pretrain_bulk:
+  preadapt_sc:
+  preadapt_bulk:
 pseudo_bulk_data_path:
 
 finetune_mode: head_only
 burn_in_epochs: 3
 loss: kl
 
-test_size: 0.2
+cv_folds: 10
 split_by_context: true
 context_columns: [dataset_id, donor_id, tissue_general]
 random_seed: 42
-train_test_split_version: 1
 
 epochs: 10
 batch_size: 2

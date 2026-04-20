@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import hashlib
+import csv
+import json
 import logging
 import math
 import os
+import subprocess
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import numpy as np
 import scanpy as sc
 import torch
 import torch.distributed as dist
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from scipy import sparse
 from sklearn.metrics import (
     accuracy_score,
@@ -22,7 +24,12 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+except ImportError:  # pragma: no cover - depends on sklearn version.
+    StratifiedGroupKFold = None
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -42,6 +49,7 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_COHORTS = ["BRCA", "BLCA", "GBM", "LGG", "LUAD", "UCEC"]
 TASK_NAME = "canc_type_class"
+MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 
 
 class CancTypePredHead(nn.Module):
@@ -244,7 +252,6 @@ class CancTypeClassRunner:
         self.optimizer: Adam | None = None
         self.scheduler = None
         self.loss_fn: nn.Module | None = None
-        self.pretrained_model_stem: str | None = None
         self.backbone_optimizer_enabled = False
 
     @staticmethod
@@ -281,10 +288,121 @@ class CancTypeClassRunner:
         seed_all(int(getattr(self.task_cfg, "random_seed", 42)) + self.rank)
 
     @staticmethod
-    def _hash_split_version(version) -> int:
-        version_str = str(version)
-        digest = hashlib.sha256(version_str.encode("utf-8")).digest()
-        return int.from_bytes(digest[:4], byteorder="big", signed=False)
+    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        preferred = [
+            "model",
+            "fold",
+            "n_folds",
+            "finetune_mode",
+            "checkpoint_path",
+            "sample_id",
+            "case_id",
+            "project_id",
+            "true_label",
+        ]
+        fieldnames = [
+            field
+            for field in preferred
+            if any(field in row for row in rows)
+        ]
+        extra_fields = sorted(
+            {
+                field
+                for row in rows
+                for field in row
+                if field not in fieldnames
+            }
+        )
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *extra_fields])
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _get_git_commit() -> str | None:
+        repo_dir = ROOT / "scbFM"
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        return result.stdout.strip()
+
+    def _save_run_metadata(self, checkpoint_paths: dict[str, str]) -> None:
+        if not self.is_master:
+            return
+        out_dir = self._task_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "config.yaml").write_text(
+            OmegaConf.to_yaml(self.cfg, resolve=True),
+            encoding="utf-8",
+        )
+        self._write_json(
+            out_dir / "run_metadata.json",
+            {
+                "task": TASK_NAME,
+                "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
+                "git_commit": self._get_git_commit(),
+                "checkpoint_paths": checkpoint_paths,
+            },
+        )
+
+    @staticmethod
+    def _aggregate_numeric_rows(rows: list[dict[str, object]]) -> dict[str, object]:
+        aggregate: dict[str, object] = {"n_folds": len(rows)}
+        skip_fields = {"model", "fold", "n_folds", "finetune_mode", "checkpoint_path"}
+        numeric_fields = sorted(
+            {
+                field
+                for row in rows
+                for field, value in row.items()
+                if field not in skip_fields and isinstance(value, (int, float, np.integer, np.floating))
+            }
+        )
+        for field in numeric_fields:
+            values = np.asarray([float(row[field]) for row in rows if field in row], dtype=float)
+            values = values[~np.isnan(values)]
+            aggregate[f"{field}_mean"] = float(np.mean(values)) if values.size else float("nan")
+            aggregate[f"{field}_std"] = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+        return aggregate
+
+    def _get_checkpoint_paths(self) -> dict[str, str]:
+        paths_cfg = getattr(self.task_cfg, "pretrained_model_paths", None)
+        if paths_cfg is None:
+            raise ValueError(
+                "finetune.canc_type_class.pretrained_model_paths must define "
+                f"{', '.join(MODEL_KEYS)}."
+            )
+
+        checkpoint_paths: dict[str, str] = {}
+        missing = []
+        for key in MODEL_KEYS:
+            value = paths_cfg.get(key)
+            if value:
+                checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
+            else:
+                missing.append(key)
+        if missing:
+            raise ValueError(
+                "Missing checkpoint paths in finetune.canc_type_class.pretrained_model_paths: "
+                f"{missing}"
+            )
+        return checkpoint_paths
 
     def _load_tcga(self) -> ad.AnnData:
         configured_path = getattr(self.task_cfg, "tcga_data_dir", None)
@@ -380,7 +498,7 @@ class CancTypeClassRunner:
 
         return adata
 
-    def _prepare_train_test_data(self) -> tuple[ad.AnnData, ad.AnnData]:
+    def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
         adata.obs["cancer_type"] = adata.obs["cancer_type"].astype(str)
 
@@ -390,29 +508,68 @@ class CancTypeClassRunner:
             )
 
         adata = self._preprocess_adata(adata)
-        labels = adata.obs["cancer_type"]
-        test_size = float(getattr(self.task_cfg, "test_size", 0.2))
-        split_version = getattr(
-            self.task_cfg,
-            "train_test_split_version",
-            getattr(self.task_cfg, "random_seed", 42),
-        )
-        split_seed = self._hash_split_version(split_version)
+        self.label_dict = np.unique(np.asarray(adata.obs["cancer_type"]).astype(str))
+        labels = np.asarray(adata.obs["cancer_type"]).astype(str)
+        groups = None
+        if "case_id" in adata.obs:
+            case_ids = adata.obs["case_id"].astype(str).to_numpy()
+            if len(np.unique(case_ids)) < len(case_ids):
+                groups = case_ids
+                log.info("Duplicate TCGA case_id values detected; using case-grouped CV.")
+        return adata, labels, groups
 
-        train_idx, test_idx = train_test_split(
-            np.arange(adata.n_obs),
-            test_size=test_size,
-            stratify=labels,
-            random_state=split_seed,
+    def _build_cv_splits(
+        self,
+        labels: np.ndarray,
+        groups: np.ndarray | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        n_splits = int(getattr(self.task_cfg, "cv_folds", 10))
+        if n_splits < 2:
+            raise ValueError("finetune.canc_type_class.cv_folds must be at least 2.")
+
+        _, class_counts = np.unique(labels, return_counts=True)
+        min_class_count = int(class_counts.min())
+        if n_splits > min_class_count:
+            raise ValueError(
+                f"cv_folds={n_splits} is larger than the smallest class size ({min_class_count})."
+            )
+
+        if groups is not None:
+            unique_groups = np.unique(groups)
+            if n_splits > unique_groups.size:
+                raise ValueError(
+                    f"cv_folds={n_splits} is larger than the number of case_id groups ({unique_groups.size})."
+                )
+            if StratifiedGroupKFold is not None:
+                splitter = StratifiedGroupKFold(
+                    n_splits=n_splits,
+                    shuffle=True,
+                    random_state=int(getattr(self.task_cfg, "random_seed", 42)),
+                )
+                return list(splitter.split(np.zeros(labels.shape[0]), labels, groups))
+
+            log.warning(
+                "StratifiedGroupKFold is unavailable in this sklearn version; "
+                "falling back to non-stratified GroupKFold."
+            )
+            splitter = GroupKFold(n_splits=n_splits)
+            return list(splitter.split(np.zeros(labels.shape[0]), labels, groups))
+
+        splitter = StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
-        return adata[train_idx].copy(), adata[test_idx].copy()
+        return list(splitter.split(np.zeros(labels.shape[0]), labels))
 
     def _build_loaders(self, train_adata: ad.AnnData, test_adata: ad.AnnData) -> None:
-        self.label_dict, train_labels = np.unique(
-            np.asarray(train_adata.obs["cancer_type"]).astype(str),
-            return_inverse=True,
-        )
+        if self.label_dict is None:
+            self.label_dict = np.unique(np.asarray(train_adata.obs["cancer_type"]).astype(str))
         label_to_idx = {label: idx for idx, label in enumerate(self.label_dict.tolist())}
+        train_labels = np.array(
+            [label_to_idx[label] for label in np.asarray(train_adata.obs["cancer_type"]).astype(str)],
+            dtype=np.int64,
+        )
         test_labels = np.array(
             [label_to_idx[label] for label in np.asarray(test_adata.obs["cancer_type"]).astype(str)],
             dtype=np.int64,
@@ -470,7 +627,7 @@ class CancTypeClassRunner:
             return state_dict
         return {key.removeprefix("module."): value for key, value in state_dict.items()}
 
-    def _build_model(self) -> None:
+    def _build_model(self, checkpoint_path: str) -> None:
         finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
         valid_modes = {"head_only", "full_ft"}
         if finetune_mode not in valid_modes:
@@ -502,11 +659,9 @@ class CancTypeClassRunner:
             qkv_bias=bool(self.model_cfg.qkv_bias),
         )
 
-        checkpoint_path = getattr(self.task_cfg, "pretrained_model_path", None)
         if not checkpoint_path:
-            raise ValueError("finetune.canc_type_class.pretrained_model_path must be set.")
+            raise ValueError("A pretrained checkpoint path must be set.")
         resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
-        self.pretrained_model_stem = Path(resolved_path).stem
         checkpoint = torch.load(resolved_path, map_location="cpu")
         state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
         model.load_state_dict(state_dict)
@@ -724,8 +879,24 @@ class CancTypeClassRunner:
         return {
             "loss": float(test_loss),
             "accuracy": float(accuracy_score(truths_np, predictions_np)),
-            "f1_macro": float(f1_score(truths_np, predictions_np, average="macro")),
-            "f1_weighted": float(f1_score(truths_np, predictions_np, average="weighted")),
+            "f1_macro": float(
+                f1_score(
+                    truths_np,
+                    predictions_np,
+                    labels=np.arange(len(self.label_dict)),
+                    average="macro",
+                    zero_division=0,
+                )
+            ),
+            "f1_weighted": float(
+                f1_score(
+                    truths_np,
+                    predictions_np,
+                    labels=np.arange(len(self.label_dict)),
+                    average="weighted",
+                    zero_division=0,
+                )
+            ),
             "confusion_matrix": confusion_matrix(
                 truths_np,
                 predictions_np,
@@ -745,92 +916,246 @@ class CancTypeClassRunner:
             "support_per_class": support,
             "label_dict": self.label_dict.tolist(),
             "n_test_samples": int(len(truths_np)),
+            "truth_indices": truths_np,
+            "prediction_indices": predictions_np,
         }
 
-    def _save_checkpoint(
+    def _flatten_fold_metrics(
         self,
-        epoch: int,
+        model_key: str,
+        fold: int,
+        n_folds: int,
+        checkpoint_path: str,
         train_metrics: dict[str, float],
-        test_metrics: dict,
-    ) -> Path | None:
-        if not self.is_master:
-            return None
+        test_metrics: dict[str, object],
+    ) -> dict[str, object]:
+        row: dict[str, object] = {
+            "model": model_key,
+            "fold": fold,
+            "n_folds": n_folds,
+            "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+            "checkpoint_path": checkpoint_path,
+            "train_loss": float(train_metrics["loss"]),
+            "train_accuracy": float(train_metrics["accuracy"]),
+        }
+        for key, value in test_metrics.items():
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                row[key] = float(value)
 
-        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
-        if not self.pretrained_model_stem:
-            raise RuntimeError("Pretrained model stem is unavailable. Build the model before saving.")
-        split_version = getattr(
-            self.task_cfg,
-            "train_test_split_version",
-            getattr(self.task_cfg, "random_seed", 42),
+        labels = list(test_metrics.get("label_dict", self.label_dict.tolist()))
+        for metric_key, prefix in (
+            ("precision_per_class", "precision"),
+            ("recall_per_class", "recall"),
+            ("f1_per_class", "f1"),
+            ("support_per_class", "support"),
+        ):
+            values = test_metrics.get(metric_key)
+            if values is None:
+                continue
+            for label, value in zip(labels, np.asarray(values).tolist()):
+                row[f"{prefix}_{label}"] = float(value)
+        return row
+
+    def _prediction_rows(
+        self,
+        model_key: str,
+        fold: int,
+        checkpoint_path: str,
+        test_adata: ad.AnnData,
+        test_metrics: dict[str, object],
+    ) -> list[dict[str, object]]:
+        truth_indices = np.asarray(test_metrics["truth_indices"], dtype=int)
+        prediction_indices = np.asarray(test_metrics["prediction_indices"], dtype=int)
+        labels = self.label_dict.tolist()
+        rows: list[dict[str, object]] = []
+        case_ids = (
+            test_adata.obs["case_id"].astype(str).to_numpy()
+            if "case_id" in test_adata.obs
+            else np.asarray([""] * test_adata.n_obs)
         )
-        model_name = f"{self.pretrained_model_stem}_{TASK_NAME}_{finetune_mode}_v{split_version}"
-        checkpoint_dir = ROOT / "output" / model_name / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_name = f"{model_name}.pth"
-        checkpoint_path = checkpoint_dir / checkpoint_name
+        project_ids = (
+            test_adata.obs["project_id"].astype(str).to_numpy()
+            if "project_id" in test_adata.obs
+            else np.asarray([""] * test_adata.n_obs)
+        )
+        for idx, (truth_idx, pred_idx) in enumerate(zip(truth_indices, prediction_indices)):
+            rows.append(
+                {
+                    "model": model_key,
+                    "fold": fold,
+                    "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+                    "checkpoint_path": checkpoint_path,
+                    "sample_id": str(test_adata.obs_names[idx]),
+                    "case_id": case_ids[idx],
+                    "project_id": project_ids[idx],
+                    "true_idx": int(truth_idx),
+                    "pred_idx": int(pred_idx),
+                    "true_label": labels[int(truth_idx)],
+                    "pred_label": labels[int(pred_idx)],
+                    "correct": int(truth_idx == pred_idx),
+                }
+            )
+        return rows
 
-        model = self.model.module if isinstance(self.model, DDP) else self.model
-        torch.save(
+    def _write_confusion_matrix(
+        self,
+        path: Path,
+        matrix: np.ndarray,
+    ) -> None:
+        labels = self.label_dict.tolist()
+        rows = [
             {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "train_metrics": train_metrics,
-                "test_metrics": test_metrics,
-                "label_dict": self.label_dict.tolist(),
-            },
-            checkpoint_path,
+                "true_label": label,
+                **{f"pred_{pred_label}": int(matrix[row_idx, col_idx]) for col_idx, pred_label in enumerate(labels)},
+            }
+            for row_idx, label in enumerate(labels)
+        ]
+        self._write_csv(path, rows)
+
+    def _task_output_dir(self) -> Path:
+        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
+        return ROOT / "output" / TASK_NAME / finetune_mode
+
+    def _write_model_results(
+        self,
+        checkpoint_path: str,
+        fold_rows: list[dict[str, object]],
+        prediction_rows: list[dict[str, object]],
+        confusion_matrices: list[np.ndarray],
+    ) -> dict[str, object]:
+        aggregate = self._aggregate_numeric_rows(fold_rows)
+        aggregate.update(
+            {
+                "model": fold_rows[0]["model"],
+                "finetune_mode": fold_rows[0]["finetune_mode"],
+                "checkpoint_path": checkpoint_path,
+            }
         )
-        return checkpoint_path
+        out_dir = self._task_output_dir()
+        model_key = str(fold_rows[0]["model"])
+        self._write_csv(out_dir / f"{model_key}_fold_metrics.csv", fold_rows)
+        self._write_csv(out_dir / f"{model_key}_evaluation_metrics.csv", [aggregate])
+        self._write_csv(out_dir / f"{model_key}_predictions.csv", prediction_rows)
+        if confusion_matrices:
+            self._write_confusion_matrix(
+                out_dir / f"{model_key}_confusion_matrix.csv",
+                np.sum(confusion_matrices, axis=0),
+            )
+        return aggregate
+
+    def _cleanup_fold_state(self) -> None:
+        self.train_loader = None
+        self.test_loader = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.loss_fn = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def run(self) -> dict:
         try:
             self._setup_runtime()
-            train_adata, test_adata = self._prepare_train_test_data()
+            adata, labels, groups = self._prepare_cv_data()
+            splits = self._build_cv_splits(labels, groups)
+            checkpoint_paths = self._get_checkpoint_paths()
+            self._save_run_metadata(checkpoint_paths)
             if self.is_master:
                 log.info(
-                    "Prepared cancer type classification data: train=%d, test=%d, genes=%d",
-                    train_adata.n_obs,
-                    test_adata.n_obs,
-                    train_adata.n_vars,
+                    "Prepared cancer type classification CV data: samples=%d, genes=%d, folds=%d",
+                    adata.n_obs,
+                    adata.n_vars,
+                    len(splits),
                 )
 
-            self._build_loaders(train_adata, test_adata)
-            self._build_model()
-            self._build_optimization()
-
             epochs = int(getattr(self.task_cfg, "epochs", 10))
-            last_train_metrics = {"loss": float("nan"), "accuracy": float("nan")}
+            aggregate_rows: list[dict[str, object]] = []
 
-            for epoch in range(1, epochs + 1):
-                last_train_metrics = self._train_one_epoch(epoch)
-                if self.is_master:
-                    log.info(
-                        "Epoch %d | Training Loss: %.6f | Accuracy: %.4f%%",
-                        epoch,
-                        last_train_metrics["loss"],
-                        last_train_metrics["accuracy"],
+            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+                fold_rows: list[dict[str, object]] = []
+                prediction_rows: list[dict[str, object]] = []
+                confusion_matrices: list[np.ndarray] = []
+                for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
+                    seed_all(
+                        int(getattr(self.task_cfg, "random_seed", 42))
+                        + self.rank
+                        + model_idx * 10000
+                        + fold_idx
                     )
+                    train_adata = adata[train_idx].copy()
+                    test_adata = adata[test_idx].copy()
+                    if self.is_master:
+                        log.info(
+                            "Model %s | Fold %d/%d | train=%d, test=%d",
+                            model_key,
+                            fold_idx,
+                            len(splits),
+                            train_adata.n_obs,
+                            test_adata.n_obs,
+                        )
 
-            test_metrics = self._evaluate()
-            checkpoint_path = self._save_checkpoint(
-                epoch=epochs,
-                train_metrics={
-                    "loss": float(last_train_metrics["loss"]),
-                    "accuracy": float(last_train_metrics["accuracy"]),
-                },
-                test_metrics=test_metrics,
-            )
-            if checkpoint_path is not None:
-                test_metrics["checkpoint_path"] = str(checkpoint_path)
+                    self._build_loaders(train_adata, test_adata)
+                    self._build_model(checkpoint_path)
+                    self._build_optimization()
 
-            return {
-                "train_loss": float(last_train_metrics["loss"]),
-                "train_accuracy": float(last_train_metrics["accuracy"]),
-                **test_metrics,
-            }
+                    last_train_metrics = {"loss": float("nan"), "accuracy": float("nan")}
+                    for epoch in range(1, epochs + 1):
+                        last_train_metrics = self._train_one_epoch(epoch)
+                        if self.is_master:
+                            log.info(
+                                "Model %s | Fold %d/%d | Epoch %d | Training Loss: %.6f | Accuracy: %.4f%%",
+                                model_key,
+                                fold_idx,
+                                len(splits),
+                                epoch,
+                                last_train_metrics["loss"],
+                                last_train_metrics["accuracy"],
+                            )
+
+                    test_metrics = self._evaluate()
+                    if self.is_master:
+                        fold_rows.append(
+                            self._flatten_fold_metrics(
+                                model_key=model_key,
+                                fold=fold_idx,
+                                n_folds=len(splits),
+                                checkpoint_path=checkpoint_path,
+                                train_metrics=last_train_metrics,
+                                test_metrics=test_metrics,
+                            )
+                        )
+                        prediction_rows.extend(
+                            self._prediction_rows(
+                                model_key=model_key,
+                                fold=fold_idx,
+                                checkpoint_path=checkpoint_path,
+                                test_adata=test_adata,
+                                test_metrics=test_metrics,
+                            )
+                        )
+                        confusion_matrices.append(np.asarray(test_metrics["confusion_matrix"]))
+                    self._cleanup_fold_state()
+
+                if self.is_master:
+                    aggregate_rows.append(
+                        self._write_model_results(
+                            checkpoint_path,
+                            fold_rows,
+                            prediction_rows,
+                            confusion_matrices,
+                        )
+                    )
+                if self.is_distributed:
+                    dist.barrier()
+
+            if self.is_master:
+                combined_dir = self._task_output_dir()
+                self._write_csv(combined_dir / "evaluation_metrics.csv", aggregate_rows)
+                return {
+                    "results_path": str(combined_dir / "evaluation_metrics.csv"),
+                    "results": aggregate_rows,
+                }
+            return {}
         finally:
             if self.is_distributed and dist.is_initialized():
                 dist.barrier()

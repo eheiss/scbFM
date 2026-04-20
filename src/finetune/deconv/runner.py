@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import hashlib
+import csv
+import json
 import logging
 import os
+import subprocess
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -12,10 +14,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from scipy import sparse
+from scipy.stats import spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, KFold
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -35,6 +38,7 @@ log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[4]
 TASK_NAME = "deconv"
+MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 
 
 class DeconvPredHead(nn.Module):
@@ -131,7 +135,6 @@ class DeconvRunner:
         self.model: nn.Module | None = None
         self.optimizer: Adam | None = None
         self.scheduler = None
-        self.pretrained_model_stem: str | None = None
         self.backbone_optimizer_enabled = False
 
     @staticmethod
@@ -163,10 +166,121 @@ class DeconvRunner:
         seed_all(int(getattr(self.task_cfg, "random_seed", 42)) + self.rank)
 
     @staticmethod
-    def _hash_split_version(version) -> int:
-        version_str = str(version)
-        digest = hashlib.sha256(version_str.encode("utf-8")).digest()
-        return int.from_bytes(digest[:4], byteorder="big", signed=False)
+    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        preferred = [
+            "model",
+            "fold",
+            "n_folds",
+            "finetune_mode",
+            "checkpoint_path",
+            "sample_id",
+            "dataset_id",
+            "donor_id",
+            "tissue_general",
+        ]
+        fieldnames = [
+            field
+            for field in preferred
+            if any(field in row for row in rows)
+        ]
+        extra_fields = sorted(
+            {
+                field
+                for row in rows
+                for field in row
+                if field not in fieldnames
+            }
+        )
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *extra_fields])
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _get_git_commit() -> str | None:
+        repo_dir = ROOT / "scbFM"
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        return result.stdout.strip()
+
+    def _save_run_metadata(self, checkpoint_paths: dict[str, str]) -> None:
+        if not self.is_master:
+            return
+        out_dir = self._task_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "config.yaml").write_text(
+            OmegaConf.to_yaml(self.cfg, resolve=True),
+            encoding="utf-8",
+        )
+        self._write_json(
+            out_dir / "run_metadata.json",
+            {
+                "task": TASK_NAME,
+                "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "head_only")),
+                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
+                "git_commit": self._get_git_commit(),
+                "checkpoint_paths": checkpoint_paths,
+            },
+        )
+
+    @staticmethod
+    def _aggregate_numeric_rows(rows: list[dict[str, object]]) -> dict[str, object]:
+        aggregate: dict[str, object] = {"n_folds": len(rows)}
+        skip_fields = {"model", "fold", "n_folds", "finetune_mode", "checkpoint_path"}
+        numeric_fields = sorted(
+            {
+                field
+                for row in rows
+                for field, value in row.items()
+                if field not in skip_fields and isinstance(value, (int, float, np.integer, np.floating))
+            }
+        )
+        for field in numeric_fields:
+            values = np.asarray([float(row[field]) for row in rows if field in row], dtype=float)
+            values = values[~np.isnan(values)]
+            aggregate[f"{field}_mean"] = float(np.mean(values)) if values.size else float("nan")
+            aggregate[f"{field}_std"] = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+        return aggregate
+
+    def _get_checkpoint_paths(self) -> dict[str, str]:
+        paths_cfg = getattr(self.task_cfg, "pretrained_model_paths", None)
+        if paths_cfg is None:
+            raise ValueError(
+                "finetune.deconv.pretrained_model_paths must define "
+                f"{', '.join(MODEL_KEYS)}."
+            )
+
+        checkpoint_paths: dict[str, str] = {}
+        missing = []
+        for key in MODEL_KEYS:
+            value = paths_cfg.get(key)
+            if value:
+                checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
+            else:
+                missing.append(key)
+        if missing:
+            raise ValueError(
+                "Missing checkpoint paths in finetune.deconv.pretrained_model_paths: "
+                f"{missing}"
+            )
+        return checkpoint_paths
 
     @staticmethod
     def _strip_module_prefix(state_dict: dict) -> dict:
@@ -322,7 +436,7 @@ class DeconvRunner:
             raise ValueError("Cell type proportions must be non-negative.")
         return targets
 
-    def _prepare_train_test_data(self) -> tuple[ad.AnnData, ad.AnnData, np.ndarray, np.ndarray]:
+    def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
         adata.var_names_make_unique()
         targets = self._load_targets(adata)
@@ -333,14 +447,7 @@ class DeconvRunner:
                 f"Expected {expected_gene_num} genes for the scbFM backbone, got {adata.n_vars}."
             )
 
-        test_size = float(getattr(self.task_cfg, "test_size", 0.2))
-        split_version = getattr(
-            self.task_cfg,
-            "train_test_split_version",
-            getattr(self.task_cfg, "random_seed", 42),
-        )
-        split_seed = self._hash_split_version(split_version)
-
+        groups = None
         if bool(getattr(self.task_cfg, "split_by_context", True)):
             context_columns = list(
                 getattr(self.task_cfg, "context_columns", ["dataset_id", "donor_id", "tissue_general"])
@@ -350,29 +457,36 @@ class DeconvRunner:
                 raise ValueError(
                     f"split_by_context=true but these context columns are missing: {missing_context}"
                 )
-            context = adata.obs[context_columns].astype(str).agg("||".join, axis=1).to_numpy()
-            unique_contexts = np.unique(context)
-            train_contexts, test_contexts = train_test_split(
-                unique_contexts,
-                test_size=test_size,
-                random_state=split_seed,
-            )
-            train_contexts = set(train_contexts.tolist())
-            train_idx = np.flatnonzero(np.isin(context, list(train_contexts)))
-            test_idx = np.flatnonzero(~np.isin(context, list(train_contexts)))
-        else:
-            train_idx, test_idx = train_test_split(
-                np.arange(adata.n_obs),
-                test_size=test_size,
-                random_state=split_seed,
-            )
+            groups = adata.obs[context_columns].astype(str).agg("||".join, axis=1).to_numpy()
 
-        return (
-            adata[train_idx].copy(),
-            adata[test_idx].copy(),
-            targets[train_idx],
-            targets[test_idx],
+        return adata, targets, groups
+
+    def _build_cv_splits(
+        self,
+        adata: ad.AnnData,
+        groups: np.ndarray | None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        n_splits = int(getattr(self.task_cfg, "cv_folds", 10))
+        if n_splits < 2:
+            raise ValueError("finetune.deconv.cv_folds must be at least 2.")
+
+        if groups is not None:
+            unique_groups = np.unique(groups)
+            if n_splits > unique_groups.size:
+                raise ValueError(
+                    f"cv_folds={n_splits} is larger than the number of context groups ({unique_groups.size})."
+                )
+            splitter = GroupKFold(n_splits=n_splits)
+            return list(splitter.split(np.zeros(adata.n_obs), groups=groups))
+
+        if n_splits > adata.n_obs:
+            raise ValueError(f"cv_folds={n_splits} is larger than sample count ({adata.n_obs}).")
+        splitter = KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
+        return list(splitter.split(np.arange(adata.n_obs)))
 
     def _build_loaders(
         self,
@@ -425,7 +539,7 @@ class DeconvRunner:
             self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
             self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    def _build_model(self) -> None:
+    def _build_model(self, checkpoint_path: str) -> None:
         finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "head_only"))
         valid_modes = {"head_only", "full_ft"}
         if finetune_mode not in valid_modes:
@@ -457,11 +571,9 @@ class DeconvRunner:
             qkv_bias=bool(self.model_cfg.qkv_bias),
         )
 
-        checkpoint_path = getattr(self.task_cfg, "pretrained_model_path", None)
         if not checkpoint_path:
-            raise ValueError("finetune.deconv.pretrained_model_path must be set.")
+            raise ValueError("A pretrained checkpoint path must be set.")
         resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
-        self.pretrained_model_stem = Path(resolved_path).stem
         checkpoint = torch.load(resolved_path, map_location="cpu")
         state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
         model.load_state_dict(state_dict)
@@ -632,15 +744,60 @@ class DeconvRunner:
         return {"loss": epoch_loss}
 
     @staticmethod
-    def _mean_pearson(predictions: np.ndarray, truths: np.ndarray) -> float:
-        corrs = []
-        for idx in range(truths.shape[1]):
-            pred = predictions[:, idx]
-            truth = truths[:, idx]
-            if np.std(pred) == 0 or np.std(truth) == 0:
-                continue
-            corrs.append(float(np.corrcoef(pred, truth)[0, 1]))
-        return float(np.mean(corrs)) if corrs else float("nan")
+    def _safe_pearson(pred: np.ndarray, truth: np.ndarray) -> float:
+        if np.std(pred) == 0 or np.std(truth) == 0:
+            return float("nan")
+        return float(np.corrcoef(pred, truth)[0, 1])
+
+    @staticmethod
+    def _safe_spearman(pred: np.ndarray, truth: np.ndarray) -> float:
+        if np.std(pred) == 0 or np.std(truth) == 0:
+            return float("nan")
+        return float(spearmanr(pred, truth).correlation)
+
+    def _correlation_metrics(
+        self,
+        predictions: np.ndarray,
+        truths: np.ndarray,
+    ) -> tuple[dict[str, float], dict[str, float], float, float]:
+        pearson_by_type: dict[str, float] = {}
+        spearman_by_type: dict[str, float] = {}
+        for idx, cell_type in enumerate(self.cell_types):
+            pearson_by_type[cell_type] = self._safe_pearson(predictions[:, idx], truths[:, idx])
+            spearman_by_type[cell_type] = self._safe_spearman(predictions[:, idx], truths[:, idx])
+
+        pearson_values = np.asarray(list(pearson_by_type.values()), dtype=float)
+        spearman_values = np.asarray(list(spearman_by_type.values()), dtype=float)
+        mean_pearson = (
+            float(np.nanmean(pearson_values))
+            if np.any(~np.isnan(pearson_values))
+            else float("nan")
+        )
+        mean_spearman = (
+            float(np.nanmean(spearman_values))
+            if np.any(~np.isnan(spearman_values))
+            else float("nan")
+        )
+        return pearson_by_type, spearman_by_type, mean_pearson, mean_spearman
+
+    @staticmethod
+    def _distribution_metrics(predictions: np.ndarray, truths: np.ndarray) -> tuple[float, float, float]:
+        eps = 1e-8
+        pred = np.clip(predictions, eps, 1.0)
+        truth = np.clip(truths, eps, 1.0)
+        pred = pred / pred.sum(axis=1, keepdims=True)
+        truth = truth / truth.sum(axis=1, keepdims=True)
+        midpoint = 0.5 * (pred + truth)
+        kl_truth_pred = np.sum(truth * np.log(truth / pred), axis=1)
+        js = 0.5 * (
+            np.sum(truth * np.log(truth / midpoint), axis=1)
+            + np.sum(pred * np.log(pred / midpoint), axis=1)
+        )
+        return (
+            float(np.mean(kl_truth_pred)),
+            float(np.mean(np.sqrt(js))),
+            float(np.mean(js)),
+        )
 
     def _evaluate(self) -> dict:
         self.model.eval()
@@ -676,11 +833,23 @@ class DeconvRunner:
 
         per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
         per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))
+        pearson_by_type, spearman_by_type, mean_pearson, mean_spearman = self._correlation_metrics(
+            predictions_np,
+            truths_np,
+        )
+        kl_divergence, js_distance, js_divergence = self._distribution_metrics(
+            predictions_np,
+            truths_np,
+        )
         return {
             "loss": float(test_loss),
             "mae": float(mean_absolute_error(truths_np, predictions_np)),
             "rmse": float(np.sqrt(mean_squared_error(truths_np, predictions_np))),
-            "mean_pearson": self._mean_pearson(predictions_np, truths_np),
+            "mean_pearson": mean_pearson,
+            "mean_spearman": mean_spearman,
+            "kl_divergence": kl_divergence,
+            "js_distance": js_distance,
+            "js_divergence": js_divergence,
             "per_cell_type_mae": {
                 cell_type: float(value)
                 for cell_type, value in zip(self.cell_types, per_type_mae.tolist())
@@ -689,86 +858,223 @@ class DeconvRunner:
                 cell_type: float(value)
                 for cell_type, value in zip(self.cell_types, per_type_rmse.tolist())
             },
+            "per_cell_type_pearson": pearson_by_type,
+            "per_cell_type_spearman": spearman_by_type,
             "cell_types": self.cell_types,
             "target_columns": self.target_columns,
             "n_test_samples": int(len(truths_np)),
+            "predictions": predictions_np,
+            "truths": truths_np,
         }
 
-    def _save_checkpoint(
+    def _flatten_fold_metrics(
         self,
-        epoch: int,
+        model_key: str,
+        fold: int,
+        n_folds: int,
+        checkpoint_path: str,
         train_metrics: dict[str, float],
-        test_metrics: dict,
-    ) -> Path | None:
-        if not self.is_master:
-            return None
+        test_metrics: dict[str, object],
+    ) -> dict[str, object]:
+        row: dict[str, object] = {
+            "model": model_key,
+            "fold": fold,
+            "n_folds": n_folds,
+            "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "head_only")),
+            "checkpoint_path": checkpoint_path,
+            "train_loss": float(train_metrics["loss"]),
+        }
+        for key, value in test_metrics.items():
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                row[key] = float(value)
+        for metric_key, prefix in (
+            ("per_cell_type_mae", "mae"),
+            ("per_cell_type_rmse", "rmse"),
+            ("per_cell_type_pearson", "pearson"),
+            ("per_cell_type_spearman", "spearman"),
+        ):
+            values = test_metrics.get(metric_key, {})
+            if isinstance(values, dict):
+                for cell_type, value in values.items():
+                    row[f"{prefix}_{cell_type}"] = float(value)
+        return row
 
+    def _prediction_rows(
+        self,
+        model_key: str,
+        fold: int,
+        checkpoint_path: str,
+        test_adata: ad.AnnData,
+        test_metrics: dict[str, object],
+    ) -> list[dict[str, object]]:
+        predictions = np.asarray(test_metrics["predictions"], dtype=float)
+        truths = np.asarray(test_metrics["truths"], dtype=float)
+        rows: list[dict[str, object]] = []
+        context_columns = [
+            col
+            for col in ["dataset_id", "donor_id", "tissue_general", "total_cells", "n_cell_types"]
+            if col in test_adata.obs
+        ]
+        context_values = {
+            col: test_adata.obs[col].astype(str).to_numpy()
+            for col in context_columns
+        }
+
+        for sample_idx, sample_id in enumerate(test_adata.obs_names.astype(str)):
+            row: dict[str, object] = {
+                "model": model_key,
+                "fold": fold,
+                "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "head_only")),
+                "checkpoint_path": checkpoint_path,
+                "sample_id": sample_id,
+            }
+            for col in context_columns:
+                row[col] = context_values[col][sample_idx]
+            for cell_idx, cell_type in enumerate(self.cell_types):
+                pred_value = float(predictions[sample_idx, cell_idx])
+                true_value = float(truths[sample_idx, cell_idx])
+                row[f"pred_{cell_type}"] = pred_value
+                row[f"true_{cell_type}"] = true_value
+                row[f"abs_error_{cell_type}"] = abs(pred_value - true_value)
+            rows.append(row)
+        return rows
+
+    def _task_output_dir(self) -> Path:
         finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "head_only"))
-        if not self.pretrained_model_stem:
-            raise RuntimeError("Pretrained model stem is unavailable. Build the model before saving.")
-        split_version = getattr(
-            self.task_cfg,
-            "train_test_split_version",
-            getattr(self.task_cfg, "random_seed", 42),
-        )
-        model_name = f"{self.pretrained_model_stem}_{TASK_NAME}_{finetune_mode}_v{split_version}"
-        checkpoint_dir = ROOT / "output" / model_name / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = checkpoint_dir / f"{model_name}.pth"
+        return ROOT / "output" / TASK_NAME / finetune_mode
 
-        model = self.model.module if isinstance(self.model, DDP) else self.model
-        torch.save(
+    def _write_model_results(
+        self,
+        checkpoint_path: str,
+        fold_rows: list[dict[str, object]],
+        prediction_rows: list[dict[str, object]],
+    ) -> dict[str, object]:
+        aggregate = self._aggregate_numeric_rows(fold_rows)
+        aggregate.update(
             {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "train_metrics": train_metrics,
-                "test_metrics": test_metrics,
-                "cell_types": self.cell_types,
-                "target_columns": self.target_columns,
-            },
-            checkpoint_path,
+                "model": fold_rows[0]["model"],
+                "finetune_mode": fold_rows[0]["finetune_mode"],
+                "checkpoint_path": checkpoint_path,
+            }
         )
-        return checkpoint_path
+        out_dir = self._task_output_dir()
+        model_key = str(fold_rows[0]["model"])
+        self._write_csv(out_dir / f"{model_key}_fold_metrics.csv", fold_rows)
+        self._write_csv(out_dir / f"{model_key}_evaluation_metrics.csv", [aggregate])
+        self._write_csv(out_dir / f"{model_key}_predictions.csv", prediction_rows)
+        return aggregate
+
+    def _cleanup_fold_state(self) -> None:
+        self.train_loader = None
+        self.test_loader = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def run(self) -> dict:
         try:
             self._setup_runtime()
-            train_adata, test_adata, train_targets, test_targets = self._prepare_train_test_data()
+            adata, targets, groups = self._prepare_cv_data()
+            splits = self._build_cv_splits(adata, groups)
+            checkpoint_paths = self._get_checkpoint_paths()
+            self._save_run_metadata(checkpoint_paths)
             if self.is_master:
                 log.info(
-                    "Prepared deconvolution data: train=%d, test=%d, genes=%d, cell_types=%d",
-                    train_adata.n_obs,
-                    test_adata.n_obs,
-                    train_adata.n_vars,
+                    "Prepared deconvolution CV data: samples=%d, genes=%d, cell_types=%d, folds=%d",
+                    adata.n_obs,
+                    adata.n_vars,
                     len(self.cell_types),
+                    len(splits),
                 )
 
-            self._build_loaders(train_adata, test_adata, train_targets, test_targets)
-            self._build_model()
-            self._build_optimization()
-
             epochs = int(getattr(self.task_cfg, "epochs", 10))
-            last_train_metrics = {"loss": float("nan")}
-            for epoch in range(1, epochs + 1):
-                last_train_metrics = self._train_one_epoch(epoch)
+            aggregate_rows: list[dict[str, object]] = []
+
+            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+                fold_rows: list[dict[str, object]] = []
+                prediction_rows: list[dict[str, object]] = []
+                for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
+                    seed_all(
+                        int(getattr(self.task_cfg, "random_seed", 42))
+                        + self.rank
+                        + model_idx * 10000
+                        + fold_idx
+                    )
+                    train_adata = adata[train_idx].copy()
+                    test_adata = adata[test_idx].copy()
+                    train_targets = targets[train_idx]
+                    test_targets = targets[test_idx]
+                    if self.is_master:
+                        log.info(
+                            "Model %s | Fold %d/%d | train=%d, test=%d",
+                            model_key,
+                            fold_idx,
+                            len(splits),
+                            train_adata.n_obs,
+                            test_adata.n_obs,
+                        )
+
+                    self._build_loaders(train_adata, test_adata, train_targets, test_targets)
+                    self._build_model(checkpoint_path)
+                    self._build_optimization()
+
+                    last_train_metrics = {"loss": float("nan")}
+                    for epoch in range(1, epochs + 1):
+                        last_train_metrics = self._train_one_epoch(epoch)
+                        if self.is_master:
+                            log.info(
+                                "Model %s | Fold %d/%d | Epoch %d | Training Loss: %.6f",
+                                model_key,
+                                fold_idx,
+                                len(splits),
+                                epoch,
+                                last_train_metrics["loss"],
+                            )
+
+                    test_metrics = self._evaluate()
+                    if self.is_master:
+                        fold_rows.append(
+                            self._flatten_fold_metrics(
+                                model_key=model_key,
+                                fold=fold_idx,
+                                n_folds=len(splits),
+                                checkpoint_path=checkpoint_path,
+                                train_metrics=last_train_metrics,
+                                test_metrics=test_metrics,
+                            )
+                        )
+                        prediction_rows.extend(
+                            self._prediction_rows(
+                                model_key=model_key,
+                                fold=fold_idx,
+                                checkpoint_path=checkpoint_path,
+                                test_adata=test_adata,
+                                test_metrics=test_metrics,
+                            )
+                        )
+                    self._cleanup_fold_state()
+
                 if self.is_master:
-                    log.info("Epoch %d | Training Loss: %.6f", epoch, last_train_metrics["loss"])
+                    aggregate_rows.append(
+                        self._write_model_results(
+                            checkpoint_path,
+                            fold_rows,
+                            prediction_rows,
+                        )
+                    )
+                if self.is_distributed:
+                    dist.barrier()
 
-            test_metrics = self._evaluate()
-            checkpoint_path = self._save_checkpoint(
-                epoch=epochs,
-                train_metrics={"loss": float(last_train_metrics["loss"])},
-                test_metrics=test_metrics,
-            )
-            if checkpoint_path is not None:
-                test_metrics["checkpoint_path"] = str(checkpoint_path)
-
-            return {
-                "train_loss": float(last_train_metrics["loss"]),
-                **test_metrics,
-            }
+            if self.is_master:
+                combined_dir = self._task_output_dir()
+                self._write_csv(combined_dir / "evaluation_metrics.csv", aggregate_rows)
+                return {
+                    "results_path": str(combined_dir / "evaluation_metrics.csv"),
+                    "results": aggregate_rows,
+                }
+            return {}
         finally:
             if self.is_distributed and dist.is_initialized():
                 dist.barrier()
