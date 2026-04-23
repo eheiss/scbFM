@@ -226,15 +226,25 @@ class SequentialSequence(nn.Module):
         if output_attentions:
             attn_weights = []
 
-        for (f, g), (f_args, g_args) in layers_and_args:
+        for layer, (f_args, g_args) in layers_and_args:
+            f, g = layer[0], layer[1]
+            attn_adapter = layer[2] if len(layer) > 2 else None
+            ff_adapter = layer[3] if len(layer) > 3 else None
+
             if output_attentions:
                 attn_out, layer_attn_weights = f(x, output_attentions = output_attentions, **f_args)
                 x = x + attn_out
+                if exists(attn_adapter):
+                    x = attn_adapter(x)
                 attn_weights.append(layer_attn_weights.unsqueeze(0))
             else:
                 x = x + f(x, **f_args)
+                if exists(attn_adapter):
+                    x = attn_adapter(x)
 
             x = x + g(x, **g_args)
+            if exists(ff_adapter):
+                x = ff_adapter(x)
 
         if output_attentions:
             attn_weights = torch.transpose(torch.cat(attn_weights, dim = 0), 0, 1)
@@ -242,6 +252,20 @@ class SequentialSequence(nn.Module):
             return x, attn_weights
 
         return x
+
+class Adapter(nn.Module):
+    def __init__(self, dim, bottleneck_dim = 32, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, dim)
+        )
+
+    def forward(self, x, **kwargs):
+        return x + self.net(x)
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult = 4, dropout = 0., activation = None, glu = False):
@@ -353,6 +377,7 @@ class Performer(nn.Module):
         qkv_bias = True,                    # ??
     ):
         super().__init__()
+        self.dim = dim
         layers = nn.ModuleList([])
 
         if use_scalenorm:
@@ -376,6 +401,49 @@ class Performer(nn.Module):
         self.auto_check_redraw = auto_check_redraw
         self.feature_redraw_interval = feature_redraw_interval
         self.register_buffer('calls_since_last_redraw', torch.tensor(0))
+
+    def add_adapters(
+        self,
+        bottleneck_dim = 32,
+        dropout = 0.,
+        after_attention = True,
+        after_ff = True
+    ):
+        if not after_attention and not after_ff:
+            raise ValueError('At least one adapter insertion point must be enabled.')
+
+        adapters = nn.ModuleList([])
+        for layer in self.net.layers:
+            if len(layer) > 2:
+                raise ValueError('Adapters have already been added to this Performer.')
+
+            attn_adapter = Adapter(
+                dim=self.dim,
+                bottleneck_dim=bottleneck_dim,
+                dropout=dropout
+            ) if after_attention else nn.Identity()
+            ff_adapter = Adapter(
+                dim=self.dim,
+                bottleneck_dim=bottleneck_dim,
+                dropout=dropout
+            ) if after_ff else nn.Identity()
+
+            layer.append(attn_adapter)
+            layer.append(ff_adapter)
+
+            if after_attention:
+                adapters.append(attn_adapter)
+            if after_ff:
+                adapters.append(ff_adapter)
+
+        return adapters
+
+    def adapter_parameters(self):
+        params = []
+        for layer in self.net.layers:
+            for module in list(layer)[2:]:
+                params.extend(list(module.parameters()))
+        return params
 
     def fix_projection_matrices_(self):
         self.feature_redraw_interval = None
@@ -447,6 +515,23 @@ class PerformerLM(nn.Module):
 
     def fix_projection_matrices_(self):
         self.performer.fix_projection_matrices_()
+
+    def add_adapters(
+        self,
+        bottleneck_dim = 32,
+        dropout = 0.,
+        after_attention = True,
+        after_ff = True
+    ):
+        return self.performer.add_adapters(
+            bottleneck_dim=bottleneck_dim,
+            dropout=dropout,
+            after_attention=after_attention,
+            after_ff=after_ff
+        )
+
+    def adapter_parameters(self):
+        return self.performer.adapter_parameters()
 
     def forward(self, x, return_encodings = False, output_attentions = False, **kwargs):
         b, n, device = *x.shape, x.device

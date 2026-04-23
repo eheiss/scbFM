@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import os
@@ -144,7 +145,6 @@ class PreTrainRunner:
         self.optimizer = None
         self.scheduler = None
         self.loss_fn = None
-        self.softmax = nn.Softmax(dim=-1)
 
     def _setup_runtime(self) -> None:
         if self.is_distributed and not dist.is_initialized():
@@ -300,14 +300,230 @@ class PreTrainRunner:
             mask_ignore_token_ids=self.mask_ignore_token_ids,
         )
 
+    def _output_dir(self) -> Path:
+        return ROOT / "output" / str(self.pretrain_cfg.model_name)
+
+    @staticmethod
+    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        preferred = [
+            "epoch",
+            "split",
+            "loss",
+            "accuracy",
+            "token_id",
+            "target_count",
+            "target_fraction",
+            "correct_count",
+            "predicted_count",
+            "precision",
+            "recall",
+            "f1",
+        ]
+        fieldnames = [field for field in preferred if any(field in row for row in rows)]
+        extra_fields = sorted(
+            {
+                field
+                for row in rows
+                for field in row
+                if field not in fieldnames
+            }
+        )
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *extra_fields])
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _new_mask_stats(self) -> dict[str, torch.Tensor]:
+        expression_token_count = self.pad_token_id
+        return {
+            "target_counts": torch.zeros(
+                expression_token_count,
+                dtype=torch.float64,
+                device=self.device,
+            ),
+            "predicted_counts": torch.zeros(
+                expression_token_count,
+                dtype=torch.float64,
+                device=self.device,
+            ),
+            "correct_counts": torch.zeros(
+                expression_token_count,
+                dtype=torch.float64,
+                device=self.device,
+            ),
+            "sample_count": torch.zeros((), dtype=torch.float64, device=self.device),
+        }
+
+    def _update_mask_stats(
+        self,
+        stats: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        predictions: torch.Tensor,
+    ) -> None:
+        valid_mask = labels != self.pad_token_id
+        valid_labels = labels[valid_mask]
+        valid_predictions = predictions[valid_mask]
+
+        stats["sample_count"] += labels.shape[0]
+        if valid_labels.numel() == 0:
+            return
+
+        stats["target_counts"] += torch.bincount(
+            valid_labels,
+            minlength=self.pad_token_id,
+        )[: self.pad_token_id].to(torch.float64)
+        stats["predicted_counts"] += torch.bincount(
+            valid_predictions,
+            minlength=self.pad_token_id,
+        )[: self.pad_token_id].to(torch.float64)
+        correct_labels = valid_labels[valid_predictions == valid_labels]
+        if correct_labels.numel() > 0:
+            stats["correct_counts"] += torch.bincount(
+                correct_labels,
+                minlength=self.pad_token_id,
+            )[: self.pad_token_id].to(torch.float64)
+
+    def _reduce_mask_stats(self, stats: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not self.is_distributed:
+            return stats
+        reduced = {}
+        for key, value in stats.items():
+            reduced_value = value.clone()
+            dist.all_reduce(reduced_value, op=dist.ReduceOp.SUM)
+            reduced[key] = reduced_value
+        return reduced
+
+    @staticmethod
+    def _safe_divide(numerator: float, denominator: float) -> float:
+        return float(numerator / denominator) if denominator > 0 else float("nan")
+
+    def _format_mask_stats(
+        self,
+        *,
+        epoch: int,
+        split: str,
+        loss: float,
+        stats: dict[str, torch.Tensor],
+        reduce_stats: bool = True,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        if reduce_stats:
+            stats = self._reduce_mask_stats(stats)
+        target_counts = stats["target_counts"].detach().cpu().numpy()
+        predicted_counts = stats["predicted_counts"].detach().cpu().numpy()
+        correct_counts = stats["correct_counts"].detach().cpu().numpy()
+        sample_count = float(stats["sample_count"].detach().cpu().item())
+
+        total_targets = float(target_counts.sum())
+        total_correct = float(correct_counts.sum())
+        zero_targets = float(target_counts[0]) if target_counts.size > 0 else 0.0
+        zero_correct = float(correct_counts[0]) if correct_counts.size > 0 else 0.0
+        nonzero_targets = total_targets - zero_targets
+        nonzero_correct = total_correct - zero_correct
+
+        precision = np.divide(
+            correct_counts,
+            predicted_counts,
+            out=np.full_like(correct_counts, np.nan, dtype=float),
+            where=predicted_counts > 0,
+        )
+        recall = np.divide(
+            correct_counts,
+            target_counts,
+            out=np.full_like(correct_counts, np.nan, dtype=float),
+            where=target_counts > 0,
+        )
+        f1 = np.divide(
+            2 * precision * recall,
+            precision + recall,
+            out=np.full_like(correct_counts, np.nan, dtype=float),
+            where=(precision + recall) > 0,
+        )
+        supported_bins = target_counts > 0
+
+        if total_targets > 0:
+            majority_token_id = int(np.argmax(target_counts))
+            majority_count = float(target_counts[majority_token_id])
+            majority_fraction = majority_count / total_targets
+            target_distribution = target_counts / total_targets
+            nonzero_distribution = target_distribution[target_distribution > 0]
+            target_entropy = float(-np.sum(nonzero_distribution * np.log(nonzero_distribution)))
+        else:
+            majority_token_id = -1
+            majority_count = 0.0
+            majority_fraction = float("nan")
+            target_entropy = float("nan")
+
+        summary_row: dict[str, object] = {
+            "epoch": epoch,
+            "split": split,
+            "loss": float(loss),
+            "accuracy": 100.0 * self._safe_divide(total_correct, total_targets),
+            "macro_f1": float(np.nanmean(f1[supported_bins])) if np.any(supported_bins) else float("nan"),
+            "weighted_f1": self._safe_divide(
+                float(np.nansum(np.nan_to_num(f1) * target_counts)),
+                total_targets,
+            ),
+            "masked_token_count": int(total_targets),
+            "avg_masked_tokens_per_sample": self._safe_divide(total_targets, sample_count),
+            "zero_target_count": int(zero_targets),
+            "zero_target_fraction": self._safe_divide(zero_targets, total_targets),
+            "zero_accuracy": 100.0 * self._safe_divide(zero_correct, zero_targets),
+            "nonzero_target_count": int(nonzero_targets),
+            "nonzero_target_fraction": self._safe_divide(nonzero_targets, total_targets),
+            "nonzero_accuracy": 100.0 * self._safe_divide(nonzero_correct, nonzero_targets),
+            "majority_token_id": majority_token_id,
+            "majority_token_fraction": majority_fraction,
+            "majority_baseline_accuracy": 100.0 * majority_fraction,
+            "target_entropy": target_entropy,
+            "mask_prob": float(self.pretrain_cfg.mask_prob),
+            "replace_prob": float(self.pretrain_cfg.replace_prob),
+            "random_token_prob": float(self.pretrain_cfg.random_token_prob),
+            "mask_ignore_token_ids": ";".join(map(str, self.mask_ignore_token_ids)),
+        }
+
+        bin_rows = []
+        ignored_token_ids = set(self.mask_ignore_token_ids)
+        for token_id in range(self.pad_token_id):
+            target_count = float(target_counts[token_id])
+            bin_rows.append(
+                {
+                    "epoch": epoch,
+                    "split": split,
+                    "token_id": token_id,
+                    "target_count": int(target_count),
+                    "target_fraction": self._safe_divide(target_count, total_targets),
+                    "correct_count": int(correct_counts[token_id]),
+                    "predicted_count": int(predicted_counts[token_id]),
+                    "precision": float(precision[token_id]),
+                    "recall": float(recall[token_id]),
+                    "f1": float(f1[token_id]),
+                    "ignored_for_masking": int(token_id in ignored_token_ids),
+                }
+            )
+        return summary_row, bin_rows
+
+    def _write_diagnostics(
+        self,
+        epoch_rows: list[dict[str, object]],
+        bin_rows: list[dict[str, object]],
+    ) -> None:
+        if not self.is_master:
+            return
+        out_dir = self._output_dir()
+        self._write_csv(out_dir / "pretrain_epoch_metrics.csv", epoch_rows)
+        self._write_csv(out_dir / "pretrain_bin_metrics.csv", bin_rows)
+
     def _save_checkpoint(self, epoch: int, train_loss: float) -> Path | None:
         if not self.is_master:
             return None
 
         model_name = str(self.pretrain_cfg.model_name)
-        checkpoint_dir = ROOT / "output" / model_name / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = checkpoint_dir / f"{model_name}_{epoch}.pth"
+        output_dir = self._output_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = output_dir / f"{model_name}.pth"
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
         torch.save(
@@ -322,7 +538,7 @@ class PreTrainRunner:
         )
         return checkpoint_path
 
-    def _train_one_epoch(self, epoch: int) -> dict:
+    def _train_one_epoch(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]]:
         if self.is_distributed:
             self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
@@ -332,8 +548,8 @@ class PreTrainRunner:
         max_grad_norm = self.pretrain_cfg.max_grad_norm
 
         running_loss = 0.0
-        running_acc = 0.0
         num_batches = 0
+        mask_stats = self._new_mask_stats()
         self.optimizer.zero_grad(set_to_none=True)
 
         for step_idx, batch in enumerate(self.train_loader, start=1):
@@ -362,32 +578,38 @@ class PreTrainRunner:
                 self.optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                predictions = self.softmax(logits)[..., 1:self.pad_token_id].argmax(dim=-1) + 1
-                valid_token_counts = (labels != self.pad_token_id).sum(dim=-1)
-                correct_token_counts = (
-                    (labels != self.pad_token_id) & (predictions == labels)
-                ).sum(dim=-1)
-                batch_acc = torch.where(
-                    valid_token_counts > 0,
-                    correct_token_counts.float() / valid_token_counts.float(),
-                    torch.zeros_like(valid_token_counts, dtype=torch.float),
-                ).mean()
+                predictions = logits[..., : self.pad_token_id].argmax(dim=-1)
+                self._update_mask_stats(mask_stats, labels, predictions)
 
             running_loss += loss.item()
-            running_acc += batch_acc.item()
             num_batches += 1
 
         epoch_loss = running_loss / max(num_batches, 1)
-        epoch_acc = 100.0 * running_acc / max(num_batches, 1)
 
         if self.is_distributed:
             epoch_loss = get_reduced(epoch_loss, self.device, 0, self.world_size)
-            epoch_acc = get_reduced(epoch_acc, self.device, 0, self.world_size)
 
         self.scheduler.step()
-        return {"train_loss": epoch_loss, "train_accuracy": epoch_acc}
+        summary_row, bin_rows = self._format_mask_stats(
+            epoch=epoch,
+            split="train",
+            loss=epoch_loss,
+            stats=mask_stats,
+        )
+        return (
+            {
+                "train_loss": epoch_loss,
+                "train_accuracy": summary_row["accuracy"],
+                "train_masked_token_count": summary_row["masked_token_count"],
+                "train_nonzero_accuracy": summary_row["nonzero_accuracy"],
+                "train_zero_target_fraction": summary_row["zero_target_fraction"],
+                "train_majority_baseline_accuracy": summary_row["majority_baseline_accuracy"],
+            },
+            summary_row,
+            bin_rows,
+        )
 
-    def _validate(self) -> dict | None:
+    def _validate(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]] | None:
         if self.val_loader is None:
             return None
 
@@ -408,9 +630,7 @@ class PreTrainRunner:
                 loss = self.loss_fn(logits.transpose(1, 2), labels)
 
                 running_loss += loss.item()
-                predictions.append(
-                    self.softmax(logits)[..., 1:self.pad_token_id].argmax(dim=-1) + 1
-                )
+                predictions.append(logits[..., : self.pad_token_id].argmax(dim=-1))
                 truths.append(labels)
                 num_batches += 1
 
@@ -431,13 +651,27 @@ class PreTrainRunner:
             )
             val_loss = get_reduced(val_loss, self.device, 0, self.world_size)
 
-        valid_token_count = (truth_tensor != self.pad_token_id).sum().item()
-        correct_token_count = (
-            (truth_tensor != self.pad_token_id) & (prediction_tensor == truth_tensor)
-        ).sum().item()
-        val_acc = 100.0 * correct_token_count / max(valid_token_count, 1)
-
-        return {"val_loss": val_loss, "val_accuracy": val_acc}
+        mask_stats = self._new_mask_stats()
+        self._update_mask_stats(mask_stats, truth_tensor, prediction_tensor)
+        summary_row, bin_rows = self._format_mask_stats(
+            epoch=epoch,
+            split="val",
+            loss=val_loss,
+            stats=mask_stats,
+            reduce_stats=False,
+        )
+        return (
+            {
+                "val_loss": val_loss,
+                "val_accuracy": summary_row["accuracy"],
+                "val_masked_token_count": summary_row["masked_token_count"],
+                "val_nonzero_accuracy": summary_row["nonzero_accuracy"],
+                "val_zero_target_fraction": summary_row["zero_target_fraction"],
+                "val_majority_baseline_accuracy": summary_row["majority_baseline_accuracy"],
+            },
+            summary_row,
+            bin_rows,
+        )
 
     def run(self) -> dict:
         self._setup_runtime()
@@ -449,7 +683,10 @@ class PreTrainRunner:
         epochs = self.pretrain_cfg.epochs
         validate_every = self.pretrain_cfg.valid_every
         history = []
-        last_checkpoint = None
+        epoch_metric_rows = []
+        bin_metric_rows = []
+        final_checkpoint = None
+        last_train_loss = float("nan")
 
         if self.is_master:
 
@@ -471,31 +708,49 @@ class PreTrainRunner:
 
         try:
             for epoch in range(1, epochs + 1):
-                train_metrics = self._train_one_epoch(epoch)
+                train_metrics, train_epoch_row, train_bin_rows = self._train_one_epoch(epoch)
+                last_train_loss = train_metrics["train_loss"]
 
                 if self.is_master:
                     log.info(
-                        "Epoch %d | Training Loss: %.6f | Accuracy: %.4f%%",
+                        (
+                            "Epoch %d | Training Loss: %.6f | Accuracy: %.4f%% | "
+                            "Nonzero Accuracy: %.4f%% | Majority Baseline: %.4f%% | "
+                            "Zero Target Fraction: %.6f"
+                        ),
                         epoch,
                         train_metrics["train_loss"],
                         train_metrics["train_accuracy"],
+                        train_metrics["train_nonzero_accuracy"],
+                        train_metrics["train_majority_baseline_accuracy"],
+                        train_metrics["train_zero_target_fraction"],
                     )
+                    epoch_metric_rows.append(train_epoch_row)
+                    bin_metric_rows.extend(train_bin_rows)
 
                 val_metrics = None
                 if validate_every > 0 and epoch % validate_every == 0:
-                    val_metrics = self._validate()
-                    if self.is_master and val_metrics is not None:
+                    val_result = self._validate(epoch)
+                    if val_result is not None:
+                        val_metrics, val_epoch_row, val_bin_rows = val_result
+                    if self.is_master and val_result is not None:
                         log.info(
-                            "Epoch %d | Validation Loss: %.6f | Accuracy: %.4f%%",
+                            (
+                                "Epoch %d | Validation Loss: %.6f | Accuracy: %.4f%% | "
+                                "Nonzero Accuracy: %.4f%% | Majority Baseline: %.4f%% | "
+                                "Zero Target Fraction: %.6f"
+                            ),
                             epoch,
                             val_metrics["val_loss"],
                             val_metrics["val_accuracy"],
+                            val_metrics["val_nonzero_accuracy"],
+                            val_metrics["val_majority_baseline_accuracy"],
+                            val_metrics["val_zero_target_fraction"],
                         )
+                        epoch_metric_rows.append(val_epoch_row)
+                        bin_metric_rows.extend(val_bin_rows)
 
-                checkpoint_path = self._save_checkpoint(epoch, train_metrics["train_loss"])
-                if checkpoint_path is not None:
-                    last_checkpoint = str(checkpoint_path)
-                    log.info("Saved checkpoint to %s", checkpoint_path)
+                self._write_diagnostics(epoch_metric_rows, bin_metric_rows)
 
                 history.append(
                     {
@@ -505,9 +760,14 @@ class PreTrainRunner:
                     }
                 )
 
+            checkpoint_path = self._save_checkpoint(epochs, last_train_loss)
+            if checkpoint_path is not None:
+                final_checkpoint = str(checkpoint_path)
+                log.info("Saved final checkpoint to %s", checkpoint_path)
+
             return {
                 "history": history,
-                "last_checkpoint": last_checkpoint,
+                "final_checkpoint": final_checkpoint,
             }
         finally:
             if self.is_distributed and dist.is_initialized():

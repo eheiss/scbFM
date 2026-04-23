@@ -49,7 +49,9 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_COHORTS = ["BRCA", "BLCA", "GBM", "LGG", "LUAD", "UCEC"]
 TASK_NAME = "canc_type_class"
-MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
+CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
+RANDOM_INIT_MODEL_KEY = "random_init"
+MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
 
 
 class CancTypePredHead(nn.Module):
@@ -386,12 +388,12 @@ class CancTypeClassRunner:
         if paths_cfg is None:
             raise ValueError(
                 "finetune.canc_type_class.pretrained_model_paths must define "
-                f"{', '.join(MODEL_KEYS)}."
+                f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
 
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in MODEL_KEYS:
+        for key in CHECKPOINT_MODEL_KEYS:
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -402,6 +404,7 @@ class CancTypeClassRunner:
                 "Missing checkpoint paths in finetune.canc_type_class.pretrained_model_paths: "
                 f"{missing}"
             )
+        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     def _load_tcga(self) -> ad.AnnData:
@@ -629,7 +632,7 @@ class CancTypeClassRunner:
 
     def _build_model(self, checkpoint_path: str) -> None:
         finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
-        valid_modes = {"head_only", "full_ft"}
+        valid_modes = {"head_only", "full_ft", "adapters"}
         if finetune_mode not in valid_modes:
             raise ValueError(
                 f"Unsupported finetune_mode '{finetune_mode}'. Expected one of {sorted(valid_modes)}."
@@ -659,13 +662,14 @@ class CancTypeClassRunner:
             qkv_bias=bool(self.model_cfg.qkv_bias),
         )
 
-        if not checkpoint_path:
-            raise ValueError("A pretrained checkpoint path must be set.")
-        resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
-        checkpoint = torch.load(resolved_path, map_location="cpu")
-        state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
-        model.load_state_dict(state_dict)
-        log.info("Loaded pretrained checkpoint from %s", resolved_path)
+        if checkpoint_path:
+            resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
+            checkpoint = torch.load(resolved_path, map_location="cpu")
+            state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
+            model.load_state_dict(state_dict)
+            log.info("Loaded pretrained checkpoint from %s", resolved_path)
+        else:
+            log.info("Using randomly initialized backbone")
 
         model.to_out = CancTypePredHead(
             seq_len=int(self.model_cfg.gene_num) + 1,
@@ -673,10 +677,26 @@ class CancTypeClassRunner:
             output_dim=len(self.label_dict),
         )
 
+        if finetune_mode == "adapters":
+            model.add_adapters(
+                bottleneck_dim=int(getattr(self.task_cfg, "adapter_bottleneck_dim", 32)),
+                dropout=float(getattr(self.task_cfg, "adapter_dropout", 0.0)),
+                after_attention=bool(getattr(self.task_cfg, "adapter_after_attention", True)),
+                after_ff=bool(getattr(self.task_cfg, "adapter_after_ff", True)),
+            )
+
         if finetune_mode == "head_only":
             for param in model.parameters():
                 param.requires_grad = False
             for param in model.to_out.parameters():
+                param.requires_grad = True
+            self.backbone_optimizer_enabled = False
+        elif finetune_mode == "adapters":
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.to_out.parameters():
+                param.requires_grad = True
+            for param in model.adapter_parameters():
                 param.requires_grad = True
             self.backbone_optimizer_enabled = False
         elif finetune_mode == "full_ft":
@@ -702,14 +722,27 @@ class CancTypeClassRunner:
             raise ValueError("finetune.canc_type_class.backbone_learning_rate must be set.")
         head_learning_rate = float(self.task_cfg.head_learning_rate)
         backbone_learning_rate = float(self.task_cfg.backbone_learning_rate)
+        adapter_learning_rate = float(
+            getattr(self.task_cfg, "adapter_learning_rate", head_learning_rate)
+        )
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
         head_params = [param for param in model.to_out.parameters() if param.requires_grad]
         head_param_ids = {id(param) for param in head_params}
+        adapter_params = [
+            param
+            for param in model.adapter_parameters()
+            if param.requires_grad
+        ]
+        adapter_param_ids = {id(param) for param in adapter_params}
         backbone_params = [
             param
             for param in model.parameters()
-            if param.requires_grad and id(param) not in head_param_ids
+            if (
+                param.requires_grad
+                and id(param) not in head_param_ids
+                and id(param) not in adapter_param_ids
+            )
         ]
 
         param_groups = []
@@ -719,6 +752,14 @@ class CancTypeClassRunner:
                     "params": backbone_params,
                     "lr": backbone_learning_rate,
                     "name": "backbone",
+                }
+            )
+        if adapter_params:
+            param_groups.append(
+                {
+                    "params": adapter_params,
+                    "lr": adapter_learning_rate,
+                    "name": "adapters",
                 }
             )
         if head_params:

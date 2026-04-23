@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import gc
 import json
+import re
 
 import anndata as ad
 import h5py
@@ -28,7 +29,9 @@ ARCHS4_MERGE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 GTEX_OUT = OUT_DIR / "gtex_binned.h5ad"
 ARCHS4_OUT = OUT_DIR / "archs4_binned.h5ad"
-PRETRAIN_OUT = OUT_DIR / "pretraining_binned.h5ad"
+PRETRAIN_OUT = OUT_DIR / "pretraining_bulk_binned.h5ad"
+PREADAPT_OUT = OUT_DIR / "preadapt_bulk_binned.h5ad"
+ARCHS4_GTEX_DONOR_HITS_OUT = OUT_DIR / "archs4_gtex_donor_hits.csv"
 
 
 # =========================
@@ -40,6 +43,9 @@ MIN_GENES = 200
 TARGET_SUM = 1e4
 ARCHS4_CHUNK_SIZE = 2000  # samples per chunk before cell filtering
 MERGE_BATCH_SIZE = 16
+PRETRAIN_SAMPLE_COUNT = 700_000
+RANDOM_SEED = 42
+GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
 
 
 # =========================
@@ -55,11 +61,26 @@ def read_gene_list(path: Path) -> list[str]:
 def decode_bytes_array(arr) -> list[str]:
     out = []
     for x in arr:
-        if isinstance(x, bytes):
-            out.append(x.decode("utf-8"))
+        if hasattr(x, "decode"):
+            out.append(x.decode("utf-8", errors="ignore"))
         else:
             out.append(str(x))
     return out
+
+
+def decode_value(value) -> str:
+    if hasattr(value, "decode"):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def gtex_donor_id(sample_id: str) -> str:
+    parts = sample_id.upper().split("-")
+    return "-".join(parts[:2]) if len(parts) >= 2 else sample_id.upper()
+
+
+def extract_gtex_donors(value: str, valid_donors: set[str]) -> set[str]:
+    return {match for match in GTEX_DONOR_PATTERN.findall(value.upper()) if match in valid_donors}
 
 
 def build_reindexer(source_gene_ids: list[str] | pd.Index, target_gene_list: list[str]) -> tuple[list[int], list[int], list[str]]:
@@ -158,15 +179,17 @@ def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
 # GTEx
 # =========================
 
-def preprocess_gtex(gene_list: list[str]) -> Path:
+def preprocess_gtex(gene_list: list[str]) -> tuple[Path, set[str]]:
     print("Loading GTEx...")
     adata = ad.read_h5ad(GTEX_PATH)
+    gtex_donors = {gtex_donor_id(sample_id) for sample_id in adata.obs_names.astype(str)}
 
     gtex_gene_ids = adata.var_names.astype(str)
     src_pos, tgt_pos, missing = build_reindexer(gtex_gene_ids, gene_list)
 
     print(f"GTEx genes present: {len(src_pos)} / {len(gene_list)}")
     print(f"GTEx genes missing: {len(missing)}")
+    print(f"GTEx donor IDs: {len(gtex_donors)}")
 
     if sparse.issparse(adata.X):
         x_present = adata.X[:, src_pos].toarray().astype(np.float32)
@@ -193,14 +216,62 @@ def preprocess_gtex(gene_list: list[str]) -> Path:
         json.dump(missing, f)
 
     print(f"Saved {GTEX_OUT}")
-    return GTEX_OUT
+    return GTEX_OUT, gtex_donors
 
 
 # =========================
 # ARCHS4 -> chunks
 # =========================
 
-def preprocess_archs4_to_chunks(gene_list: list[str], chunk_size: int = ARCHS4_CHUNK_SIZE) -> list[Path]:
+def find_archs4_gtex_donor_hits(gtex_donors: set[str]) -> set[int]:
+    print("Scanning ARCHS4 metadata for GTEx donor IDs...")
+    hits: dict[int, dict[str, set[str]]] = {}
+
+    with h5py.File(ARCHS4_PATH, "r") as f:
+        sample_group = f["meta/samples"]
+        keys = list(sample_group.keys())
+        n_samples = len(sample_group["sample"])
+
+        for key in keys:
+            values = sample_group[key][:]
+            for i, raw in enumerate(values):
+                value = decode_value(raw)
+                if "GTEX" not in value.upper():
+                    continue
+                matched_donors = extract_gtex_donors(value, gtex_donors)
+                if not matched_donors:
+                    continue
+                record = hits.setdefault(
+                    i,
+                    {"matched_fields": set(), "matched_donors": set()},
+                )
+                record["matched_fields"].add(key)
+                record["matched_donors"].update(matched_donors)
+
+        rows = []
+        for i, record in sorted(hits.items()):
+            row = {
+                "archs4_row": int(i),
+                "matched_fields": ";".join(sorted(record["matched_fields"])),
+                "matched_donors": ";".join(sorted(record["matched_donors"])),
+            }
+            for key in keys:
+                row[key] = decode_value(sample_group[key][i])
+            rows.append(row)
+
+    pd.DataFrame(rows).to_csv(ARCHS4_GTEX_DONOR_HITS_OUT, index=False)
+    print(
+        f"ARCHS4 samples with GTEx donor ID hits: {len(hits)} / {n_samples}; "
+        f"details saved to {ARCHS4_GTEX_DONOR_HITS_OUT}"
+    )
+    return set(hits)
+
+
+def preprocess_archs4_to_chunks(
+    gene_list: list[str],
+    gtex_donor_hits: set[int],
+    chunk_size: int = ARCHS4_CHUNK_SIZE,
+) -> list[Path]:
     print("Preparing ARCHS4 mappings...")
     with h5py.File(ARCHS4_PATH, "r") as f:
         archs4_gene_ids = decode_bytes_array(f["meta/genes/ensembl_gene"][:])
@@ -209,10 +280,23 @@ def preprocess_archs4_to_chunks(gene_list: list[str], chunk_size: int = ARCHS4_C
 
     src_pos, tgt_pos, missing = build_reindexer(archs4_gene_ids, gene_list)
     bulk_like_idx = np.where(sc_prob < 0.5)[0]   # keep bulk-like samples
+    bulk_like_before_filter = len(bulk_like_idx)
+    if gtex_donor_hits:
+        gtex_hit_mask = np.isin(bulk_like_idx, np.fromiter(gtex_donor_hits, dtype=np.int64))
+        excluded_bulk_like_count = int(gtex_hit_mask.sum())
+        bulk_like_idx = bulk_like_idx[~gtex_hit_mask]
+    else:
+        excluded_bulk_like_count = 0
 
     print(f"ARCHS4 genes present: {len(src_pos)} / {len(gene_list)}")
     print(f"ARCHS4 genes missing: {len(missing)}")
-    print(f"ARCHS4 kept samples (singlecellprobability < 0.5): {len(bulk_like_idx)} / {len(sc_prob)}")
+    print(
+        "ARCHS4 kept samples "
+        f"(singlecellprobability < 0.5, before GTEx donor filtering): "
+        f"{bulk_like_before_filter} / {len(sc_prob)}"
+    )
+    print(f"ARCHS4 bulk-like samples excluded by GTEx donor IDs: {excluded_bulk_like_count}")
+    print(f"ARCHS4 kept samples after GTEx donor filtering: {len(bulk_like_idx)}")
 
     with open(OUT_DIR / "archs4_missing_genes.json", "w") as f:
         json.dump(missing, f)
@@ -300,24 +384,44 @@ def merge_archs4_chunks(chunk_paths: list[Path]) -> Path:
 
 
 # =========================
-# GTEx + ARCHS4 -> one h5ad
+# GTEx + ARCHS4 -> pretraining and pre-adaptation h5ad files
 # =========================
 
-def merge_pretraining(gtex_path: Path, archs4_path: Path) -> Path:
-    print("Merging GTEx + ARCHS4...")
+def merge_and_split_bulk_datasets(gtex_path: Path, archs4_path: Path) -> tuple[Path, Path]:
+    print("Merging GTEx + filtered ARCHS4...")
     gtex = ad.read_h5ad(gtex_path)
     archs4 = ad.read_h5ad(archs4_path)
 
     merged = ad.concat([gtex, archs4], axis=0, join="outer", merge="same", index_unique=None)
     merged.obs_names_make_unique()
-    print(f"Pretraining merged: {merged.n_obs} samples x {merged.n_vars} genes")
-    merged.write(PRETRAIN_OUT)
+    print(f"Merged bulk data: {merged.n_obs} samples x {merged.n_vars} genes")
 
-    del gtex, archs4, merged
+    if merged.n_obs < PRETRAIN_SAMPLE_COUNT:
+        raise ValueError(
+            f"Cannot sample {PRETRAIN_SAMPLE_COUNT} pretraining samples from only "
+            f"{merged.n_obs} merged bulk samples."
+        )
+
+    rng = np.random.default_rng(RANDOM_SEED)
+    shuffled = rng.permutation(merged.n_obs)
+    pretrain_idx = np.sort(shuffled[:PRETRAIN_SAMPLE_COUNT])
+    preadapt_idx = np.sort(shuffled[PRETRAIN_SAMPLE_COUNT:])
+
+    pretrain = merged[pretrain_idx].copy()
+    preadapt = merged[preadapt_idx].copy()
+    pretrain.obs["bulk_split"] = "pretrain"
+    preadapt.obs["bulk_split"] = "preadapt"
+
+    pretrain.write(PRETRAIN_OUT)
+    preadapt.write(PREADAPT_OUT)
+
+    print(f"Pretraining bulk samples: {pretrain.n_obs}; saved {PRETRAIN_OUT}")
+    print(f"Pre-adaptation bulk samples: {preadapt.n_obs}; saved {PREADAPT_OUT}")
+
+    del gtex, archs4, merged, pretrain, preadapt
     gc.collect()
 
-    print(f"Saved {PRETRAIN_OUT}")
-    return PRETRAIN_OUT
+    return PRETRAIN_OUT, PREADAPT_OUT
 
 
 # =========================
@@ -328,10 +432,15 @@ def main():
     gene_list = read_gene_list(GENE_LIST_PATH)
     print(f"Gene list length: {len(gene_list)}")
 
-    gtex_path = preprocess_gtex(gene_list)
-    archs4_chunks = preprocess_archs4_to_chunks(gene_list, chunk_size=ARCHS4_CHUNK_SIZE)
+    gtex_path, gtex_donors = preprocess_gtex(gene_list)
+    gtex_donor_hits = find_archs4_gtex_donor_hits(gtex_donors)
+    archs4_chunks = preprocess_archs4_to_chunks(
+        gene_list,
+        gtex_donor_hits,
+        chunk_size=ARCHS4_CHUNK_SIZE,
+    )
     archs4_path = merge_archs4_chunks(archs4_chunks)
-    merge_pretraining(gtex_path, archs4_path)
+    merge_and_split_bulk_datasets(gtex_path, archs4_path)
 
 
 if __name__ == "__main__":

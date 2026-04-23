@@ -4,8 +4,8 @@ data_path:
 resume_checkpoint: null
 
 # training
-epochs: 1
-batch_size: 1
+epochs: 5
+batch_size: 4
 valid_every: 1
 grad_acc: 60
 max_grad_norm: 1e2
@@ -43,12 +43,11 @@ mask_ignore_token_ids: [0]
 
 #optimizer
 learning_rate: 1e-4
-first_cycle_steps: 15
-cycle_mult: 2
+first_cycle_steps: 5
+cycle_mult: 1
 min_lr: 1e-6
-warmup_steps: 5
-gamma: 0.9
-
+warmup_steps: 1
+gamma: 1.0
 
 
 
