@@ -790,7 +790,7 @@ class DeconvRunner:
             return float("nan")
         return float(spearmanr(pred, truth).correlation)
 
-    def _correlation_metrics(
+    def _cell_type_correlation_across_samples_metrics(
         self,
         predictions: np.ndarray,
         truths: np.ndarray,
@@ -814,6 +814,37 @@ class DeconvRunner:
             else float("nan")
         )
         return pearson_by_type, spearman_by_type, mean_pearson, mean_spearman
+
+    def _sample_correlation_across_cell_types_metrics(
+        self,
+        predictions: np.ndarray,
+        truths: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        sample_pearson = np.asarray(
+            [
+                self._safe_pearson(predictions[idx, :], truths[idx, :])
+                for idx in range(predictions.shape[0])
+            ],
+            dtype=float,
+        )
+        sample_spearman = np.asarray(
+            [
+                self._safe_spearman(predictions[idx, :], truths[idx, :])
+                for idx in range(predictions.shape[0])
+            ],
+            dtype=float,
+        )
+        mean_sample_pearson = (
+            float(np.nanmean(sample_pearson))
+            if np.any(~np.isnan(sample_pearson))
+            else float("nan")
+        )
+        mean_sample_spearman = (
+            float(np.nanmean(sample_spearman))
+            if np.any(~np.isnan(sample_spearman))
+            else float("nan")
+        )
+        return sample_pearson, sample_spearman, mean_sample_pearson, mean_sample_spearman
 
     @staticmethod
     def _distribution_metrics(predictions: np.ndarray, truths: np.ndarray) -> tuple[float, float, float]:
@@ -868,7 +899,21 @@ class DeconvRunner:
 
         per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
         per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))
-        pearson_by_type, spearman_by_type, mean_pearson, mean_spearman = self._correlation_metrics(
+        (
+            cell_type_pearson_across_samples,
+            cell_type_spearman_across_samples,
+            mean_cell_type_pearson_across_samples,
+            mean_cell_type_spearman_across_samples,
+        ) = self._cell_type_correlation_across_samples_metrics(
+            predictions_np,
+            truths_np,
+        )
+        (
+            sample_pearson_across_cell_types,
+            sample_spearman_across_cell_types,
+            mean_sample_pearson_across_cell_types,
+            mean_sample_spearman_across_cell_types,
+        ) = self._sample_correlation_across_cell_types_metrics(
             predictions_np,
             truths_np,
         )
@@ -880,8 +925,10 @@ class DeconvRunner:
             "loss": float(test_loss),
             "mae": float(mean_absolute_error(truths_np, predictions_np)),
             "rmse": float(np.sqrt(mean_squared_error(truths_np, predictions_np))),
-            "mean_pearson": mean_pearson,
-            "mean_spearman": mean_spearman,
+            "mean_cell_type_pearson_across_samples": mean_cell_type_pearson_across_samples,
+            "mean_cell_type_spearman_across_samples": mean_cell_type_spearman_across_samples,
+            "mean_sample_pearson_across_cell_types": mean_sample_pearson_across_cell_types,
+            "mean_sample_spearman_across_cell_types": mean_sample_spearman_across_cell_types,
             "kl_divergence": kl_divergence,
             "js_distance": js_distance,
             "js_divergence": js_divergence,
@@ -893,13 +940,15 @@ class DeconvRunner:
                 cell_type: float(value)
                 for cell_type, value in zip(self.cell_types, per_type_rmse.tolist())
             },
-            "per_cell_type_pearson": pearson_by_type,
-            "per_cell_type_spearman": spearman_by_type,
+            "per_cell_type_pearson_across_samples": cell_type_pearson_across_samples,
+            "per_cell_type_spearman_across_samples": cell_type_spearman_across_samples,
             "cell_types": self.cell_types,
             "target_columns": self.target_columns,
             "n_test_samples": int(len(truths_np)),
             "predictions": predictions_np,
             "truths": truths_np,
+            "sample_pearson_across_cell_types": sample_pearson_across_cell_types,
+            "sample_spearman_across_cell_types": sample_spearman_across_cell_types,
         }
 
     def _flatten_fold_metrics(
@@ -925,8 +974,8 @@ class DeconvRunner:
         for metric_key, prefix in (
             ("per_cell_type_mae", "mae"),
             ("per_cell_type_rmse", "rmse"),
-            ("per_cell_type_pearson", "pearson"),
-            ("per_cell_type_spearman", "spearman"),
+            ("per_cell_type_pearson_across_samples", "pearson_across_samples"),
+            ("per_cell_type_spearman_across_samples", "spearman_across_samples"),
         ):
             values = test_metrics.get(metric_key, {})
             if isinstance(values, dict):
@@ -944,6 +993,14 @@ class DeconvRunner:
     ) -> list[dict[str, object]]:
         predictions = np.asarray(test_metrics["predictions"], dtype=float)
         truths = np.asarray(test_metrics["truths"], dtype=float)
+        sample_pearson = np.asarray(
+            test_metrics["sample_pearson_across_cell_types"],
+            dtype=float,
+        )
+        sample_spearman = np.asarray(
+            test_metrics["sample_spearman_across_cell_types"],
+            dtype=float,
+        )
         rows: list[dict[str, object]] = []
         context_columns = [
             col
@@ -962,6 +1019,8 @@ class DeconvRunner:
                 "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "head_only")),
                 "checkpoint_path": checkpoint_path,
                 "sample_id": sample_id,
+                "sample_pearson_across_cell_types": float(sample_pearson[sample_idx]),
+                "sample_spearman_across_cell_types": float(sample_spearman[sample_idx]),
             }
             for col in context_columns:
                 row[col] = context_values[col][sample_idx]
