@@ -23,18 +23,18 @@ cellxgene_census = None
 
 GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 
-OUT_DIR = Path("/Users/enricoheiss/Downloads/preprocessed_pseudo_bulk")
-CHUNK_DIR = OUT_DIR / "pseudo_bulk_chunks"
+OUT_DIR = Path("/Users/enricoheiss/Downloads/pseudo_bulk")
+CHUNK_DIR = OUT_DIR / "pseudo_bulk_RAW_chunks"
 SOURCE_CHUNK_DIR = OUT_DIR / "source_cell_chunks"
-MERGE_TMP_DIR = OUT_DIR / "merge_tmp"
+MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 SOURCE_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 MERGE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-FINAL_OUT = OUT_DIR / "pseudo_bulk_binned.h5ad"
+FINAL_OUT = OUT_DIR / "pseudo_bulk_RAW.h5ad"
 PLAN_OUT = OUT_DIR / "pseudo_bulk_sampling_plan.csv"
-SUMMARY_OUT = OUT_DIR / "pseudo_bulk_summary.json"
+SUMMARY_OUT = OUT_DIR / "pseudo_bulk_summary_RAW.json"
 MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes.json"
 ELIGIBLE_CONTEXTS_OUT = OUT_DIR / "eligible_contexts.csv"
 SOURCE_POOL_QUOTAS_OUT = OUT_DIR / "source_cell_pool_quotas.csv"
@@ -48,9 +48,7 @@ SOURCE_ADATA_OUT = OUT_DIR / "sampled_source_cells_aligned.h5ad"
 
 ORGANISM = "Homo sapiens"
 CENSUS_VERSION = "2025-11-08"
-BIN_NUM = 5
 MIN_GENES = 200
-TARGET_SUM = 1e4
 TARGET_PSEUDO_BULKS = int(os.getenv("SCBFM_TARGET_PSEUDO_BULKS", "20000"))
 CELLS_PER_PSEUDO_BULK = int(os.getenv("SCBFM_CELLS_PER_PSEUDO_BULK", "1000"))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_PSEUDO_DOWNLOAD_CHUNK_SIZE", "5000"))
@@ -132,25 +130,18 @@ def normalize_obs_chunk(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return df
 
 
-def preprocess_dense_block(
+def filter_raw_dense_block(
     x: np.ndarray,
     min_genes: int = MIN_GENES,
-    target_sum: float = TARGET_SUM,
-    bin_num: int = BIN_NUM,
 ) -> tuple[np.ndarray, np.ndarray]:
     n_genes_by_sample = (x > 0).sum(axis=1)
     keep_mask = n_genes_by_sample >= min_genes
     x = x[keep_mask]
 
     if x.shape[0] == 0:
-        return np.zeros((0, x.shape[1]), dtype=np.uint8), keep_mask
+        return np.zeros((0, x.shape[1]), dtype=np.float32), keep_mask
 
-    libsize = x.sum(axis=1, keepdims=True)
-    libsize[libsize == 0] = 1.0
-    x = x / libsize * target_sum
-    x = np.log1p(x) / np.log(2.0)
-    x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
-    return x, keep_mask
+    return x.astype(np.float32, copy=False), keep_mask
 
 
 def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
@@ -707,7 +698,7 @@ def generate_pseudo_bulk_chunks(
     for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
         end = min(start + WRITE_CHUNK_SIZE, len(plan_rows))
         chunk_plan = plan_rows[start:end]
-        out_path = CHUNK_DIR / f"pseudo_bulk_chunk_{chunk_id:05d}.h5ad"
+        out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
         if RESUME and out_path.exists():
             print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
             chunk_paths.append(out_path)
@@ -751,22 +742,22 @@ def generate_pseudo_bulk_chunks(
 
         raw_chunk = sparse.vstack(aggregated_rows, format="csr")
         x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
-        x_binned, keep_mask = preprocess_dense_block(x_dense)
-        if x_binned.shape[0] == 0:
+        x_raw, keep_mask = filter_raw_dense_block(x_dense)
+        if x_raw.shape[0] == 0:
             continue
 
         obs = pd.DataFrame(obs_records, index=pd.Index([row["sample_id"] for row in chunk_plan], name="sample_id"))
         obs = obs.iloc[np.where(keep_mask)[0]].copy()
         var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
 
-        out = ad.AnnData(X=sparse.csr_matrix(x_binned), obs=obs, var=var)
+        out = ad.AnnData(X=sparse.csr_matrix(x_raw), obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
         store_proportion_metadata(out, proportion_column_map)
 
         out.write(out_path)
         chunk_paths.append(out_path)
 
-        del raw_chunk, x_dense, x_binned, obs, var, out
+        del raw_chunk, x_dense, x_raw, obs, var, out
         gc.collect()
 
         print(
@@ -789,7 +780,7 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
     for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
         end = min(start + WRITE_CHUNK_SIZE, len(plan_rows))
         chunk_plan = plan_rows[start:end]
-        out_path = CHUNK_DIR / f"pseudo_bulk_chunk_{chunk_id:05d}.h5ad"
+        out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
         if RESUME and out_path.exists():
             print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
             chunk_paths.append(out_path)
@@ -832,8 +823,8 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
 
         raw_chunk = sparse.vstack(aggregated_rows, format="csr")
         x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
-        x_binned, keep_mask = preprocess_dense_block(x_dense)
-        if x_binned.shape[0] == 0:
+        x_raw, keep_mask = filter_raw_dense_block(x_dense)
+        if x_raw.shape[0] == 0:
             continue
 
         obs = pd.DataFrame(
@@ -843,14 +834,14 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
         obs = obs.iloc[np.where(keep_mask)[0]].copy()
         var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
 
-        out = ad.AnnData(X=sparse.csr_matrix(x_binned), obs=obs, var=var)
+        out = ad.AnnData(X=sparse.csr_matrix(x_raw), obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
         store_proportion_metadata(out, proportion_column_map)
 
         out.write(out_path)
         chunk_paths.append(out_path)
 
-        del raw_chunk, x_dense, x_binned, obs, var, out
+        del raw_chunk, x_dense, x_raw, obs, var, out
         gc.collect()
 
         print(
@@ -876,7 +867,7 @@ def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str])
         next_paths: list[Path] = []
         for batch_id, start in enumerate(range(0, len(current_paths), MERGE_BATCH_SIZE)):
             batch_paths = current_paths[start:start + MERGE_BATCH_SIZE]
-            out_path = MERGE_TMP_DIR / f"merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
+            out_path = MERGE_TMP_DIR / f"RAW_merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
             print(
                 f"Merging pseudo-bulk batch round {round_id}, batch {batch_id}: "
                 f"{len(batch_paths)} files"

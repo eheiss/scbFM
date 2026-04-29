@@ -27,6 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.runner import GroupedCosineAnnealingWarmupRestarts
 from performer_pytorch import PerformerLM
+from preprocess import preprocess_adata_for_tokens, validate_token_matrix
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -103,8 +104,7 @@ class DeconvDataset(Dataset):
             full_seq = row.toarray().ravel()
         else:
             full_seq = np.asarray(row).ravel()
-        full_seq = np.clip(full_seq, 0, self.bin_num)
-        full_seq = torch.from_numpy(full_seq).long()
+        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
         full_seq = torch.cat(
             (full_seq, torch.tensor([self.special_token_id], dtype=torch.long))
         )
@@ -302,6 +302,15 @@ class DeconvRunner:
             raise FileNotFoundError(f"Pseudo-bulk h5ad file not found: {data_path}")
         return ad.read_h5ad(data_path)
 
+    def _resolve_gene_list_path(self) -> Path:
+        gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
+        if gene_list_path:
+            return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
+        return ROOT / "scbFM" / "data" / "gene_list.txt"
+
+    def _should_preprocess_input(self) -> bool:
+        return bool(getattr(self.task_cfg, "preprocess", False))
+
     @staticmethod
     def _as_string(value) -> str | None:
         if isinstance(value, str):
@@ -326,12 +335,12 @@ class DeconvRunner:
 
     def _normalize_proportion_mapping(self, raw_mapping, obs_columns) -> dict[str, str]:
         obs_columns = set(map(str, obs_columns))
-        normalized: dict[str, str] = {}
+        mapping_out: dict[str, str] = {}
 
         def visit(cell_type_parts: list[str], value) -> None:
             value_string = self._as_string(value)
             if value_string is not None:
-                normalized["/".join(cell_type_parts)] = value_string
+                mapping_out["/".join(cell_type_parts)] = value_string
                 return
 
             if isinstance(value, np.ndarray):
@@ -354,7 +363,7 @@ class DeconvRunner:
                         if direct_value is not None:
                             break
                 if direct_value is not None:
-                    normalized["/".join(cell_type_parts)] = direct_value
+                    mapping_out["/".join(cell_type_parts)] = direct_value
                     return
 
                 # HDF5-backed AnnData stores '/' in uns dict keys as nested groups.
@@ -364,7 +373,7 @@ class DeconvRunner:
                         key_string = str(key)
                     child_string = self._as_string(child)
                     if child_string is None and key_string in obs_columns:
-                        normalized["/".join(cell_type_parts)] = key_string
+                        mapping_out["/".join(cell_type_parts)] = key_string
                     else:
                         visit([*cell_type_parts, key_string], child)
                 return
@@ -388,7 +397,7 @@ class DeconvRunner:
                 cell_type_string = str(cell_type)
             visit([cell_type_string], value)
 
-        invalid_columns = [col for col in normalized.values() if col not in obs_columns]
+        invalid_columns = [col for col in mapping_out.values() if col not in obs_columns]
         if invalid_columns:
             inferred = self._infer_proportion_mapping_from_obs(obs_columns)
             if inferred:
@@ -399,7 +408,7 @@ class DeconvRunner:
                 )
                 return inferred
 
-        return normalized
+        return mapping_out
 
     @staticmethod
     def _infer_proportion_mapping_from_obs(obs_columns) -> dict[str, str]:
@@ -441,7 +450,23 @@ class DeconvRunner:
 
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
-        adata.var_names_make_unique()
+        if self._should_preprocess_input():
+            adata, missing_genes = preprocess_adata_for_tokens(
+                adata,
+                gene_list_path=self._resolve_gene_list_path(),
+                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
+                target_sum=float(getattr(self.task_cfg, "target_sum", 1e4)),
+                log_base=float(getattr(self.task_cfg, "log_base", 2.0)),
+                bin_num=int(self.model_cfg.bin_num),
+                reindex_genes=bool(getattr(self.task_cfg, "reindex_genes", True)),
+            )
+            log.info(
+                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
+                len(missing_genes),
+                adata.shape,
+            )
+        else:
+            adata.var_names_make_unique()
         targets = self._load_targets(adata)
 
         expected_gene_num = int(self.model_cfg.gene_num)
@@ -450,6 +475,7 @@ class DeconvRunner:
                 f"Expected {expected_gene_num} genes for the scbFM backbone, got {adata.n_vars}."
             )
 
+        validate_token_matrix(adata.X, bin_num=int(self.model_cfg.bin_num), name="deconvolution input data")
         groups = None
         if bool(getattr(self.task_cfg, "split_by_context", True)):
             context_columns = list(

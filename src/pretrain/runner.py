@@ -7,9 +7,9 @@ import os
 from functools import reduce
 from pathlib import Path
 
+import anndata as ad
 import hydra
 import numpy as np
-import scanpy as sc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from performer_pytorch import PerformerLM
+from preprocess import preprocess_adata_for_tokens, validate_token_matrix
 from utils import (
     CosineAnnealingWarmupRestarts,
     SequentialDistributedSampler,
@@ -104,8 +105,7 @@ class SCDataset(Dataset):
         else:
             full_seq = np.asarray(row).ravel()
 
-        full_seq = np.clip(full_seq, 0, self.max_token_id)
-        full_seq = torch.from_numpy(full_seq).long()
+        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
         full_seq = torch.cat((
             full_seq,
             torch.tensor([self.special_token_id], dtype=torch.long),
@@ -162,11 +162,42 @@ class PreTrainRunner:
 
         seed_all(self.pretrain_cfg.seed + self.rank)
 
+    def _resolve_gene_list_path(self) -> Path:
+        gene_list_path = getattr(self.pretrain_cfg, "gene_list_path", None)
+        if gene_list_path:
+            return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
+        return ROOT / "data" / "gene_list.txt"
+
+    def _should_preprocess_input(self) -> bool:
+        return bool(getattr(self.pretrain_cfg, "preprocess", False))
+
     def _load_data(self):
         data_path = hydra.utils.to_absolute_path(self.pretrain_cfg.data_path)
         log.info("Loading pretraining data from %s", data_path)
-        adata = sc.read_h5ad(data_path)
+        adata = ad.read_h5ad(data_path)
+        if self._should_preprocess_input():
+            adata, missing_genes = preprocess_adata_for_tokens(
+                adata,
+                gene_list_path=self._resolve_gene_list_path(),
+                min_genes=int(getattr(self.pretrain_cfg, "min_genes", 200)),
+                target_sum=float(getattr(self.pretrain_cfg, "target_sum", 1e4)),
+                log_base=float(getattr(self.pretrain_cfg, "log_base", 2.0)),
+                bin_num=int(self.pretrain_cfg.bin_num),
+                reindex_genes=bool(getattr(self.pretrain_cfg, "reindex_genes", True)),
+            )
+            log.info(
+                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
+                len(missing_genes),
+                adata.shape,
+            )
+
+        expected_gene_num = int(self.pretrain_cfg.gene_num)
+        if adata.n_vars != expected_gene_num:
+            raise ValueError(
+                f"Expected {expected_gene_num} genes for the scbFM backbone, got {adata.n_vars}."
+            )
         matrix = adata.X
+        validate_token_matrix(matrix, bin_num=int(self.pretrain_cfg.bin_num), name="pretraining data")
 
         val_fraction = self.pretrain_cfg.validation_split
         if matrix.shape[0] < 2 or val_fraction <= 0:

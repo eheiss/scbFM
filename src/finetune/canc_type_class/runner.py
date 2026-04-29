@@ -12,7 +12,6 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
-import scanpy as sc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -37,6 +36,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from performer_pytorch import PerformerLM
+from preprocess import (
+    preprocess_adata_for_tokens,
+    reindex_adata_genes,
+    validate_token_matrix,
+)
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -220,8 +224,7 @@ class CancTypeClassDataset(Dataset):
             full_seq = row.toarray().ravel()
         else:
             full_seq = np.asarray(row).ravel()
-        full_seq = np.clip(full_seq, 0, self.bin_num)
-        full_seq = torch.from_numpy(full_seq).long()
+        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
         full_seq = torch.cat(
             (full_seq, torch.tensor([self.special_token_id], dtype=torch.long))
         )
@@ -415,7 +418,7 @@ class CancTypeClassRunner:
         if not data_path.exists():
             raise FileNotFoundError(f"TCGA h5ad file not found: {data_path}")
 
-        adata = sc.read_h5ad(data_path)
+        adata = ad.read_h5ad(data_path)
         if "project_id" not in adata.obs:
             raise ValueError("TCGA AnnData must contain obs['project_id'] to filter cohorts.")
 
@@ -438,59 +441,40 @@ class CancTypeClassRunner:
         log.info("Loading TCGA cohorts for cancer type classification")
         return self._load_tcga()
 
-    def _load_gene_order(self) -> list[str] | None:
+    def _resolve_gene_list_path(self) -> Path:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
         if gene_list_path:
-            resolved_path = Path(hydra.utils.to_absolute_path(str(gene_list_path)))
-        else:
-            resolved_path = ROOT / "scbFM" / "data" / "gene_list.txt"
-        with resolved_path.open() as handle:
-            gene_order = [line.strip() for line in handle if line.strip()]
-        if not gene_order:
-            raise ValueError(f"Gene list is empty: {resolved_path}")
-        return gene_order
+            return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
+        return ROOT / "scbFM" / "data" / "gene_list.txt"
+
+    def _should_preprocess_input(self) -> bool:
+        return bool(getattr(self.task_cfg, "preprocess", False))
 
     def _preprocess_adata(self, adata: ad.AnnData) -> ad.AnnData:
-        gene_order = self._load_gene_order()
-        if gene_order:
-            counts = sparse.lil_matrix((adata.n_obs, len(gene_order)), dtype=np.float32)
-            gene_to_idx = {gene: idx for idx, gene in enumerate(adata.var_names.tolist())}
-            matched_genes = [
-                (target_idx, gene_to_idx[gene])
-                for target_idx, gene in enumerate(gene_order)
-                if gene in gene_to_idx
-            ]
-            if not matched_genes:
-                raise ValueError("No genes matched the provided gene_list_path.")
-            for target_idx, input_idx in matched_genes:
-                counts[:, target_idx] = adata.X[:, input_idx]
-
-            new_adata = ad.AnnData(X=counts.tocsr())
-            new_adata.var_names = gene_order
-            new_adata.obs_names = adata.obs_names.copy()
-            new_adata.obs = adata.obs.copy()
-            adata = new_adata
-
-            log.info(
-                "Matched %d/%d genes against the target gene list of size %d",
-                len(matched_genes),
-                len(gene_to_idx),
-                len(gene_order),
-            )
-
-        normalized = bool(getattr(self.task_cfg, "normalized", True))
-        if not normalized:
+        gene_list_path = self._resolve_gene_list_path()
+        if self._should_preprocess_input():
             min_genes = int(getattr(self.task_cfg, "min_genes", 200))
-            sc.pp.filter_cells(adata, min_genes=min_genes)
-            sc.pp.normalize_total(adata, target_sum=1e4)
-            sc.pp.log1p(adata, base=2)
-
-            if sparse.issparse(adata.X):
-                x = adata.X.toarray()
-            else:
-                x = np.asarray(adata.X)
-            x = np.clip(np.floor(x), 0, int(self.model_cfg.bin_num)).astype(np.uint8)
-            adata.X = sparse.csr_matrix(x)
+            adata, missing_genes = preprocess_adata_for_tokens(
+                adata,
+                gene_list_path=gene_list_path,
+                min_genes=min_genes,
+                target_sum=float(getattr(self.task_cfg, "target_sum", 1e4)),
+                log_base=float(getattr(self.task_cfg, "log_base", 2.0)),
+                bin_num=int(self.model_cfg.bin_num),
+                reindex_genes=True,
+            )
+            log.info(
+                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
+                len(missing_genes),
+                adata.shape,
+            )
+        else:
+            adata, missing_genes = reindex_adata_genes(adata, gene_list_path=gene_list_path)
+            log.info(
+                "Reindexed preprocessed input to gene list: %d target genes missing, output shape %s",
+                len(missing_genes),
+                adata.shape,
+            )
 
         expected_gene_num = int(self.model_cfg.gene_num)
         if adata.n_vars != expected_gene_num:
@@ -499,6 +483,7 @@ class CancTypeClassRunner:
                 "Provide a matching gene list or aligned input matrix."
             )
 
+        validate_token_matrix(adata.X, bin_num=int(self.model_cfg.bin_num), name="cancer type input data")
         return adata
 
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:

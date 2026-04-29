@@ -35,6 +35,12 @@ auto_check_redraw: True
 qkv_bias: True
 
 # data
+preprocess: true
+reindex_genes: true
+gene_list_path: ../data/gene_list.txt
+min_genes: 200
+target_sum: 1e4
+log_base: 2.0
 validation_split: 0.05
 mask_prob: 0.15
 replace_prob: 0.9
@@ -48,9 +54,6 @@ cycle_mult: 1
 min_lr: 1e-6
 warmup_steps: 1
 gamma: 1.0
-
-
-
 
 
 

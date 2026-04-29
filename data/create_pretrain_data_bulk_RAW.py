@@ -20,27 +20,25 @@ GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 GTEX_PATH = Path("/cluster/work/boeva/eheiss/datasets/GTEx/gtex.h5ad")
 ARCHS4_PATH = Path("/cluster/work/boeva/eheiss/datasets/ARCHS4/human_gene_v2.latest.h5")
 
-OUT_DIR = Path("/cluster/work/boeva/eheiss/datasets/preprocessed_bulk")
-ARCHS4_CHUNK_DIR = OUT_DIR / "archs4_chunks"
-ARCHS4_MERGE_TMP_DIR = OUT_DIR / "archs4_merge_tmp"
+OUT_DIR = Path("/cluster/work/boeva/eheiss/datasets/bulk")
+ARCHS4_CHUNK_DIR = OUT_DIR / "archs4_RAW_chunks"
+ARCHS4_MERGE_TMP_DIR = OUT_DIR / "archs4_RAW_merge_tmp"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 ARCHS4_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 ARCHS4_MERGE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-GTEX_OUT = OUT_DIR / "gtex_binned.h5ad"
-ARCHS4_OUT = OUT_DIR / "archs4_binned.h5ad"
-PRETRAIN_OUT = OUT_DIR / "pretraining_bulk_binned.h5ad"
-PREADAPT_OUT = OUT_DIR / "preadapt_bulk_binned.h5ad"
-ARCHS4_GTEX_DONOR_HITS_OUT = OUT_DIR / "archs4_gtex_donor_hits.csv"
+GTEX_OUT = OUT_DIR / "gtex_RAW.h5ad"
+ARCHS4_OUT = OUT_DIR / "archs4_RAW.h5ad"
+PRETRAIN_OUT = OUT_DIR / "pretraining_bulk_RAW.h5ad"
+PREADAPT_OUT = OUT_DIR / "preadapt_bulk_RAW.h5ad"
+ARCHS4_GTEX_DONOR_HITS_OUT = OUT_DIR / "archs4_gtex_donor_hits_RAW.csv"
 
 
 # =========================
 # Settings
 # =========================
 
-BIN_NUM = 5
 MIN_GENES = 200
-TARGET_SUM = 1e4
 ARCHS4_CHUNK_SIZE = 2000  # samples per chunk before cell filtering
 MERGE_BATCH_SIZE = 16
 PRETRAIN_SAMPLE_COUNT = 700_000
@@ -121,38 +119,24 @@ def place_into_target_order(x_present: np.ndarray, tgt_pos: list[int], total_gen
     return out
 
 
-def preprocess_dense_block(
+def filter_raw_dense_block(
     x: np.ndarray,
     min_genes: int = MIN_GENES,
-    target_sum: float = TARGET_SUM,
-    bin_num: int = BIN_NUM,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     x: dense float array, shape (cells, genes)
     returns:
-        x_binned_uint8: shape (kept_cells, genes)
+        x_raw_float32: shape (kept_cells, genes)
         keep_mask: bool mask over original cells
     """
-    # filter_cells(min_genes=200)
     n_genes_by_cell = (x > 0).sum(axis=1)
     keep_mask = n_genes_by_cell >= min_genes
     x = x[keep_mask]
 
     if x.shape[0] == 0:
-        return np.zeros((0, x.shape[1]), dtype=np.uint8), keep_mask
+        return np.zeros((0, x.shape[1]), dtype=np.float32), keep_mask
 
-    # normalize_total(target_sum=1e4)
-    libsize = x.sum(axis=1, keepdims=True)
-    libsize[libsize == 0] = 1.0
-    x = x / libsize * target_sum
-
-    # log1p(base=2)
-    x = np.log1p(x) / np.log(2.0)
-
-    # floor + clip to [0, bin_num]
-    x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
-
-    return x, keep_mask
+    return x.astype(np.float32, copy=False), keep_mask
 
 
 def write_manifest(paths: list[Path], out_path: Path) -> None:
@@ -200,7 +184,7 @@ def preprocess_gtex(gene_list: list[str]) -> tuple[Path, set[str]]:
     del x_present
     gc.collect()
 
-    x, keep_mask = preprocess_dense_block(x)
+    x, keep_mask = filter_raw_dense_block(x)
 
     obs = adata.obs.iloc[np.where(keep_mask)[0]].copy()
     obs["dataset"] = "GTEx"
@@ -212,7 +196,7 @@ def preprocess_gtex(gene_list: list[str]) -> tuple[Path, set[str]]:
 
     out.write(GTEX_OUT)
 
-    with open(OUT_DIR / "gtex_missing_genes.json", "w") as f:
+    with open(OUT_DIR / "gtex_missing_genes_RAW.json", "w") as f:
         json.dump(missing, f)
 
     print(f"Saved {GTEX_OUT}")
@@ -298,7 +282,7 @@ def preprocess_archs4_to_chunks(
     print(f"ARCHS4 bulk-like samples excluded by GTEx donor IDs: {excluded_bulk_like_count}")
     print(f"ARCHS4 kept samples after GTEx donor filtering: {len(bulk_like_idx)}")
 
-    with open(OUT_DIR / "archs4_missing_genes.json", "w") as f:
+    with open(OUT_DIR / "archs4_missing_genes_RAW.json", "w") as f:
         json.dump(missing, f)
 
     written_chunks: list[Path] = []
@@ -323,8 +307,9 @@ def preprocess_archs4_to_chunks(
             del x_present
             gc.collect()
 
-            # Notebook preprocessing
-            x, keep_mask = preprocess_dense_block(x)
+            # Keep the same expressed-gene filter as the binned pipeline, but
+            # leave counts otherwise untouched.
+            x, keep_mask = filter_raw_dense_block(x)
 
             kept_cols = cols[np.where(keep_mask)[0]]
             obs = pd.DataFrame(index=pd.Index([sample_ids[i] for i in kept_cols], name="sample_id"))
@@ -335,14 +320,14 @@ def preprocess_archs4_to_chunks(
             adata_chunk = ad.AnnData(X=sparse.csr_matrix(x), obs=obs, var=var)
             adata_chunk.var_names = pd.Index(gene_list, dtype=str)
 
-            out_path = ARCHS4_CHUNK_DIR / f"archs4_binned_chunk_{chunk_id:05d}.h5ad"
+            out_path = ARCHS4_CHUNK_DIR / f"archs4_RAW_chunk_{chunk_id:05d}.h5ad"
             adata_chunk.write(out_path)
             written_chunks.append(out_path)
 
             del x, obs, var, adata_chunk
             gc.collect()
 
-    write_manifest(written_chunks, OUT_DIR / "archs4_chunk_manifest.json")
+    write_manifest(written_chunks, OUT_DIR / "archs4_RAW_chunk_manifest.json")
     print(f"Wrote {len(written_chunks)} ARCHS4 chunks")
     return written_chunks
 
@@ -363,7 +348,7 @@ def merge_archs4_chunks(chunk_paths: list[Path]) -> Path:
         next_paths: list[Path] = []
         for batch_id, start in enumerate(range(0, len(current_paths), MERGE_BATCH_SIZE)):
             batch_paths = current_paths[start:start + MERGE_BATCH_SIZE]
-            out_path = ARCHS4_MERGE_TMP_DIR / f"archs4_merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
+            out_path = ARCHS4_MERGE_TMP_DIR / f"archs4_RAW_merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
             print(
                 f"Merging ARCHS4 batch round {round_id}, batch {batch_id}: "
                 f"{len(batch_paths)} files"

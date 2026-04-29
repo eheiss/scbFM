@@ -4,7 +4,6 @@ from pathlib import Path
 
 import anndata as ad
 import hydra
-import scanpy as sc
 from omegaconf import DictConfig, OmegaConf
 
 from finetune.canc_type_class.runner import (
@@ -119,7 +118,7 @@ class CancTypeClass33Runner(CancTypeClassRunner):
         if not data_path.exists():
             raise FileNotFoundError(f"TCGA h5ad file not found: {data_path}")
 
-        adata = sc.read_h5ad(data_path)
+        adata = ad.read_h5ad(data_path)
         if "project_id" not in adata.obs:
             raise ValueError("TCGA AnnData must contain obs['project_id'] to filter cohorts.")
 

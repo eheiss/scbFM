@@ -17,7 +17,7 @@ try:
     import cellxgene_census
 except ImportError as exc:
     raise ImportError(
-        "cellxgene_census is required for create_pretrain_data_sc.py. "
+        "cellxgene_census is required for create_pretrain_data_sc_RAW.py. "
         "Run this script in the census environment where the notebook works."
     ) from exc
 
@@ -28,17 +28,17 @@ except ImportError as exc:
 
 GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 
-OUT_DIR = Path("/Users/enricoheiss/Downloads/preprocessed_sc")
-CHUNK_DIR = OUT_DIR / "census_chunks"
-MERGE_TMP_DIR = OUT_DIR / "merge_tmp"
+OUT_DIR = Path("/Users/enricoheiss/Downloads/sc")
+CHUNK_DIR = OUT_DIR / "census_RAW_chunks"
+MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 MERGE_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-FINAL_OUT = OUT_DIR / "pretraining_sc_binned.h5ad"
-SAMPLING_PLAN_OUT = OUT_DIR / "sampling_plan.csv"
-SAMPLING_SUMMARY_OUT = OUT_DIR / "sampling_summary.json"
-MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes.json"
+FINAL_OUT = OUT_DIR / "pretraining_sc_RAW.h5ad"
+SAMPLING_PLAN_OUT = OUT_DIR / "sampling_plan_RAW.csv"
+SAMPLING_SUMMARY_OUT = OUT_DIR / "sampling_summary_RAW.json"
+MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes_RAW.json"
 
 
 # =========================
@@ -47,9 +47,7 @@ MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes.json"
 
 ORGANISM = "Homo sapiens"
 CENSUS_VERSION = "2025-11-08"
-BIN_NUM = 5
 MIN_GENES = 200
-TARGET_SUM = 1e4
 TARGET_TOTAL_CELLS = int(os.getenv("SCBFM_TARGET_TOTAL_CELLS", "700000"))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_DOWNLOAD_CHUNK_SIZE", "5000"))
 PROCESS_BATCH_SIZE = int(os.getenv("SCBFM_PROCESS_BATCH_SIZE", "2048"))
@@ -93,41 +91,18 @@ def close_backed_adata(adata: ad.AnnData) -> None:
         file_obj.close()
 
 
-def preprocess_dense_block(
+def filter_raw_dense_block(
     x: np.ndarray,
     min_genes: int = MIN_GENES,
-    target_sum: float = TARGET_SUM,
-    bin_num: int = BIN_NUM,
 ) -> tuple[np.ndarray, np.ndarray]:
     n_genes_by_cell = (x > 0).sum(axis=1)
     keep_mask = n_genes_by_cell >= min_genes
     x = x[keep_mask]
 
     if x.shape[0] == 0:
-        return np.zeros((0, x.shape[1]), dtype=np.uint8), keep_mask
+        return np.zeros((0, x.shape[1]), dtype=np.float32), keep_mask
 
-    libsize = x.sum(axis=1, keepdims=True)
-    libsize[libsize == 0] = 1.0
-    x = x / libsize * target_sum
-    x = np.log1p(x) / np.log(2.0)
-    x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
-    return x, keep_mask
-
-
-def bin_dense_block(
-    x: np.ndarray,
-    target_sum: float = TARGET_SUM,
-    bin_num: int = BIN_NUM,
-) -> np.ndarray:
-    if x.shape[0] == 0:
-        return np.zeros((0, x.shape[1]), dtype=np.uint8)
-
-    libsize = x.sum(axis=1, keepdims=True)
-    libsize[libsize == 0] = 1.0
-    x = x / libsize * target_sum
-    x = np.log1p(x) / np.log(2.0)
-    x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
-    return x
+    return x.astype(np.float32, copy=False), keep_mask
 
 
 def write_json(data, out_path: Path) -> None:
@@ -361,14 +336,13 @@ def download_and_preprocess_chunks(
                 x_dense = x_batch[keep_mask].toarray().astype(np.float32, copy=False)
             else:
                 x_dense = np.asarray(x_batch, dtype=np.float32)
-                x_dense, keep_mask = preprocess_dense_block(x_dense)
+                x_dense, keep_mask = filter_raw_dense_block(x_dense)
                 if x_dense.shape[0] == 0:
                     continue
                 x_blocks.append(sparse.csr_matrix(x_dense))
                 obs_blocks.append(obs_batch.iloc[np.where(keep_mask)[0]].copy())
                 continue
 
-            x_dense = bin_dense_block(x_dense)
             x_blocks.append(sparse.csr_matrix(x_dense))
             obs_blocks.append(obs_batch.iloc[np.where(keep_mask)[0]].copy())
 
@@ -376,7 +350,7 @@ def download_and_preprocess_chunks(
             gc.collect()
 
         t3 = time.perf_counter()
-        print(f"Chunk {chunk_id}: batched preprocessing finished in {t3 - t2:.1f}s")
+        print(f"Chunk {chunk_id}: batched raw filtering finished in {t3 - t2:.1f}s")
 
         if len(x_blocks) == 0:
             del adata, x_blocks, obs_blocks
@@ -403,7 +377,7 @@ def download_and_preprocess_chunks(
         out = ad.AnnData(X=x, obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
 
-        out_path = CHUNK_DIR / f"cellxgene_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
+        out_path = CHUNK_DIR / f"cellxgene_RAW_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
         out.write(out_path)
         chunk_paths.append(out_path)
         kept_total += out.n_obs
@@ -430,7 +404,7 @@ def merge_chunks(chunk_paths: list[Path]) -> Path:
         next_paths: list[Path] = []
         for batch_id, start in enumerate(range(0, len(current_paths), MERGE_BATCH_SIZE)):
             batch_paths = current_paths[start:start + MERGE_BATCH_SIZE]
-            out_path = MERGE_TMP_DIR / f"merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
+            out_path = MERGE_TMP_DIR / f"RAW_merge_r{round_id:02d}_b{batch_id:04d}.h5ad"
             print(
                 f"Merging CELLxGENE batch round {round_id}, batch {batch_id}: "
                 f"{len(batch_paths)} files"
