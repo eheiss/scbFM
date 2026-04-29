@@ -32,6 +32,7 @@ ARCHS4_OUT = OUT_DIR / "archs4_RAW.h5ad"
 PRETRAIN_OUT = OUT_DIR / "pretraining_bulk_RAW.h5ad"
 PREADAPT_OUT = OUT_DIR / "preadapt_bulk_RAW.h5ad"
 ARCHS4_GTEX_DONOR_HITS_OUT = OUT_DIR / "archs4_gtex_donor_hits_RAW.csv"
+ARCHS4_DOWNSTREAM_HITS_OUT = OUT_DIR / "archs4_downstream_hits_RAW.csv"
 
 
 # =========================
@@ -44,6 +45,59 @@ MERGE_BATCH_SIZE = 16
 PRETRAIN_SAMPLE_COUNT = 700_000
 RANDOM_SEED = 42
 GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
+METADATA_TOKEN_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9._:-]{2,}")
+
+DOWNSTREAM_DATASET_PATHS = {
+    "TCGA": Path("/cluster/work/boeva/eheiss/datasets/TCGA/tcga.h5ad"),
+    "DepMap": Path("/cluster/work/boeva/eheiss/datasets/DepMap/depmap.h5ad"),
+    "GDSC": Path("/cluster/work/boeva/eheiss/datasets/GDSC/gdsc.h5ad"),
+    "DiSignAtlas": Path("/cluster/work/boeva/eheiss/datasets/DiSignAtlas/disignatlas.h5ad"),
+}
+
+DOWNSTREAM_GCTX_PATHS = {
+    "LINCS": Path("/cluster/customapps/biomed/boeva/eheiss/downloads/level5_beta_all_n1201944x12328.gctx"),
+}
+
+DOWNSTREAM_DATASET_TERMS = {
+    "TCGA": (
+        "TCGA",
+        "The Cancer Genome Atlas",
+        "Cancer Genome Atlas",
+    ),
+    "DepMap": (
+        "DepMap",
+        "CCLE",
+        "Cancer Cell Line Encyclopedia",
+    ),
+    "GDSC": (
+        "GDSC",
+        "Genomics of Drug Sensitivity in Cancer",
+        "CancerRxGene",
+        "Cancer RX Gene",
+    ),
+    "DiSignAtlas": (
+        "DiSignAtlas",
+        "Disease Signature Atlas",
+    ),
+    "LINCS": (
+        "LINCS",
+        "L1000",
+        "Connectivity Map",
+        "CMAP",
+    ),
+}
+
+DOWNSTREAM_ID_PATTERNS = {
+    "TCGA": (
+        re.compile(r"\bTCGA-[A-Z0-9]{2}-[A-Z0-9]{4}(?:-[A-Z0-9]{2,4}){0,4}\b"),
+    ),
+    "DepMap": (
+        re.compile(r"\bACH-\d{6}\b"),
+    ),
+    "LINCS": (
+        re.compile(r"\b(?:LINCS|L1000)[-_:][A-Z0-9._:-]+\b"),
+    ),
+}
 
 
 # =========================
@@ -79,6 +133,113 @@ def gtex_donor_id(sample_id: str) -> str:
 
 def extract_gtex_donors(value: str, valid_donors: set[str]) -> set[str]:
     return {match for match in GTEX_DONOR_PATTERN.findall(value.upper()) if match in valid_donors}
+
+
+def normalize_metadata_token(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", value.upper())
+
+
+def term_in_metadata_value(value_upper: str, term: str) -> bool:
+    term_upper = term.upper()
+    if len(term_upper) <= 5 and term_upper.replace("-", "").isalnum():
+        return re.search(rf"(?<![A-Z0-9]){re.escape(term_upper)}(?![A-Z0-9])", value_upper) is not None
+    return term_upper in value_upper
+
+
+def metadata_tokens_from_adata(path: Path) -> set[str]:
+    if not path.exists():
+        print(f"Downstream dataset not found, skipping ID extraction: {path}")
+        return set()
+
+    print(f"Loading downstream sample IDs from {path}...")
+    adata = ad.read_h5ad(path, backed="r")
+    try:
+        tokens = {normalize_metadata_token(str(idx)) for idx in adata.obs_names}
+    finally:
+        adata.file.close()
+    tokens = {token for token in tokens if len(token) >= 4}
+    print(f"Loaded {len(tokens)} downstream sample IDs from {path.name}")
+    return tokens
+
+
+def hdf5_string_values(dataset: h5py.Dataset) -> list[str]:
+    try:
+        values = dataset.asstr()[:]
+    except (AttributeError, TypeError):
+        values = dataset[:]
+    return [decode_value(value) for value in values]
+
+
+def metadata_tokens_from_gctx(path: Path) -> set[str]:
+    if not path.exists():
+        print(f"Downstream GCTX not found, skipping ID extraction: {path}")
+        return set()
+
+    print(f"Loading downstream sample IDs from {path}...")
+    candidate_names = {"ID", "SIG_ID", "SAMPLE_ID", "SAMPLE", "GEO_ID", "DISTIL_ID"}
+    tokens: set[str] = set()
+
+    with h5py.File(path, "r") as f:
+        dataset_names: list[str] = []
+
+        def collect_candidate(name: str, obj) -> None:
+            if not isinstance(obj, h5py.Dataset):
+                return
+            upper_name = name.upper()
+            base_name = upper_name.rsplit("/", 1)[-1]
+            if "META/COL" in upper_name and base_name in candidate_names and obj.ndim == 1:
+                dataset_names.append(name)
+
+        f.visititems(collect_candidate)
+
+        for dataset_name in dataset_names:
+            values = hdf5_string_values(f[dataset_name])
+            for value in values:
+                token = normalize_metadata_token(value)
+                if len(token) >= 4:
+                    tokens.add(token)
+
+    print(f"Loaded {len(tokens)} downstream sample IDs from {path.name}")
+    return tokens
+
+
+def build_downstream_id_tokens() -> dict[str, set[str]]:
+    tokens = {
+        dataset: metadata_tokens_from_adata(path)
+        for dataset, path in DOWNSTREAM_DATASET_PATHS.items()
+    }
+    for dataset, path in DOWNSTREAM_GCTX_PATHS.items():
+        tokens.setdefault(dataset, set()).update(metadata_tokens_from_gctx(path))
+    return tokens
+
+
+def extract_downstream_matches(
+    value: str,
+    downstream_id_tokens: dict[str, set[str]],
+) -> dict[str, dict[str, set[str]]]:
+    value_upper = value.upper()
+    value_tokens = {normalize_metadata_token(token) for token in METADATA_TOKEN_PATTERN.findall(value_upper)}
+    value_tokens = {token for token in value_tokens if len(token) >= 4}
+    matches: dict[str, dict[str, set[str]]] = {}
+
+    for dataset, terms in DOWNSTREAM_DATASET_TERMS.items():
+        matched_terms = {term for term in terms if term_in_metadata_value(value_upper, term)}
+        matched_ids = set()
+
+        for pattern in DOWNSTREAM_ID_PATTERNS.get(dataset, ()):
+            matched_ids.update(pattern.findall(value_upper))
+
+        dataset_tokens = downstream_id_tokens.get(dataset, set())
+        if dataset_tokens and value_tokens:
+            matched_ids.update(sorted(value_tokens.intersection(dataset_tokens)))
+
+        if matched_terms or matched_ids:
+            matches[dataset] = {
+                "matched_terms": matched_terms,
+                "matched_ids": matched_ids,
+            }
+
+    return matches
 
 
 def build_reindexer(source_gene_ids: list[str] | pd.Index, target_gene_list: list[str]) -> tuple[list[int], list[int], list[str]]:
@@ -251,9 +412,68 @@ def find_archs4_gtex_donor_hits(gtex_donors: set[str]) -> set[int]:
     return set(hits)
 
 
+def find_archs4_downstream_hits(
+    downstream_id_tokens: dict[str, set[str]],
+) -> set[int]:
+    print("Scanning ARCHS4 metadata for downstream dataset leakage...")
+    hits: dict[int, dict[str, set[str]]] = {}
+
+    with h5py.File(ARCHS4_PATH, "r") as f:
+        sample_group = f["meta/samples"]
+        keys = list(sample_group.keys())
+        n_samples = len(sample_group["sample"])
+
+        for key in keys:
+            values = sample_group[key][:]
+            for i, raw in enumerate(values):
+                matches = extract_downstream_matches(decode_value(raw), downstream_id_tokens)
+                if not matches:
+                    continue
+
+                record = hits.setdefault(
+                    i,
+                    {
+                        "matched_fields": set(),
+                        "matched_datasets": set(),
+                        "matched_terms": set(),
+                        "matched_ids": set(),
+                    },
+                )
+                record["matched_fields"].add(key)
+                for dataset, match in matches.items():
+                    record["matched_datasets"].add(dataset)
+                    record["matched_terms"].update(
+                        f"{dataset}:{term}" for term in match["matched_terms"]
+                    )
+                    record["matched_ids"].update(
+                        f"{dataset}:{matched_id}" for matched_id in match["matched_ids"]
+                    )
+
+        rows = []
+        for i, record in sorted(hits.items()):
+            row = {
+                "archs4_row": int(i),
+                "matched_fields": ";".join(sorted(record["matched_fields"])),
+                "matched_datasets": ";".join(sorted(record["matched_datasets"])),
+                "matched_terms": ";".join(sorted(record["matched_terms"])),
+                "matched_ids": ";".join(sorted(record["matched_ids"])),
+            }
+            for key in keys:
+                row[key] = decode_value(sample_group[key][i])
+            rows.append(row)
+
+    pd.DataFrame(rows).to_csv(ARCHS4_DOWNSTREAM_HITS_OUT, index=False)
+    print(
+        f"ARCHS4 samples with downstream metadata hits: {len(hits)} / {n_samples}; "
+        f"details saved to {ARCHS4_DOWNSTREAM_HITS_OUT}"
+    )
+    return set(hits)
+
+
 def preprocess_archs4_to_chunks(
     gene_list: list[str],
     gtex_donor_hits: set[int],
+    downstream_hits: set[int],
     chunk_size: int = ARCHS4_CHUNK_SIZE,
 ) -> list[Path]:
     print("Preparing ARCHS4 mappings...")
@@ -271,6 +491,12 @@ def preprocess_archs4_to_chunks(
         bulk_like_idx = bulk_like_idx[~gtex_hit_mask]
     else:
         excluded_bulk_like_count = 0
+    if downstream_hits:
+        downstream_hit_mask = np.isin(bulk_like_idx, np.fromiter(downstream_hits, dtype=np.int64))
+        excluded_downstream_count = int(downstream_hit_mask.sum())
+        bulk_like_idx = bulk_like_idx[~downstream_hit_mask]
+    else:
+        excluded_downstream_count = 0
 
     print(f"ARCHS4 genes present: {len(src_pos)} / {len(gene_list)}")
     print(f"ARCHS4 genes missing: {len(missing)}")
@@ -280,7 +506,8 @@ def preprocess_archs4_to_chunks(
         f"{bulk_like_before_filter} / {len(sc_prob)}"
     )
     print(f"ARCHS4 bulk-like samples excluded by GTEx donor IDs: {excluded_bulk_like_count}")
-    print(f"ARCHS4 kept samples after GTEx donor filtering: {len(bulk_like_idx)}")
+    print(f"ARCHS4 bulk-like samples excluded by downstream metadata hits: {excluded_downstream_count}")
+    print(f"ARCHS4 kept samples after leakage filtering: {len(bulk_like_idx)}")
 
     with open(OUT_DIR / "archs4_missing_genes_RAW.json", "w") as f:
         json.dump(missing, f)
@@ -419,9 +646,12 @@ def main():
 
     gtex_path, gtex_donors = preprocess_gtex(gene_list)
     gtex_donor_hits = find_archs4_gtex_donor_hits(gtex_donors)
+    downstream_id_tokens = build_downstream_id_tokens()
+    downstream_hits = find_archs4_downstream_hits(downstream_id_tokens)
     archs4_chunks = preprocess_archs4_to_chunks(
         gene_list,
         gtex_donor_hits,
+        downstream_hits,
         chunk_size=ARCHS4_CHUNK_SIZE,
     )
     archs4_path = merge_archs4_chunks(archs4_chunks)
