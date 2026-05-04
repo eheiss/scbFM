@@ -181,7 +181,6 @@ class PreTrainRunner:
                 gene_list_path=self._resolve_gene_list_path(),
                 min_genes=int(getattr(self.pretrain_cfg, "min_genes", 200)),
                 target_sum=float(getattr(self.pretrain_cfg, "target_sum", 1e4)),
-                log_base=float(getattr(self.pretrain_cfg, "log_base", 2.0)),
                 bin_num=int(self.pretrain_cfg.bin_num),
                 reindex_genes=bool(getattr(self.pretrain_cfg, "reindex_genes", True)),
             )
@@ -332,7 +331,13 @@ class PreTrainRunner:
         )
 
     def _output_dir(self) -> Path:
-        return ROOT / "output" / str(self.pretrain_cfg.model_name)
+        return ROOT / "output" / self._model_name()
+
+    def _model_name(self) -> str:
+        return str(self.pretrain_cfg.model_name)
+
+    def _output_prefix(self) -> str:
+        return self._model_name()
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -544,14 +549,15 @@ class PreTrainRunner:
         if not self.is_master:
             return
         out_dir = self._output_dir()
-        self._write_csv(out_dir / "pretrain_epoch_metrics.csv", epoch_rows)
-        self._write_csv(out_dir / "pretrain_bin_metrics.csv", bin_rows)
+        prefix = self._output_prefix()
+        self._write_csv(out_dir / f"{prefix}_pretrain_epoch_metrics.csv", epoch_rows)
+        self._write_csv(out_dir / f"{prefix}_pretrain_bin_metrics.csv", bin_rows)
 
     def _save_checkpoint(self, epoch: int, train_loss: float) -> Path | None:
         if not self.is_master:
             return None
 
-        model_name = str(self.pretrain_cfg.model_name)
+        model_name = self._model_name()
         output_dir = self._output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = output_dir / f"{model_name}.pth"
@@ -724,7 +730,7 @@ class PreTrainRunner:
             if self.pretrain_cfg.resume_checkpoint:
                 log.info(
                     "Starting pre-adaptation of %s from checkpoint %s for up to %d epochs on device %s",
-                    self.pretrain_cfg.model_name,
+                    self._model_name(),
                     self.pretrain_cfg.resume_checkpoint,
                     epochs,
                     self.device,
@@ -732,7 +738,7 @@ class PreTrainRunner:
             else:   
                 log.info(
                     "Starting pretraining of %s for %d epochs on device %s",
-                    self.pretrain_cfg.model_name,
+                    self._model_name(),
                     epochs,
                     self.device,
                 )

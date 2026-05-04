@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 import gc
 import json
 import math
 import os
+import re
 import time
 
 import anndata as ad
@@ -13,13 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-try:
-    import cellxgene_census
-except ImportError as exc:
-    raise ImportError(
-        "cellxgene_census is required for create_pretrain_data_sc_RAW.py. "
-        "Run this script in the census environment where the notebook works."
-    ) from exc
+cellxgene_census = None
 
 
 # =========================
@@ -48,13 +44,14 @@ MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes_RAW.json"
 ORGANISM = "Homo sapiens"
 CENSUS_VERSION = "2025-11-08"
 MIN_GENES = 200
-TARGET_TOTAL_CELLS = int(os.getenv("SCBFM_TARGET_TOTAL_CELLS", "700000"))
+TARGET_TOTAL_CELLS = int(os.getenv("SCBFM_TARGET_TOTAL_CELLS", "560000"))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_DOWNLOAD_CHUNK_SIZE", "5000"))
 PROCESS_BATCH_SIZE = int(os.getenv("SCBFM_PROCESS_BATCH_SIZE", "2048"))
 MERGE_BATCH_SIZE = int(os.getenv("SCBFM_MERGE_BATCH_SIZE", "4"))
 RANDOM_SEED = 2021
 INITIAL_OVERDRAW_FACTOR = 1.10
 MAX_SAMPLING_ATTEMPTS = 4
+RESUME = os.getenv("SCBFM_SC_RESUME", "1") != "0"
 
 TILEDB_CONFIG = {
     "py.init_buffer_bytes": 256 * 1024**2,
@@ -75,6 +72,8 @@ OBS_SAMPLE_COLUMNS = [
     "donor_id",
 ]
 
+ATTEMPT_CHUNK_RE = re.compile(r"cellxgene_RAW_a(\d+)_chunk_\d+\.h5ad$")
+
 
 # =========================
 # Helpers
@@ -83,6 +82,11 @@ OBS_SAMPLE_COLUMNS = [
 def read_gene_list(path: Path) -> list[str]:
     with open(path) as f:
         return [line.strip() for line in f if line.strip()]
+
+
+def read_json(path: Path):
+    with open(path) as f:
+        return json.load(f)
 
 
 def close_backed_adata(adata: ad.AnnData) -> None:
@@ -108,6 +112,20 @@ def filter_raw_dense_block(
 def write_json(data, out_path: Path) -> None:
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def require_cellxgene_census():
+    global cellxgene_census
+    if cellxgene_census is None:
+        try:
+            import cellxgene_census as census_module
+        except ImportError as exc:
+            raise ImportError(
+                "cellxgene_census is required for create_pretrain_data_sc_RAW.py "
+                "unless all needed chunks are already cached."
+            ) from exc
+        cellxgene_census = census_module
+    return cellxgene_census
 
 
 def normalize_obs_chunk(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -153,6 +171,46 @@ def estimate_dense_chunk_gib(n_obs: int, n_vars: int, dtype_bytes: int = 4) -> f
     return n_obs * n_vars * dtype_bytes / 1024**3
 
 
+def sampling_plan_attempt_path(attempt_id: int) -> Path:
+    return OUT_DIR / f"sampling_plan_RAW_a{attempt_id:02d}.csv"
+
+
+def write_sampling_plan(sampled_meta: pd.DataFrame, attempt_id: int) -> None:
+    attempt_path = sampling_plan_attempt_path(attempt_id)
+    sampled_meta.to_csv(attempt_path, index=False)
+    sampled_meta.to_csv(SAMPLING_PLAN_OUT, index=False)
+
+
+def load_sampled_meta(path: Path) -> pd.DataFrame:
+    sampled_meta = pd.read_csv(path)
+    sampled_meta = normalize_obs_chunk(sampled_meta, OBS_SAMPLE_COLUMNS)
+    return sampled_meta.sort_values("soma_joinid").reset_index(drop=True)
+
+
+def infer_legacy_sampling_plan_attempt_id() -> int | None:
+    if not SAMPLING_PLAN_OUT.exists():
+        return None
+
+    attempt_ids = []
+    for path in CHUNK_DIR.glob("cellxgene_RAW_a*_chunk_*.h5ad"):
+        match = ATTEMPT_CHUNK_RE.match(path.name)
+        if match is not None:
+            attempt_ids.append(int(match.group(1)))
+
+    if attempt_ids:
+        return max(attempt_ids)
+    return 0
+
+
+def resolve_cached_sampling_plan_path(attempt_id: int, legacy_attempt_id: int | None) -> Path | None:
+    attempt_path = sampling_plan_attempt_path(attempt_id)
+    if attempt_path.exists():
+        return attempt_path
+    if legacy_attempt_id is not None and attempt_id == legacy_attempt_id and SAMPLING_PLAN_OUT.exists():
+        return SAMPLING_PLAN_OUT
+    return None
+
+
 def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
     adatas = [ad.read_h5ad(p) for p in paths]
     merged = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
@@ -173,7 +231,8 @@ def iter_obs_tables(census, column_names: list[str]):
 
 
 def build_var_coords(census, gene_list: list[str]) -> tuple[list[int], list[str]]:
-    var_df = cellxgene_census.get_var(
+    census_api = require_cellxgene_census()
+    var_df = census_api.get_var(
         census=census,
         organism=ORGANISM,
         column_names=["soma_joinid", "feature_id"],
@@ -265,14 +324,17 @@ def reservoir_sample_cells(census, group_quotas: dict[tuple[str, str, str], int]
     sampled_rows = [row for reservoir in reservoirs.values() for row in reservoir]
     sampled_meta = pd.DataFrame(sampled_rows)
     sampled_meta = sampled_meta.sort_values("soma_joinid").reset_index(drop=True)
-    sampled_meta.to_csv(SAMPLING_PLAN_OUT, index=False)
     return sampled_meta
+
+
+class MissingChunkDownloadRequired(RuntimeError):
+    pass
 
 
 def download_and_preprocess_chunks(
     census,
     sampled_meta: pd.DataFrame,
-    var_coords: list[int],
+    var_coords: list[int] | None,
     gene_list: list[str],
     target_total: int,
     attempt_id: int,
@@ -285,12 +347,45 @@ def download_and_preprocess_chunks(
             break
 
         end = min(start + DOWNLOAD_CHUNK_SIZE, sampled_meta.shape[0])
+        out_path = CHUNK_DIR / f"cellxgene_RAW_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
+        if RESUME and out_path.exists():
+            cached = ad.read_h5ad(out_path, backed="r")
+            cached_gene_list = list(cached.var_names)
+            if cached_gene_list != gene_list:
+                close_backed_adata(cached)
+                raise ValueError(
+                    f"Cached chunk {out_path} does not match the current gene_list.txt ordering."
+                )
+            reused_n_obs = int(cached.n_obs)
+            remaining = target_total - kept_total
+            if reused_n_obs > remaining:
+                close_backed_adata(cached)
+                raise ValueError(
+                    f"Cached chunk {out_path} keeps {reused_n_obs} cells but only {remaining} "
+                    "fit the current target. Remove cached chunks or set SCBFM_SC_RESUME=0."
+                )
+            close_backed_adata(cached)
+            chunk_paths.append(out_path)
+            kept_total += reused_n_obs
+            print(
+                f"Reusing CELLxGENE chunk {chunk_id}: sampled cells {start}:{end} "
+                f"(kept {reused_n_obs}, cumulative {kept_total}/{target_total})"
+            )
+            gc.collect()
+            continue
+
+        if var_coords is None:
+            raise MissingChunkDownloadRequired(
+                f"Missing cached chunk {out_path}; Census download is required."
+            )
+
         meta_chunk = sampled_meta.iloc[start:end].copy()
         obs_coords = meta_chunk["soma_joinid"].astype(np.int64).tolist()
 
         print(f"Downloading CELLxGENE chunk {chunk_id}: sampled cells {start}:{end}")
         t0 = time.perf_counter()
-        adata = cellxgene_census.get_anndata(
+        census_api = require_cellxgene_census()
+        adata = census_api.get_anndata(
             census=census,
             organism=ORGANISM,
             obs_coords=obs_coords,
@@ -377,7 +472,6 @@ def download_and_preprocess_chunks(
         out = ad.AnnData(X=x, obs=obs, var=var)
         out.var_names = pd.Index(gene_list, dtype=str)
 
-        out_path = CHUNK_DIR / f"cellxgene_RAW_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
         out.write(out_path)
         chunk_paths.append(out_path)
         kept_total += out.n_obs
@@ -393,9 +487,22 @@ def download_and_preprocess_chunks(
     return chunk_paths, kept_total
 
 
-def merge_chunks(chunk_paths: list[Path]) -> Path:
+def merge_chunks(chunk_paths: list[Path], gene_list: list[str], target_total: int) -> Path:
     if len(chunk_paths) == 0:
         raise ValueError("No CELLxGENE chunk files were created.")
+
+    if RESUME and FINAL_OUT.exists():
+        cached_final = ad.read_h5ad(FINAL_OUT, backed="r")
+        cached_gene_list = list(cached_final.var_names)
+        cached_n_obs = int(cached_final.n_obs)
+        close_backed_adata(cached_final)
+        if cached_gene_list == gene_list and cached_n_obs == target_total:
+            print(f"Reusing existing merged single-cell file at {FINAL_OUT}")
+            return FINAL_OUT
+        print(
+            f"Ignoring cached merged single-cell file at {FINAL_OUT} because it does not "
+            "match the current target or gene ordering."
+        )
 
     current_paths = list(chunk_paths)
     round_id = 0
@@ -431,19 +538,27 @@ def main() -> None:
     print(f"Target single-cell sample count: {target_total}")
     print(f"Target gene count: {len(gene_list)}")
 
-    with cellxgene_census.open_soma(
-        census_version=CENSUS_VERSION,
-        tiledb_config=TILEDB_CONFIG,
-    ) as census:
-        var_coords, missing_genes = build_var_coords(census, gene_list)
-        write_json(missing_genes, MISSING_GENES_OUT)
-        if missing_genes:
-            raise ValueError(
-                f"CELLxGENE Census is missing {len(missing_genes)} genes from gene_list.txt. "
-                f"See {MISSING_GENES_OUT}."
-            )
+    previous_summary = read_json(SAMPLING_SUMMARY_OUT) if RESUME and SAMPLING_SUMMARY_OUT.exists() else {}
+    missing_genes = read_json(MISSING_GENES_OUT) if RESUME and MISSING_GENES_OUT.exists() else None
+    legacy_plan_attempt_id = infer_legacy_sampling_plan_attempt_id()
+    dataset_counts = None
+    group_counts_by_dataset = None
+    var_coords = None
+    census = None
 
-        dataset_counts, group_counts_by_dataset = count_sampling_groups(census)
+    with ExitStack() as stack:
+        def ensure_census():
+            nonlocal census
+            if census is None:
+                census_api = require_cellxgene_census()
+                census = stack.enter_context(
+                    census_api.open_soma(
+                        census_version=CENSUS_VERSION,
+                        tiledb_config=TILEDB_CONFIG,
+                    )
+                )
+            return census
+
         attempt_summaries = []
         chunk_paths = []
 
@@ -455,20 +570,58 @@ def main() -> None:
                 f"{candidate_total} candidate cells (factor {overdraw_factor:.2f})"
             )
 
-            dataset_quotas, group_quotas = build_group_quotas(
-                candidate_total,
-                dataset_counts,
-                group_counts_by_dataset,
-            )
-            sampled_meta = reservoir_sample_cells(census, group_quotas)
-            chunk_paths, kept_total = download_and_preprocess_chunks(
-                census,
-                sampled_meta,
-                var_coords,
-                gene_list,
-                target_total=target_total,
-                attempt_id=attempt_id,
-            )
+            cached_plan_path = resolve_cached_sampling_plan_path(attempt_id, legacy_plan_attempt_id)
+            if RESUME and cached_plan_path is not None:
+                print(f"Reusing sampling plan for attempt {attempt_id} from {cached_plan_path}")
+                sampled_meta = load_sampled_meta(cached_plan_path)
+                datasets_sampled = int(sampled_meta["dataset_id"].nunique())
+                sampling_groups_sampled = int(
+                    sampled_meta[["dataset_id", "tissue_general", "cell_type"]]
+                    .drop_duplicates()
+                    .shape[0]
+                )
+            else:
+                if dataset_counts is None or group_counts_by_dataset is None:
+                    dataset_counts, group_counts_by_dataset = count_sampling_groups(ensure_census())
+
+                dataset_quotas, group_quotas = build_group_quotas(
+                    candidate_total,
+                    dataset_counts,
+                    group_counts_by_dataset,
+                )
+                sampled_meta = reservoir_sample_cells(ensure_census(), group_quotas)
+                write_sampling_plan(sampled_meta, attempt_id)
+                legacy_plan_attempt_id = attempt_id
+                datasets_sampled = int((dataset_quotas > 0).sum())
+                sampling_groups_sampled = int(sum(q > 0 for q in group_quotas.values()))
+
+            try:
+                chunk_paths, kept_total = download_and_preprocess_chunks(
+                    census,
+                    sampled_meta,
+                    var_coords,
+                    gene_list,
+                    target_total=target_total,
+                    attempt_id=attempt_id,
+                )
+            except MissingChunkDownloadRequired:
+                if var_coords is None:
+                    var_coords, missing_genes = build_var_coords(ensure_census(), gene_list)
+                    write_json(missing_genes, MISSING_GENES_OUT)
+                    if missing_genes:
+                        raise ValueError(
+                            f"CELLxGENE Census is missing {len(missing_genes)} genes from gene_list.txt. "
+                            f"See {MISSING_GENES_OUT}."
+                        )
+
+                chunk_paths, kept_total = download_and_preprocess_chunks(
+                    census,
+                    sampled_meta,
+                    var_coords,
+                    gene_list,
+                    target_total=target_total,
+                    attempt_id=attempt_id,
+                )
 
             attempt_summary = {
                 "attempt_id": attempt_id,
@@ -476,13 +629,26 @@ def main() -> None:
                 "candidate_total_requested": int(candidate_total),
                 "candidate_total_sampled": int(sampled_meta.shape[0]),
                 "kept_total_after_filtering": int(kept_total),
-                "datasets_sampled": int((dataset_quotas > 0).sum()),
-                "sampling_groups_sampled": int(sum(q > 0 for q in group_quotas.values())),
+                "datasets_sampled": datasets_sampled,
+                "sampling_groups_sampled": sampling_groups_sampled,
             }
             attempt_summaries.append(attempt_summary)
 
             if kept_total >= target_total:
                 break
+
+        if missing_genes is None:
+            missing_genes = []
+        available_primary_cells = (
+            int(dataset_counts.sum())
+            if dataset_counts is not None
+            else previous_summary.get("available_primary_cells")
+        )
+        datasets_seen = (
+            int(dataset_counts.shape[0])
+            if dataset_counts is not None
+            else previous_summary.get("datasets_seen")
+        )
 
         if not chunk_paths or attempt_summaries[-1]["kept_total_after_filtering"] < target_total:
             write_json(
@@ -490,10 +656,11 @@ def main() -> None:
                     "census_version": CENSUS_VERSION,
                     "target_total_cells": int(target_total),
                     "target_gene_count": int(len(gene_list)),
-                    "available_primary_cells": int(dataset_counts.sum()),
-                    "datasets_seen": int(dataset_counts.shape[0]),
+                    "available_primary_cells": available_primary_cells,
+                    "datasets_seen": datasets_seen,
                     "missing_genes": int(len(missing_genes)),
                     "attempts": attempt_summaries,
+                    "resume_enabled": RESUME,
                 },
                 SAMPLING_SUMMARY_OUT,
             )
@@ -506,14 +673,15 @@ def main() -> None:
             "census_version": CENSUS_VERSION,
             "target_total_cells": int(target_total),
             "target_gene_count": int(len(gene_list)),
-            "available_primary_cells": int(dataset_counts.sum()),
-            "datasets_seen": int(dataset_counts.shape[0]),
+            "available_primary_cells": available_primary_cells,
+            "datasets_seen": datasets_seen,
             "missing_genes": int(len(missing_genes)),
             "attempts": attempt_summaries,
+            "resume_enabled": RESUME,
         }
         write_json(summary, SAMPLING_SUMMARY_OUT)
 
-    merge_chunks(chunk_paths)
+    merge_chunks(chunk_paths, gene_list, target_total)
 
 
 if __name__ == "__main__":

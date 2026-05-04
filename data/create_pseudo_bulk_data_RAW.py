@@ -23,7 +23,7 @@ cellxgene_census = None
 
 GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
 
-OUT_DIR = Path("/Users/enricoheiss/Downloads/pseudo_bulk")
+OUT_DIR = Path("/cluster/work/boeva/eheiss/datasets/pseudo_bulk")
 CHUNK_DIR = OUT_DIR / "pseudo_bulk_RAW_chunks"
 SOURCE_CHUNK_DIR = OUT_DIR / "source_cell_chunks"
 MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"

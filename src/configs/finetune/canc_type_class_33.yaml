@@ -44,7 +44,6 @@ merge_gbm_lgg: false
 preprocess: true
 min_genes: 200
 target_sum: 1e4
-log_base: 2.0
 cv_folds: 5
 random_seed: 42
 

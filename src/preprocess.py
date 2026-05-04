@@ -90,10 +90,35 @@ def filter_min_genes(adata: ad.AnnData, min_genes: int) -> ad.AnnData:
     return adata[keep_mask].copy()
 
 
-def normalize_log_bin(
+def _digitize(x, bins, rng) -> "np.ndarray":
+    import numpy as np
+
+    assert x.ndim == 1 and bins.ndim == 1
+    left_digits = np.digitize(x, bins)
+    right_digits = np.digitize(x, bins, right=True)
+    random_offsets = rng.rand(len(x))
+    digits = random_offsets * (right_digits - left_digits) + left_digits
+    return np.ceil(digits).astype(np.int64)
+
+
+def _quantile_bin_nonzero_values(values, *, bin_num: int, rng) -> "np.ndarray":
+    import numpy as np
+
+    if values.ndim != 1:
+        raise ValueError("Expected a 1D array of nonzero expression values.")
+    if values.size == 0:
+        return np.zeros(0, dtype=np.uint8)
+
+    # Match scGPT: token 0 is reserved for true zeros, and nonzero values are
+    # quantile-binned into integer tokens 1..bin_num.
+    bins = np.quantile(values, np.linspace(0, 1, bin_num))
+    digits = _digitize(values, bins, rng)
+    return np.clip(digits, 1, bin_num).astype(np.uint8, copy=False)
+
+
+def normalize_total_quantile_bin(
     adata: ad.AnnData,
     target_sum: float,
-    log_base: float,
     bin_num: int,
 ) -> ad.AnnData:
     import numpy as np
@@ -101,10 +126,10 @@ def normalize_log_bin(
 
     if target_sum <= 0:
         raise ValueError("--target-sum must be positive.")
-    if log_base <= 0 or log_base == 1:
-        raise ValueError("--log-base must be positive and not equal to 1.")
     if bin_num < 1:
         raise ValueError("--bin-num must be at least 1.")
+
+    rng = np.random.RandomState(0)
 
     if sparse.issparse(adata.X):
         x = adata.X.tocsr().astype(np.float32, copy=False)
@@ -114,18 +139,35 @@ def normalize_log_bin(
         scale[nonzero] = np.float32(target_sum) / libsize[nonzero]
 
         x = x.multiply(scale[:, None]).tocsr()
-        x.data = np.log1p(x.data) / np.log(log_base)
-        x.data = np.clip(np.floor(x.data), 0, bin_num).astype(np.uint8)
-        x.eliminate_zeros()
+        for row_idx in range(x.shape[0]):
+            start = x.indptr[row_idx]
+            end = x.indptr[row_idx + 1]
+            if start == end:
+                continue
+            x.data[start:end] = _quantile_bin_nonzero_values(
+                x.data[start:end],
+                bin_num=bin_num,
+                rng=rng,
+            ).astype(np.float32, copy=False)
         adata.X = x.astype(np.uint8, copy=False)
     else:
         x = np.asarray(adata.X, dtype=np.float32)
         libsize = x.sum(axis=1, keepdims=True)
-        libsize[libsize == 0] = 1.0
-        x = x / libsize * target_sum
-        x = np.log1p(x) / np.log(log_base)
-        x = np.clip(np.floor(x), 0, bin_num).astype(np.uint8)
-        adata.X = sparse.csr_matrix(x)
+        nonzero_rows = libsize[:, 0] > 0
+        libsize[~nonzero_rows] = 1.0
+        x = x / libsize * np.float32(target_sum)
+
+        binned = np.zeros_like(x, dtype=np.uint8)
+        for row_idx, row in enumerate(x):
+            nonzero = row > 0
+            if not np.any(nonzero):
+                continue
+            binned[row_idx, nonzero] = _quantile_bin_nonzero_values(
+                row[nonzero],
+                bin_num=bin_num,
+                rng=rng,
+            )
+        adata.X = sparse.csr_matrix(binned)
 
     return adata
 
@@ -136,8 +178,7 @@ def preprocess_adata_for_tokens(
     gene_list_path: Path | None = DEFAULT_GENE_LIST_PATH,
     min_genes: int = 200,
     target_sum: float = 1e4,
-    log_base: float = 2.0,
-    bin_num: int = 5,
+    bin_num: int = 10,
     reindex_genes: bool = True,
 ) -> tuple[ad.AnnData, list[str]]:
     missing: list[str] = []
@@ -151,10 +192,9 @@ def preprocess_adata_for_tokens(
         adata.var_names_make_unique()
 
     adata = filter_min_genes(adata, min_genes=min_genes)
-    adata = normalize_log_bin(
+    adata = normalize_total_quantile_bin(
         adata,
         target_sum=target_sum,
-        log_base=log_base,
         bin_num=bin_num,
     )
     return adata, missing
@@ -202,7 +242,6 @@ def preprocess_raw_h5ad(
     gene_list_path: Path | None,
     min_genes: int,
     target_sum: float,
-    log_base: float,
     bin_num: int,
     overwrite: bool,
 ) -> None:
@@ -229,10 +268,9 @@ def preprocess_raw_h5ad(
     adata = filter_min_genes(adata, min_genes=min_genes)
     print(f"Filtered samples by min_genes={min_genes}: {before_filter} -> {adata.n_obs}")
 
-    adata = normalize_log_bin(
+    adata = normalize_total_quantile_bin(
         adata,
         target_sum=target_sum,
-        log_base=log_base,
         bin_num=bin_num,
     )
 
@@ -244,8 +282,10 @@ def preprocess_raw_h5ad(
         "missing_genes": int(len(missing)),
         "min_genes": int(min_genes),
         "target_sum": float(target_sum),
-        "log_base": float(log_base),
         "bin_num": int(bin_num),
+        "binning_strategy": "scgpt_nonzero_quantile",
+        "nonzero_bin_count": int(bin_num),
+        "zero_token_reserved": True,
         "output_dtype": "uint8",
     }
 

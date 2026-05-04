@@ -233,6 +233,8 @@ class CancTypeClassDataset(Dataset):
 
 
 class CancTypeClassRunner:
+    task_name = TASK_NAME
+
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
         self.task_cfg = self._resolve_task_cfg(cfg)
@@ -352,15 +354,16 @@ class CancTypeClassRunner:
             return
         out_dir = self._task_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "config.yaml").write_text(
+        prefix = self._output_prefix()
+        (out_dir / f"{prefix}_config.yaml").write_text(
             OmegaConf.to_yaml(self.cfg, resolve=True),
             encoding="utf-8",
         )
         self._write_json(
-            out_dir / "run_metadata.json",
+            out_dir / f"{prefix}_run_metadata.json",
             {
-                "task": TASK_NAME,
-                "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+                "task": self.task_name,
+                "finetune_mode": self._finetune_mode(),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
@@ -459,7 +462,6 @@ class CancTypeClassRunner:
                 gene_list_path=gene_list_path,
                 min_genes=min_genes,
                 target_sum=float(getattr(self.task_cfg, "target_sum", 1e4)),
-                log_base=float(getattr(self.task_cfg, "log_base", 2.0)),
                 bin_num=int(self.model_cfg.bin_num),
                 reindex_genes=True,
             )
@@ -616,7 +618,7 @@ class CancTypeClassRunner:
         return {key.removeprefix("module."): value for key, value in state_dict.items()}
 
     def _build_model(self, checkpoint_path: str) -> None:
-        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
+        finetune_mode = self._finetune_mode()
         valid_modes = {"head_only", "full_ft", "adapters"}
         if finetune_mode not in valid_modes:
             raise ValueError(
@@ -788,7 +790,7 @@ class CancTypeClassRunner:
             log.info("Optimizer parameter groups: %s", "; ".join(group_summaries))
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
-        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "head_only"))
+        finetune_mode = self._finetune_mode()
         burn_in_epochs = int(getattr(self.task_cfg, "burn_in_epochs", 0))
         if (
             finetune_mode != "full_ft"
@@ -956,14 +958,14 @@ class CancTypeClassRunner:
         test_metrics: dict[str, object],
     ) -> dict[str, object]:
         row: dict[str, object] = {
-            "model": model_key,
-            "fold": fold,
-            "n_folds": n_folds,
-            "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
-            "checkpoint_path": checkpoint_path,
-            "train_loss": float(train_metrics["loss"]),
-            "train_accuracy": float(train_metrics["accuracy"]),
-        }
+                "model": model_key,
+                "fold": fold,
+                "n_folds": n_folds,
+                "finetune_mode": self._finetune_mode(),
+                "checkpoint_path": checkpoint_path,
+                "train_loss": float(train_metrics["loss"]),
+                "train_accuracy": float(train_metrics["accuracy"]),
+            }
         for key, value in test_metrics.items():
             if isinstance(value, (int, float, np.integer, np.floating)):
                 row[key] = float(value)
@@ -1009,7 +1011,7 @@ class CancTypeClassRunner:
                 {
                     "model": model_key,
                     "fold": fold,
-                    "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+                    "finetune_mode": self._finetune_mode(),
                     "checkpoint_path": checkpoint_path,
                     "sample_id": str(test_adata.obs_names[idx]),
                     "case_id": case_ids[idx],
@@ -1039,8 +1041,13 @@ class CancTypeClassRunner:
         self._write_csv(path, rows)
 
     def _task_output_dir(self) -> Path:
-        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
-        return ROOT / "output" / TASK_NAME / finetune_mode
+        return ROOT / "output" / self.task_name / self._finetune_mode()
+
+    def _output_prefix(self) -> str:
+        return f"{self.task_name}_{self._finetune_mode()}"
+
+    def _finetune_mode(self) -> str:
+        return str(getattr(self.task_cfg, "finetune_mode", "head_only"))
 
     def _write_model_results(
         self,
@@ -1059,12 +1066,13 @@ class CancTypeClassRunner:
         )
         out_dir = self._task_output_dir()
         model_key = str(fold_rows[0]["model"])
-        self._write_csv(out_dir / f"{model_key}_fold_metrics.csv", fold_rows)
-        self._write_csv(out_dir / f"{model_key}_evaluation_metrics.csv", [aggregate])
-        self._write_csv(out_dir / f"{model_key}_predictions.csv", prediction_rows)
+        prefix = self._output_prefix()
+        self._write_csv(out_dir / f"{prefix}_{model_key}_fold_metrics.csv", fold_rows)
+        self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate])
+        self._write_csv(out_dir / f"{prefix}_{model_key}_predictions.csv", prediction_rows)
         if confusion_matrices:
             self._write_confusion_matrix(
-                out_dir / f"{model_key}_confusion_matrix.csv",
+                out_dir / f"{prefix}_{model_key}_confusion_matrix.csv",
                 np.sum(confusion_matrices, axis=0),
             )
         return aggregate
@@ -1176,9 +1184,10 @@ class CancTypeClassRunner:
 
             if self.is_master:
                 combined_dir = self._task_output_dir()
-                self._write_csv(combined_dir / "evaluation_metrics.csv", aggregate_rows)
+                output_path = combined_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
+                self._write_csv(output_path, aggregate_rows)
                 return {
-                    "results_path": str(combined_dir / "evaluation_metrics.csv"),
+                    "results_path": str(output_path),
                     "results": aggregate_rows,
                 }
             return {}

@@ -11,7 +11,7 @@ grad_acc: 60
 max_grad_norm: 1e2
 
 # model
-bin_num: 5
+bin_num: 10
 gene_num: 11964
 seed: 2021
 dim: 200
@@ -40,7 +40,6 @@ reindex_genes: true
 gene_list_path: ../data/gene_list.txt
 min_genes: 200
 target_sum: 1e4
-log_base: 2.0
 validation_split: 0.05
 mask_prob: 0.15
 replace_prob: 0.9
@@ -54,6 +53,4 @@ cycle_mult: 1
 min_lr: 1e-6
 warmup_steps: 1
 gamma: 1.0
-
-
 

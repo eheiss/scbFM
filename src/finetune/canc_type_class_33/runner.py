@@ -71,15 +71,16 @@ class CancTypeClass33Runner(CancTypeClassRunner):
             return
         out_dir = self._task_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "config.yaml").write_text(
+        prefix = self._output_prefix()
+        (out_dir / f"{prefix}_config.yaml").write_text(
             OmegaConf.to_yaml(self.cfg, resolve=True),
             encoding="utf-8",
         )
         self._write_json(
-            out_dir / "run_metadata.json",
+            out_dir / f"{prefix}_run_metadata.json",
             {
                 "task": self.task_name,
-                "finetune_mode": str(getattr(self.task_cfg, "finetune_mode", "full_ft")),
+                "finetune_mode": self._finetune_mode(),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
@@ -138,5 +139,4 @@ class CancTypeClass33Runner(CancTypeClassRunner):
         return adata
 
     def _task_output_dir(self) -> Path:
-        finetune_mode = str(getattr(self.task_cfg, "finetune_mode", "full_ft"))
-        return ROOT / "output" / self.task_name / finetune_mode
+        return ROOT / "output" / self.task_name / self._finetune_mode()

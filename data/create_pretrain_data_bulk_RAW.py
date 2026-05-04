@@ -42,7 +42,7 @@ ARCHS4_DOWNSTREAM_HITS_OUT = OUT_DIR / "archs4_downstream_hits_RAW.csv"
 MIN_GENES = 200
 ARCHS4_CHUNK_SIZE = 2000  # samples per chunk before cell filtering
 MERGE_BATCH_SIZE = 16
-PRETRAIN_SAMPLE_COUNT = 700_000
+PRETRAIN_SAMPLE_COUNT = 560_000
 RANDOM_SEED = 42
 GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
 METADATA_TOKEN_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9._:-]{2,}")
@@ -55,7 +55,7 @@ DOWNSTREAM_DATASET_PATHS = {
 }
 
 DOWNSTREAM_GCTX_PATHS = {
-    "LINCS": Path("/cluster/customapps/biomed/boeva/eheiss/downloads/level5_beta_all_n1201944x12328.gctx"),
+    "LINCS": Path("/cluster/work/boeva/eheiss/datasets/LINCS/level5_beta_all_n1201944x12328.gctx"),
 }
 
 DOWNSTREAM_DATASET_TERMS = {
