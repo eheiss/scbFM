@@ -10,6 +10,7 @@ import re
 import time
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -148,7 +149,7 @@ def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
     adatas = [ad.read_h5ad(p) for p in paths]
     merged = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
     merged.obs_names_make_unique()
-    merged.write(out_path)
+    write_h5ad_compat(merged, out_path)
 
     del adatas, merged
     gc.collect()
@@ -203,6 +204,21 @@ def build_proportion_column_map(cell_types: list[str]) -> dict[str, str]:
         used.add(column)
 
     return mapping
+
+
+def write_h5ad_compat(adata: ad.AnnData, path: Path) -> None:
+    """Write h5ad with HDF5 libver='earliest' so cluster HDF5 < 1.10 can read it."""
+    tmp = path.with_suffix(".writing.h5ad")
+    try:
+        adata.write(tmp)
+        with h5py.File(tmp, "r") as f_in:
+            with h5py.File(path, "w", libver="earliest") as f_out:
+                for key in f_in.keys():
+                    f_in.copy(key, f_out)
+                for k, v in f_in.attrs.items():
+                    f_out.attrs[k] = v
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def store_proportion_metadata(adata: ad.AnnData, proportion_column_map: dict[str, str]) -> None:
@@ -589,7 +605,7 @@ def download_source_cells(
         else:
             adata.X = sparse.csr_matrix(np.asarray(adata.X, dtype=np.float32))
 
-        adata.write(chunk_path)
+        write_h5ad_compat(adata, chunk_path)
         chunk_paths.append(chunk_path)
 
         del adata
@@ -646,19 +662,25 @@ def get_source_chunk_paths(sampled_meta: pd.DataFrame) -> list[Path]:
 
 
 def build_source_chunk_index(
+    sampled_meta: pd.DataFrame,
     source_chunk_paths: list[Path],
 ) -> dict[tuple[tuple[str, str, str], str], list[tuple[int, int]]]:
     index: dict[tuple[tuple[str, str, str], str], list[tuple[int, int]]] = defaultdict(list)
 
-    for chunk_id, chunk_path in enumerate(source_chunk_paths):
-        adata = ad.read_h5ad(chunk_path, backed="r")
-        obs = normalize_obs_chunk(adata.obs.reset_index(drop=True), OBS_CONTEXT_COLUMNS)
-        for row_idx, row in enumerate(obs.itertuples(index=False)):
-            context_key = make_context_key(row)
-            index[(context_key, row.cell_type)].append((chunk_id, row_idx))
-        adata.file.close()
-        del adata, obs
-        gc.collect()
+    expected_chunks = math.ceil(sampled_meta.shape[0] / DOWNLOAD_CHUNK_SIZE)
+    if expected_chunks != len(source_chunk_paths):
+        raise ValueError(
+            "Cached source metadata and chunk files are inconsistent: "
+            f"metadata implies {expected_chunks} chunks, found {len(source_chunk_paths)} files."
+        )
+
+    # Cached source chunks are written chunk-by-chunk from sampled_meta in order,
+    # so each metadata row maps directly to a (chunk_id, row_idx) location.
+    for absolute_row_idx, row in enumerate(sampled_meta.itertuples(index=False)):
+        chunk_id = absolute_row_idx // DOWNLOAD_CHUNK_SIZE
+        row_idx = absolute_row_idx % DOWNLOAD_CHUNK_SIZE
+        context_key = make_context_key(row)
+        index[(context_key, row.cell_type)].append((chunk_id, row_idx))
 
     return index
 
@@ -754,7 +776,7 @@ def generate_pseudo_bulk_chunks(
         out.var_names = pd.Index(gene_list, dtype=str)
         store_proportion_metadata(out, proportion_column_map)
 
-        out.write(out_path)
+        write_h5ad_compat(out, out_path)
         chunk_paths.append(out_path)
 
         del raw_chunk, x_dense, x_raw, obs, var, out
@@ -769,12 +791,13 @@ def generate_pseudo_bulk_chunks(
 
 
 def generate_pseudo_bulk_chunks_from_cached_sources(
+    sampled_meta: pd.DataFrame,
     source_chunk_paths: list[Path],
     plan_rows: list[dict[str, object]],
     proportion_column_map: dict[str, str],
     gene_list: list[str],
 ) -> list[Path]:
-    source_index = build_source_chunk_index(source_chunk_paths)
+    source_index = build_source_chunk_index(sampled_meta, source_chunk_paths)
     chunk_paths: list[Path] = []
 
     for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
@@ -838,7 +861,7 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
         out.var_names = pd.Index(gene_list, dtype=str)
         store_proportion_metadata(out, proportion_column_map)
 
-        out.write(out_path)
+        write_h5ad_compat(out, out_path)
         chunk_paths.append(out_path)
 
         del raw_chunk, x_dense, x_raw, obs, var, out
@@ -879,7 +902,7 @@ def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str])
     final_merged = ad.read_h5ad(current_paths[0])
     final_merged.obs_names_make_unique()
     store_proportion_metadata(final_merged, proportion_column_map)
-    final_merged.write(FINAL_OUT)
+    write_h5ad_compat(final_merged, FINAL_OUT)
 
     del final_merged
     gc.collect()
@@ -996,7 +1019,7 @@ def main() -> None:
                     var_coords,
                     gene_list,
                 )
-                source_adata.write(SOURCE_ADATA_OUT)
+                write_h5ad_compat(source_adata, SOURCE_ADATA_OUT)
                 print(f"Cached aligned source cells at {SOURCE_ADATA_OUT}")
 
     if eligible_df.empty:
@@ -1009,6 +1032,7 @@ def main() -> None:
         sampled_source_meta = load_sampled_source_meta(SAMPLED_SOURCE_CELLS_OUT)
         source_chunk_paths = get_source_chunk_paths(sampled_source_meta)
         chunk_paths = generate_pseudo_bulk_chunks_from_cached_sources(
+            sampled_source_meta,
             source_chunk_paths,
             plan_rows,
             proportion_column_map,
