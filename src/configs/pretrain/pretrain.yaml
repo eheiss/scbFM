@@ -46,6 +46,9 @@ replace_prob: 0.9
 random_token_prob: 0.
 mask_ignore_token_ids: [0]
 
+# loss
+loss_type: mse  # "ce" (cross-entropy) or "mse" (ordinal MSE over bin soft-predictions)
+
 #optimizer
 learning_rate: 1e-4
 first_cycle_steps: 5

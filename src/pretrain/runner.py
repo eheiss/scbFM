@@ -116,6 +116,23 @@ class SCDataset(Dataset):
         return self.data.shape[0]
 
 
+class ExprDecoder(nn.Module):
+    """Scalar regression head: hidden_dim → 1, matching scGPT's ExprDecoder MLP."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(dim, dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x).squeeze(-1)  # (B, seq_len)
+
+
 class PreTrainRunner:
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
@@ -142,6 +159,7 @@ class PreTrainRunner:
         self.val_loader = None
         self.val_dataset_size = 0
         self.model = None
+        self.expr_decoder = None
         self.optimizer = None
         self.scheduler = None
         self.loss_fn = None
@@ -287,10 +305,16 @@ class PreTrainRunner:
             qkv_bias=self.pretrain_cfg.qkv_bias,
         ).to(self.device)
 
+        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
+        if loss_type == "mse":
+            self.expr_decoder = ExprDecoder(dim=self.pretrain_cfg.dim).to(self.device)
+
         if self.pretrain_cfg.resume_checkpoint:
             checkpoint_path = hydra.utils.to_absolute_path(self.pretrain_cfg.resume_checkpoint)
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             model.load_state_dict(checkpoint["model_state_dict"])
+            if "expr_decoder_state_dict" in checkpoint and self.expr_decoder is not None:
+                self.expr_decoder.load_state_dict(checkpoint["expr_decoder_state_dict"])
             log.info("Loaded checkpoint from %s", checkpoint_path)
 
         if self.is_distributed:
@@ -298,12 +322,42 @@ class PreTrainRunner:
                 model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank)
             else:
                 model = DDP(model)
+            if self.expr_decoder is not None:
+                if self.device.type == "cuda":
+                    self.expr_decoder = DDP(self.expr_decoder, device_ids=[self.local_rank], output_device=self.local_rank)
+                else:
+                    self.expr_decoder = DDP(self.expr_decoder)
 
         self.model = model
 
+    def _compute_loss(self, hidden_or_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute masked MLM loss. CE receives logits; MSE receives hidden states."""
+        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
+        if loss_type == "ce":
+            return self.loss_fn(hidden_or_logits.transpose(1, 2), labels)
+
+        # MSE: scalar decoder head on hidden states, masked positions only (scGPT style).
+        pred = self.expr_decoder(hidden_or_logits)  # (B, seq_len)
+        valid = labels != self.pad_token_id
+        if not valid.any():
+            return pred.sum() * 0.0
+        mask = valid.float()
+        loss = nn.functional.mse_loss(pred * mask, labels.to(pred.dtype) * mask, reduction="sum")
+        return loss / mask.sum()
+
     def _build_optimization(self) -> None:
         learning_rate = self.pretrain_cfg.learning_rate
-        self.optimizer = Adam(self.model.parameters(), lr=learning_rate)
+        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
+        if loss_type == "ce":
+            self.loss_fn = nn.CrossEntropyLoss(
+                ignore_index=self.pad_token_id,
+                reduction="mean",
+            ).to(self.device)
+            all_params = self.model.parameters()
+        else:
+            self.loss_fn = None
+            all_params = list(self.model.parameters()) + list(self.expr_decoder.parameters())
+        self.optimizer = Adam(all_params, lr=learning_rate)
         self.scheduler = CosineAnnealingWarmupRestarts(
             self.optimizer,
             first_cycle_steps=self.pretrain_cfg.first_cycle_steps,
@@ -313,10 +367,26 @@ class PreTrainRunner:
             warmup_steps=self.pretrain_cfg.warmup_steps,
             gamma=self.pretrain_cfg.gamma,
         )
-        self.loss_fn = nn.CrossEntropyLoss(
-            ignore_index=self.pad_token_id,
-            reduction="mean",
-        ).to(self.device)
+
+    def _use_mse(self) -> bool:
+        return str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower() == "mse"
+
+    def _forward_batch(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run model forward, returning (loss_input, logits).
+
+        CE mode: loss_input == logits (vocab logits, shape B×L×V).
+        MSE mode: loss_input = hidden states (B×L×dim); logits derived via to_out
+                  for accuracy stats without a second full forward pass.
+        """
+        if not self._use_mse():
+            logits = self.model(batch)
+            return logits, logits
+
+        hidden = self.model(batch, return_encodings=True)
+        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        with torch.no_grad():
+            logits = raw_model.to_out(hidden)
+        return hidden, logits
 
     def _mask_batch(self, batch):
         return data_mask(
@@ -563,16 +633,17 @@ class PreTrainRunner:
         checkpoint_path = output_dir / f"{model_name}.pth"
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "losses": train_loss,
-            },
-            checkpoint_path,
-        )
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "losses": train_loss,
+        }
+        if self.expr_decoder is not None:
+            raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
+            checkpoint["expr_decoder_state_dict"] = raw_decoder.state_dict()
+        torch.save(checkpoint, checkpoint_path)
         return checkpoint_path
 
     def _train_one_epoch(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]]:
@@ -581,6 +652,8 @@ class PreTrainRunner:
             dist.barrier()
 
         self.model.train()
+        if self.expr_decoder is not None:
+            self.expr_decoder.train()
         grad_acc_steps = self.pretrain_cfg.grad_acc
         max_grad_norm = self.pretrain_cfg.max_grad_norm
 
@@ -599,18 +672,30 @@ class PreTrainRunner:
                 and step_idx % grad_acc_steps != 0
             )
 
+            no_sync_contexts = [self.model.no_sync()]
+            if self._use_mse() and isinstance(self.expr_decoder, DDP):
+                no_sync_contexts.append(self.expr_decoder.no_sync())
+
             if use_no_sync:
-                with self.model.no_sync():
-                    logits = self.model(masked_batch)
-                    loss = self.loss_fn(logits.transpose(1, 2), labels)
+                from contextlib import ExitStack
+                with ExitStack() as stack:
+                    for ctx in no_sync_contexts:
+                        stack.enter_context(ctx)
+                    loss_input, logits = self._forward_batch(masked_batch)
+                    loss = self._compute_loss(loss_input, labels)
                     (loss / grad_acc_steps).backward()
             else:
-                logits = self.model(masked_batch)
-                loss = self.loss_fn(logits.transpose(1, 2), labels)
+                loss_input, logits = self._forward_batch(masked_batch)
+                loss = self._compute_loss(loss_input, labels)
                 (loss / grad_acc_steps).backward()
 
             if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                all_params = (
+                    list(self.model.parameters()) + list(self.expr_decoder.parameters())
+                    if self._use_mse()
+                    else self.model.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -651,6 +736,8 @@ class PreTrainRunner:
             return None
 
         self.model.eval()
+        if self.expr_decoder is not None:
+            self.expr_decoder.eval()
         if self.is_distributed:
             dist.barrier()
 
@@ -663,8 +750,8 @@ class PreTrainRunner:
             for batch in self.val_loader:
                 batch = batch.to(self.device, non_blocking=True)
                 masked_batch, labels = self._mask_batch(batch)
-                logits = self.model(masked_batch)
-                loss = self.loss_fn(logits.transpose(1, 2), labels)
+                loss_input, logits = self._forward_batch(masked_batch)
+                loss = self._compute_loss(loss_input, labels)
 
                 running_loss += loss.item()
                 predictions.append(logits[..., : self.pad_token_id].argmax(dim=-1))
