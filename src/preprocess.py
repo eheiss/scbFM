@@ -111,9 +111,9 @@ def _quantile_bin_nonzero_values(values, *, bin_num: int, rng) -> "np.ndarray":
 
     # Match scGPT: token 0 is reserved for true zeros, and nonzero values are
     # quantile-binned into integer tokens 1..bin_num.
-    bins = np.quantile(values, np.linspace(0, 1, bin_num))
+    bins = np.quantile(values, np.linspace(0, 1, bin_num + 1)[1:-1])
     digits = _digitize(values, bins, rng)
-    return np.clip(digits, 1, bin_num).astype(np.uint8, copy=False)
+    return np.clip(digits + 1, 1, bin_num).astype(np.uint8, copy=False)
 
 
 def normalize_total_quantile_bin(
