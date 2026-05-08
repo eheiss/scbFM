@@ -240,26 +240,17 @@ def cox_partial_log_likelihood(
     return -((lh - log_cumsum_exp) * e).sum() / n_events
 
 
-def concordance_index(
+def antolini_concordance(
+    survival_probs: np.ndarray,
+    time_points: np.ndarray,
     time: np.ndarray,
-    log_hazard: np.ndarray,
     event: np.ndarray,
 ) -> float:
-    """Harrell's C-index. Higher log_hazard = higher risk = shorter expected survival."""
-    event = event.astype(bool)
-    event_idx = np.where(event)[0]
-    concordant = 0.0
-    discordant = 0.0
-    tied_risk = 0.0
-    for i in event_idx:
-        mask = time > time[i]
-        lh_j = log_hazard[mask]
-        lh_i = log_hazard[i]
-        concordant += float((lh_i > lh_j).sum())
-        discordant += float((lh_i < lh_j).sum())
-        tied_risk += 0.5 * float((lh_i == lh_j).sum())
-    total = concordant + discordant + tied_risk
-    return float((concordant + tied_risk) / total) if total > 0.0 else 0.5
+    """Antolini's time-dependent concordance (exact match with SurvBoard leaderboard)."""
+    from pycox.evaluation import EvalSurv
+    surv_df = pd.DataFrame(survival_probs.T, index=time_points.astype(float))
+    ev = EvalSurv(surv_df, time, event, censor_surv="km", steps="post")
+    return float(ev.concordance_td())
 
 
 class BreslowEstimator:
@@ -970,7 +961,7 @@ class SurvPredRunner:
         cancer: str,
         project: str,
         train_metrics: dict[str, float],
-        test_cindex: float,
+        test_antolini_cindex: float,
     ) -> dict[str, object]:
         return {
             "model": model_key,
@@ -981,7 +972,7 @@ class SurvPredRunner:
             "cancer": cancer,
             "project": project,
             "train_loss": float(train_metrics["loss"]),
-            "test_cindex": float(test_cindex),
+            "test_antolini_cindex": float(test_antolini_cindex),
         }
 
     def _write_model_results(
@@ -1116,14 +1107,25 @@ class SurvPredRunner:
                                 }
                             )
 
-                    # Predict on test set → C-index (scbFM-style output)
+                    # Predict on test set
                     test_lh = self._predict_log_hazard(self.test_loader, len(test_ix))
 
                     if self.is_master:
-                        test_cindex = concordance_index(test_times, test_lh, test_events)
+                        # Fit Breslow on train set (shared by Antolini C-index + SurvBoard output)
+                        train_lh = self._predict_log_hazard(
+                            self.train_infer_loader, len(train_ix)
+                        )
+                        breslow = BreslowEstimator()
+                        breslow.fit(train_lh, train_times, train_events)
+                        event_times = np.unique(train_times[train_events.astype(bool)])
+                        survival_probs = breslow.predict_survival(test_lh, event_times)
+
+                        test_antolini_cindex = antolini_concordance(
+                            survival_probs, event_times, test_times, test_events
+                        )
                         log.info(
-                            "Model %s | Split %d | Test C-index: %.4f",
-                            model_key, split_idx, test_cindex,
+                            "Model %s | Split %d | Test Antolini C-index: %.4f",
+                            model_key, split_idx, test_antolini_cindex,
                         )
                         fold_rows.append(
                             self._flatten_fold_metrics(
@@ -1134,18 +1136,11 @@ class SurvPredRunner:
                                 cancer=cancer,
                                 project=project,
                                 train_metrics=last_train_metrics,
-                                test_cindex=test_cindex,
+                                test_antolini_cindex=test_antolini_cindex,
                             )
                         )
 
-                        # Predict on train set → Breslow → SurvBoard-style output
-                        train_lh = self._predict_log_hazard(
-                            self.train_infer_loader, len(train_ix)
-                        )
-                        breslow = BreslowEstimator()
-                        breslow.fit(train_lh, train_times, train_events)
-                        event_times = np.unique(train_times[train_events.astype(bool)])
-                        survival_probs = breslow.predict_survival(test_lh, event_times)
+                        # SurvBoard-style output
                         self._save_survboard_predictions(
                             model_key, split_idx, survival_probs, event_times
                         )

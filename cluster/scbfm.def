@@ -24,7 +24,8 @@ From: pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
         h5py \
         pandas \
         einops \
-        requests
+        requests \
+        pycox
 
 %runscript
     exec "$@"
