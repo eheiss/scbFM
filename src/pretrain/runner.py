@@ -318,10 +318,13 @@ class PreTrainRunner:
             log.info("Loaded checkpoint from %s", checkpoint_path)
 
         if self.is_distributed:
+            # MSE mode never calls to_out inside the DDP forward (used only for
+            # no-grad accuracy stats), so those parameters appear unused to DDP.
+            find_unused = loss_type == "mse"
             if self.device.type == "cuda":
-                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank)
+                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=find_unused)
             else:
-                model = DDP(model)
+                model = DDP(model, find_unused_parameters=find_unused)
             if self.expr_decoder is not None:
                 if self.device.type == "cuda":
                     self.expr_decoder = DDP(self.expr_decoder, device_ids=[self.local_rank], output_device=self.local_rank)
