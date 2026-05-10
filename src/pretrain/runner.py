@@ -281,6 +281,7 @@ class PreTrainRunner:
             self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     def _build_model(self) -> None:
+        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
         model = PerformerLM(
             num_tokens=self.vocab_size,
             max_seq_len=self.pretrain_cfg.gene_num + 1,
@@ -303,9 +304,9 @@ class PreTrainRunner:
             g2v_position_emb=self.pretrain_cfg.g2v_position_emb,
             auto_check_redraw=self.pretrain_cfg.auto_check_redraw,
             qkv_bias=self.pretrain_cfg.qkv_bias,
+            embx_bin_num=int(self.pretrain_cfg.bin_num) if loss_type == "mse" else None,
         ).to(self.device)
 
-        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
         if loss_type == "mse":
             self.expr_decoder = ExprDecoder(dim=self.pretrain_cfg.dim).to(self.device)
 
@@ -375,21 +376,26 @@ class PreTrainRunner:
         return str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower() == "mse"
 
     def _forward_batch(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run model forward, returning (loss_input, logits).
+        """Run model forward, returning (loss_input, predictions).
 
-        CE mode: loss_input == logits (vocab logits, shape B×L×V).
-        MSE mode: loss_input = hidden states (B×L×dim); logits derived via to_out
-                  for accuracy stats without a second full forward pass.
+        CE mode: loss_input == logits (vocab logits, B×L×V); predictions = logits (argmax externally).
+        MSE mode: loss_input = hidden (B×L×dim); predictions = integer bin IDs from ExprDecoder.
         """
         if not self._use_mse():
             logits = self.model(batch)
             return logits, logits
 
         hidden = self.model(batch, return_encodings=True)
-        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
         with torch.no_grad():
-            logits = raw_model.to_out(hidden)
-        return hidden, logits
+            pred_int = (
+                raw_decoder(hidden)
+                .squeeze(-1)
+                .round()
+                .clamp(0, self.pretrain_cfg.bin_num)
+                .long()
+            )
+        return hidden, pred_int
 
     def _mask_batch(self, batch):
         return data_mask(
@@ -703,7 +709,10 @@ class PreTrainRunner:
                 self.optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                predictions = logits[..., : self.pad_token_id].argmax(dim=-1)
+                if self._use_mse():
+                    predictions = logits  # already integer bin IDs from ExprDecoder
+                else:
+                    predictions = logits[..., : self.pad_token_id].argmax(dim=-1)
                 self._update_mask_stats(mask_stats, labels, predictions)
 
             running_loss += loss.item()
@@ -757,7 +766,10 @@ class PreTrainRunner:
                 loss = self._compute_loss(loss_input, labels)
 
                 running_loss += loss.item()
-                predictions.append(logits[..., : self.pad_token_id].argmax(dim=-1))
+                if self._use_mse():
+                    predictions.append(logits)  # already integer bin IDs from ExprDecoder
+                else:
+                    predictions.append(logits[..., : self.pad_token_id].argmax(dim=-1))
                 truths.append(labels)
                 num_batches += 1
 

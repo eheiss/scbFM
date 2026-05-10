@@ -600,6 +600,7 @@ class DeconvRunner:
             g2v_position_emb=bool(self.model_cfg.g2v_position_emb),
             auto_check_redraw=bool(self.model_cfg.auto_check_redraw),
             qkv_bias=bool(self.model_cfg.qkv_bias),
+            embx_bin_num=int(self.model_cfg.bin_num) if str(getattr(self.model_cfg, "loss_type", "ce")).lower() == "mse" else None,
         )
 
         if checkpoint_path:

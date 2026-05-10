@@ -493,11 +493,20 @@ class PerformerLM(nn.Module):
         tie_embed = False,                  # False: output is num of tokens, True: output is dim of tokens  //multiply final embeddings with token weights for logits, like gpt decoder//
         g2v_position_emb = True,            # priority: gene2vec, no embedding
         auto_check_redraw = True,
-        qkv_bias = False
+        qkv_bias = False,
+        embx_bin_num = None,               # if set, use FC layer for expression tokens 0..embx_bin_num (scGPT-style)
     ):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.token_emb = nn.Embedding(num_tokens, dim)
+
+        # Continuous FC embedding for expression tokens (scGPT-style: preserves ordinal structure)
+        if embx_bin_num is not None:
+            self.embx = nn.Linear(1, dim, bias=True)
+            self.embx_bin_num = embx_bin_num
+        else:
+            self.embx = None
+            self.embx_bin_num = None
 
         if g2v_position_emb:
             self.pos_emb = Gene2VecPositionalEmbedding()
@@ -538,7 +547,15 @@ class PerformerLM(nn.Module):
         assert n <= self.max_seq_len, f'sequence length {n} must be less than the max sequence length {self.max_seq_len}'
 
         # token and positional embedding
-        x = self.token_emb(x)
+        if self.embx is not None:
+            # scGPT-style: expression tokens (0..embx_bin_num) use a continuous FC layer;
+            # special tokens (mask, EOS) use the discrete embedding.
+            expr_mask = x <= self.embx_bin_num  # (B, L)
+            expr_emb = self.embx(x.float().unsqueeze(-1))                       # (B, L, dim)
+            spec_emb = self.token_emb(x.clamp(min=self.embx_bin_num + 1))      # (B, L, dim)
+            x = torch.where(expr_mask.unsqueeze(-1), expr_emb, spec_emb)
+        else:
+            x = self.token_emb(x)
         if output_attentions:
             x.requires_grad_()    # used for attn_map output
         x += self.pos_emb(x)

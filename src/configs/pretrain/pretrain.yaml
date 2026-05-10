@@ -47,7 +47,7 @@ random_token_prob: 0.
 mask_ignore_token_ids: [0]
 
 # loss
-loss_type: mse  # "ce" (cross-entropy) or "mse" (ordinal MSE over bin soft-predictions)
+loss_type: mse  # "ce" (cross-entropy) or "mse" (ordinal MSE over bin soft-predictions; also enables scGPT-style embx)
 
 #optimizer
 learning_rate: 1e-4
