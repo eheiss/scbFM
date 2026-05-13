@@ -4,5 +4,6 @@ defaults:
   - finetune@finetune.canc_type_class: canc_type_class
   - finetune@finetune.canc_type_class_33: canc_type_class_33
   - finetune@finetune.deconv: deconv
+  - finetune@finetune.surv_pred: surv_pred
 
 task: pretrain
