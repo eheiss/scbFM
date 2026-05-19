@@ -6,6 +6,7 @@ from omegaconf import DictConfig
 from finetune.canc_type_class import CancTypeClassRunner
 from finetune.canc_type_class_33 import CancTypeClass33Runner
 from finetune.deconv import DeconvRunner
+from finetune.disease_class import DiseaseClassRunner
 from finetune.surv_pred import SurvPredRunner
 from pretrain import PreTrainRunner
 
@@ -24,11 +25,14 @@ def main(cfg: DictConfig):
         runner = DeconvRunner(cfg)
     elif task_name == "finetune.surv_pred":
         runner = SurvPredRunner(cfg)
+    elif task_name == "finetune.disease_class":
+        runner = DiseaseClassRunner(cfg)
     else:
         raise ValueError(
             f"Unsupported task '{task_name}'. "
             "Expected one of: ['pretrain', 'finetune.canc_type_class', "
-            "'finetune.canc_type_class_33', 'finetune.deconv', 'finetune.surv_pred']."
+            "'finetune.canc_type_class_33', 'finetune.deconv', 'finetune.surv_pred', "
+            "'finetune.disease_class']."
         )
     results = runner.run()
 
