@@ -6,5 +6,6 @@ defaults:
   - finetune@finetune.deconv: deconv
   - finetune@finetune.surv_pred: surv_pred
   - finetune@finetune.disease_class: disease_class
+  - finetune@finetune.gene_essent: gene_essent
 
 task: pretrain

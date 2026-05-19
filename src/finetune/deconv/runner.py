@@ -27,7 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.runner import GroupedCosineAnnealingWarmupRestarts
 from performer_pytorch import PerformerLM
-from preprocess import preprocess_adata_for_tokens, validate_token_matrix
+from preprocess import preprocess_adata_for_tokens, reindex_adata_genes, validate_token_matrix
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -468,7 +468,14 @@ class DeconvRunner:
                 adata.shape,
             )
         else:
-            adata.var_names_make_unique()
+            adata, missing_genes = reindex_adata_genes(
+                adata, gene_list_path=self._resolve_gene_list_path()
+            )
+            log.info(
+                "Reindexed preprocessed input to gene list: %d target genes missing, output shape %s",
+                len(missing_genes),
+                adata.shape,
+            )
         targets = self._load_targets(adata)
 
         expected_gene_num = int(self.model_cfg.gene_num)
