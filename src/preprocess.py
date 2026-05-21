@@ -116,29 +116,30 @@ def _quantile_bin_nonzero_values(values, *, bin_num: int, rng) -> "np.ndarray":
     return np.clip(digits + 1, 1, bin_num).astype(np.uint8, copy=False)
 
 
-def normalize_total_quantile_bin(
+def quantile_bin(
     adata: ad.AnnData,
-    target_sum: float,
     bin_num: int,
 ) -> ad.AnnData:
     import numpy as np
     from scipy import sparse
 
-    if target_sum <= 0:
-        raise ValueError("--target-sum must be positive.")
     if bin_num < 1:
         raise ValueError("--bin-num must be at least 1.")
+
+    if sparse.issparse(adata.X):
+        min_val = adata.X.data.min() if adata.X.nnz > 0 else 0.0
+    else:
+        min_val = np.asarray(adata.X).min()
+    if min_val < 0:
+        raise ValueError(
+            f"Expression matrix contains negative values (min={min_val:.4g}). "
+            "Input must be non-negative (raw counts, CPM, TPM, log1p, etc.)."
+        )
 
     rng = np.random.RandomState(0)
 
     if sparse.issparse(adata.X):
         x = adata.X.tocsr().astype(np.float32, copy=False)
-        libsize = np.asarray(x.sum(axis=1)).ravel().astype(np.float32, copy=False)
-        scale = np.zeros_like(libsize, dtype=np.float32)
-        nonzero = libsize > 0
-        scale[nonzero] = np.float32(target_sum) / libsize[nonzero]
-
-        x = x.multiply(scale[:, None]).tocsr()
         for row_idx in range(x.shape[0]):
             start = x.indptr[row_idx]
             end = x.indptr[row_idx + 1]
@@ -152,11 +153,6 @@ def normalize_total_quantile_bin(
         adata.X = x.astype(np.uint8, copy=False)
     else:
         x = np.asarray(adata.X, dtype=np.float32)
-        libsize = x.sum(axis=1, keepdims=True)
-        nonzero_rows = libsize[:, 0] > 0
-        libsize[~nonzero_rows] = 1.0
-        x = x / libsize * np.float32(target_sum)
-
         binned = np.zeros_like(x, dtype=np.uint8)
         for row_idx, row in enumerate(x):
             nonzero = row > 0
@@ -177,7 +173,6 @@ def preprocess_adata_for_tokens(
     *,
     gene_list_path: Path | None = DEFAULT_GENE_LIST_PATH,
     min_genes: int = 200,
-    target_sum: float = 1e4,
     bin_num: int = 10,
     reindex_genes: bool = True,
 ) -> tuple[ad.AnnData, list[str]]:
@@ -192,11 +187,7 @@ def preprocess_adata_for_tokens(
         adata.var_names_make_unique()
 
     adata = filter_min_genes(adata, min_genes=min_genes)
-    adata = normalize_total_quantile_bin(
-        adata,
-        target_sum=target_sum,
-        bin_num=bin_num,
-    )
+    adata = quantile_bin(adata, bin_num=bin_num)
     return adata, missing
 
 
@@ -241,7 +232,6 @@ def preprocess_raw_h5ad(
     output_path: Path,
     gene_list_path: Path | None,
     min_genes: int,
-    target_sum: float,
     bin_num: int,
     overwrite: bool,
 ) -> None:
@@ -268,11 +258,7 @@ def preprocess_raw_h5ad(
     adata = filter_min_genes(adata, min_genes=min_genes)
     print(f"Filtered samples by min_genes={min_genes}: {before_filter} -> {adata.n_obs}")
 
-    adata = normalize_total_quantile_bin(
-        adata,
-        target_sum=target_sum,
-        bin_num=bin_num,
-    )
+    adata = quantile_bin(adata, bin_num=bin_num)
 
     adata.uns["scbfm_preprocess"] = {
         "input_path": str(input_path),
@@ -281,7 +267,6 @@ def preprocess_raw_h5ad(
         "gene_list_path": str(gene_list_path) if gene_list_path is not None else None,
         "missing_genes": int(len(missing)),
         "min_genes": int(min_genes),
-        "target_sum": float(target_sum),
         "bin_num": int(bin_num),
         "binning_strategy": "scgpt_nonzero_quantile",
         "nonzero_bin_count": int(bin_num),

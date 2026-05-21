@@ -17,8 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Convert raw-count h5ad files into scbFM token input by applying "
-            "gene reindexing, min-gene filtering, total-count normalization, "
-            "and scGPT-style nonzero quantile binning."
+            "gene reindexing, min-gene filtering, and scGPT-style nonzero quantile binning."
         )
     )
     parser.add_argument("--input", required=True, type=Path, help="Raw input .h5ad file.")
@@ -35,7 +34,6 @@ def parse_args() -> argparse.Namespace:
         help="Keep the input gene order instead of reindexing to --gene-list.",
     )
     parser.add_argument("--min-genes", type=int, default=200)
-    parser.add_argument("--target-sum", type=float, default=1e4)
     parser.add_argument("--bin-num", type=int, default=10)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -48,7 +46,6 @@ def main() -> None:
         output_path=args.output,
         gene_list_path=None if args.skip_gene_reindex else args.gene_list,
         min_genes=args.min_genes,
-        target_sum=args.target_sum,
         bin_num=args.bin_num,
         overwrite=args.overwrite,
     )

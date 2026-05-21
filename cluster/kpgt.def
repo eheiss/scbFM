@@ -1,0 +1,62 @@
+Bootstrap: docker
+From: ubuntu:20.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y \
+        python3.8 python3.8-dev python3-pip \
+        libxrender1 libxext6 libgomp1 \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Make python3.8 the default python
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.8 1
+    python -m pip install --upgrade pip setuptools wheel
+
+    # PyTorch 1.11 CPU — no GPU needed for < 300 GDSC drug embeddings
+    pip install torch==1.11.0+cpu \
+        --extra-index-url https://download.pytorch.org/whl/cpu
+
+    # DGL 0.9.1 CPU — the cu113 wheel is no longer hosted (HTTP 403); CPU is
+    # sufficient because the job processes < 300 GDSC drugs and has no GPU request.
+    pip install dgl==0.9.1
+
+    # RDKit — official PyPI wheel (Python 3.8+, no conda needed)
+    pip install rdkit
+
+    # numpy C-API 0x10 (version 16) required by torch/dgl wheels; let pip
+    # resolve everything else to avoid version conflicts
+    pip install "numpy>=1.23,<1.25"
+
+    pip install \
+        dgllife \
+        pandas \
+        scipy \
+        scikit-learn \
+        networkx \
+        cloudpickle \
+        future \
+        hyperopt \
+        joblib \
+        pandas-flavor \
+        tqdm \
+        xarray
+
+    pip cache purge
+    find /usr -name "*.pyc" -delete 2>/dev/null || true
+
+%environment
+    export DGLBACKEND=pytorch
+
+%test
+    python -c "import torch; print('torch', torch.__version__)"
+    python -c "import dgl; print('dgl', dgl.__version__)"
+    python -c "from rdkit import Chem; print('rdkit ok')"
+    python -c "import dgllife; print('dgllife', dgllife.__version__)"
+    python -c "import numpy, pandas, scipy, sklearn, networkx; print('all deps ok')"
+
+%runscript
+    exec python "$@"
+
+%labels
+    Author eheiss
+    Description KPGT drug feature extraction (Python 3.8, PyTorch 1.11+cpu, DGL 0.9.1 cpu, RDKit)

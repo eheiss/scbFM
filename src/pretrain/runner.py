@@ -198,7 +198,6 @@ class PreTrainRunner:
                 adata,
                 gene_list_path=self._resolve_gene_list_path(),
                 min_genes=int(getattr(self.pretrain_cfg, "min_genes", 200)),
-                target_sum=float(getattr(self.pretrain_cfg, "target_sum", 1e4)),
                 bin_num=int(self.pretrain_cfg.bin_num),
                 reindex_genes=bool(getattr(self.pretrain_cfg, "reindex_genes", True)),
             )

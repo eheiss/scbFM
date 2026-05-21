@@ -295,7 +295,7 @@ class CancTypeClassRunner:
         seed_all(int(getattr(self.task_cfg, "random_seed", 42)) + self.rank)
 
     @staticmethod
-    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    def _write_csv(path: Path, rows: list[dict[str, object]], comment: str = "") -> None:
         if not rows:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +324,8 @@ class CancTypeClassRunner:
             }
         )
         with path.open("w", newline="") as handle:
+            if comment:
+                handle.write(f"# {comment}\n")
             writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *extra_fields])
             writer.writeheader()
             writer.writerows(rows)
@@ -364,7 +366,7 @@ class CancTypeClassRunner:
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
+                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
             },
@@ -461,7 +463,6 @@ class CancTypeClassRunner:
                 adata,
                 gene_list_path=gene_list_path,
                 min_genes=min_genes,
-                target_sum=float(getattr(self.task_cfg, "target_sum", 1e4)),
                 bin_num=int(self.model_cfg.bin_num),
                 reindex_genes=True,
             )
@@ -477,6 +478,11 @@ class CancTypeClassRunner:
                 len(missing_genes),
                 adata.shape,
             )
+
+        self._missing_genes_note = (
+            f"Model genes missing from TCGA GEX and filled with count 0: "
+            f"{len(missing_genes)} / {int(self.model_cfg.gene_num)}"
+        ) if missing_genes else ""
 
         expected_gene_num = int(self.model_cfg.gene_num)
         if adata.n_vars != expected_gene_num:
@@ -513,7 +519,7 @@ class CancTypeClassRunner:
         labels: np.ndarray,
         groups: np.ndarray | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
-        n_splits = int(getattr(self.task_cfg, "cv_folds", 10))
+        n_splits = int(getattr(self.task_cfg, "cv_folds", 5))
         if n_splits < 2:
             raise ValueError("finetune.canc_type_class.cv_folds must be at least 2.")
 
@@ -1069,7 +1075,7 @@ class CancTypeClassRunner:
         model_key = str(fold_rows[0]["model"])
         prefix = self._output_prefix()
         self._write_csv(out_dir / f"{prefix}_{model_key}_fold_metrics.csv", fold_rows)
-        self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate])
+        self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate], comment=getattr(self, "_missing_genes_note", ""))
         self._write_csv(out_dir / f"{prefix}_{model_key}_predictions.csv", prediction_rows)
         if confusion_matrices:
             self._write_confusion_matrix(
@@ -1186,7 +1192,7 @@ class CancTypeClassRunner:
             if self.is_master:
                 combined_dir = self._task_output_dir()
                 output_path = combined_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
-                self._write_csv(output_path, aggregate_rows)
+                self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
                 return {
                     "results_path": str(output_path),
                     "results": aggregate_rows,

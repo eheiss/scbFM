@@ -81,7 +81,7 @@ class CancTypeClass33Runner(CancTypeClassRunner):
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 10)),
+                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
             },

@@ -287,7 +287,7 @@ class DiseaseClassRunner:
         seed_all(int(getattr(self.task_cfg, "random_seed", 42)) + self.rank)
 
     @staticmethod
-    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    def _write_csv(path: Path, rows: list[dict[str, object]], comment: str = "") -> None:
         if not rows:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,6 +315,8 @@ class DiseaseClassRunner:
             }
         )
         with path.open("w", newline="") as handle:
+            if comment:
+                handle.write(f"# {comment}\n")
             writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *extra_fields])
             writer.writeheader()
             writer.writerows(rows)
@@ -421,6 +423,16 @@ class DiseaseClassRunner:
                 f"Available columns: {list(adata.obs.columns)}"
             )
 
+        binary_label_col = str(getattr(self.task_cfg, "binary_label_col", "binary_label"))
+        if binary_label_col not in adata.obs:
+            raise ValueError(
+                f"obs column '{binary_label_col}' not found in DiSignAtlas h5ad. "
+                f"Available columns: {list(adata.obs.columns)}"
+            )
+        n_before = adata.n_obs
+        adata = adata[adata.obs[binary_label_col] == "case"].copy()
+        log.info("Filtered to cases only: %d → %d samples", n_before, adata.n_obs)
+
         adata.obs["disease_label"] = adata.obs[disease_label_col].astype(str)
         adata.obs_names_make_unique()
         adata.var_names_make_unique()
@@ -438,12 +450,11 @@ class DiseaseClassRunner:
     def _preprocess_adata(self, adata: ad.AnnData) -> ad.AnnData:
         gene_list_path = self._resolve_gene_list_path()
         if self._should_preprocess_input():
-            min_genes = int(getattr(self.task_cfg, "min_genes", 0))
+            min_genes = int(getattr(self.task_cfg, "min_genes", 200))
             adata, missing_genes = preprocess_adata_for_tokens(
                 adata,
                 gene_list_path=gene_list_path,
                 min_genes=min_genes,
-                target_sum=float(getattr(self.task_cfg, "target_sum", 1e4)),
                 bin_num=int(self.model_cfg.bin_num),
                 reindex_genes=True,
             )
@@ -459,6 +470,11 @@ class DiseaseClassRunner:
                 len(missing_genes),
                 adata.shape,
             )
+
+        self._missing_genes_note = (
+            f"Model genes missing from DiSignAtlas and filled with count 0: "
+            f"{len(missing_genes)} / {int(self.model_cfg.gene_num)}"
+        ) if missing_genes else ""
 
         expected_gene_num = int(self.model_cfg.gene_num)
         if adata.n_vars != expected_gene_num:
@@ -1012,7 +1028,7 @@ class DiseaseClassRunner:
         model_key = str(fold_rows[0]["model"])
         prefix = self._output_prefix()
         self._write_csv(out_dir / f"{prefix}_{model_key}_fold_metrics.csv", fold_rows)
-        self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate])
+        self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate], comment=getattr(self, "_missing_genes_note", ""))
         self._write_csv(out_dir / f"{prefix}_{model_key}_predictions.csv", prediction_rows)
         if confusion_matrices:
             self._write_confusion_matrix(
@@ -1142,7 +1158,7 @@ class DiseaseClassRunner:
             if self.is_master:
                 combined_dir = self._task_output_dir()
                 output_path = combined_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
-                self._write_csv(output_path, aggregate_rows)
+                self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
                 return {
                     "results_path": str(output_path),
                     "results": aggregate_rows,

@@ -39,7 +39,6 @@ preprocess: true
 reindex_genes: true
 gene_list_path: ../data/gene_list.txt
 min_genes: 200
-target_sum: 1e4
 validation_split: 0.05
 mask_prob: 0.15
 replace_prob: 0.9

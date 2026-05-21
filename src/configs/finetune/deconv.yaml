@@ -8,7 +8,6 @@ preprocess: true
 reindex_genes: true
 gene_list_path: ../data/gene_list.txt
 min_genes: 200
-target_sum: 1e4
 
 finetune_mode: head_only
 burn_in_epochs: 3
@@ -19,7 +18,7 @@ adapter_after_attention: true
 adapter_after_ff: true
 loss: kl
 
-cv_folds: 10
+cv_folds: 5
 split_by_context: true
 context_columns: [dataset_id, donor_id, tissue_general]
 random_seed: 42
