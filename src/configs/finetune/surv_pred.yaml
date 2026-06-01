@@ -19,6 +19,8 @@ os_days_col: OS_days
 
 # Data preprocessing (preprocess=true quantile-bins the raw float values)
 gene_list_path: ../data/gene_list.txt
+# Maps HUGO symbols in SurvBoard gex columns to ENSG IDs used by the backbone
+gene_info_path: ../data/bulkformer_gene_info.csv
 preprocess: true
 min_genes: 200
 

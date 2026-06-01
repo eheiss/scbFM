@@ -85,15 +85,20 @@ class DrugRespModel(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, tokens: torch.Tensor, drug_emb: torch.Tensor) -> torch.Tensor:
-        # tokens:   (B, seq_len) int
-        # drug_emb: (B, drug_emb_dim) float
-        h = self.backbone(tokens)         # (B, seq_len, dim) — to_out is Identity
-        cell_emb = h.mean(dim=1)          # (B, dim)
+    def forward(self, tokens: torch.Tensor | None, drug_emb: torch.Tensor, cell_emb: torch.Tensor | None = None) -> torch.Tensor:
+        if cell_emb is None:
+            h = self.backbone(tokens)     # (1_or_B, seq_len, dim) — to_out is Identity
+            cell_emb = h.mean(dim=1)      # (1_or_B, dim)
+        # cell-centric: single cell embedding → expand to match all its drugs
+        if cell_emb.shape[0] == 1 and drug_emb.shape[0] > 1:
+            cell_emb = cell_emb.expand(drug_emb.shape[0], -1)
         return self.head(cell_emb, drug_emb)  # (B,)
 
     def adapter_parameters(self):
         return self.backbone.adapter_parameters()
+
+    def enable_grad_checkpoint(self):
+        self.backbone.enable_grad_checkpoint()
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +216,9 @@ class DrugRespDataset(Dataset):
     def __len__(self) -> int:
         return len(self.ic50_values)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        row = self.X_cell[self.cell_idxs[idx]]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cell_idx = int(self.cell_idxs[idx])
+        row = self.X_cell[cell_idx]
         if sparse.issparse(row):
             seq = row.toarray().ravel()
         else:
@@ -224,7 +230,7 @@ class DrugRespDataset(Dataset):
             self.drug_emb_matrix[self.drug_idxs[idx]], dtype=torch.float32
         )
         target = torch.as_tensor(self.ic50_values[idx], dtype=torch.float32)
-        return seq, drug_emb, target
+        return torch.tensor(cell_idx, dtype=torch.long), seq, drug_emb, target
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +256,18 @@ class DrugRespRunner:
         self.vocab_size = self.class_count + 1
         self.special_token_id = self.class_count
 
-        self.train_loader: DataLoader | None = None
         self.test_loader: DataLoader | None = None
         self.test_dataset_size: int = 0
+        self.cell_to_train_pairs: dict | None = None
+        self.train_drug_idxs: np.ndarray | None = None
+        self.train_ic50: np.ndarray | None = None
+        self.X_cell_ref: np.ndarray | None = None
+        self.drug_emb_matrix_ref: np.ndarray | None = None
         self.model: nn.Module | None = None
         self.optimizer: Adam | None = None
         self.scheduler = None
         self.backbone_optimizer_enabled = False
+        self.cell_emb_cache: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -596,43 +607,47 @@ class DrugRespRunner:
     # Data loaders
     # ------------------------------------------------------------------
 
-    def _build_loaders(
+    def _build_cell_centric_train(
         self,
         X_cell: np.ndarray,
         drug_emb_matrix: np.ndarray,
         cell_idxs_train: np.ndarray,
         drug_idxs_train: np.ndarray,
         ic50_train: np.ndarray,
+    ) -> None:
+        """Index training pairs by cell line for cell-centric training."""
+        from collections import defaultdict
+        mapping: dict[int, list[int]] = defaultdict(list)
+        for i, ci in enumerate(cell_idxs_train):
+            mapping[int(ci)].append(i)
+        self.cell_to_train_pairs = dict(mapping)
+        self.train_drug_idxs = drug_idxs_train
+        self.train_ic50 = ic50_train
+        self.X_cell_ref = X_cell
+        self.drug_emb_matrix_ref = drug_emb_matrix
+
+    def _build_test_loader(
+        self,
+        X_cell: np.ndarray,
+        drug_emb_matrix: np.ndarray,
         cell_idxs_test: np.ndarray,
         drug_idxs_test: np.ndarray,
         ic50_test: np.ndarray,
     ) -> None:
         batch_size = int(getattr(self.task_cfg, "batch_size", 32))
-        train_dataset = DrugRespDataset(
-            X_cell, drug_emb_matrix, cell_idxs_train, drug_idxs_train, ic50_train,
-            self.special_token_id,
-        )
         test_dataset = DrugRespDataset(
             X_cell, drug_emb_matrix, cell_idxs_test, drug_idxs_test, ic50_test,
             self.special_token_id,
         )
         self.test_dataset_size = len(test_dataset)
-
         if self.is_distributed:
-            train_sampler = DistributedSampler(
-                train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True,
-            )
             test_sampler = SequentialDistributedSampler(
                 test_dataset, batch_size=batch_size, world_size=self.world_size, rank=self.rank,
-            )
-            self.train_loader = DataLoader(
-                train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=False
             )
             self.test_loader = DataLoader(
                 test_dataset, batch_size=batch_size, sampler=test_sampler, shuffle=False
             )
         else:
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
             self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # ------------------------------------------------------------------
@@ -730,6 +745,9 @@ class DrugRespRunner:
                 int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
             )
 
+        if finetune_mode in ("adapters", "full_ft"):
+            model.enable_grad_checkpoint()
+
         model = model.to(self.device)
         if self.is_distributed:
             if self.device.type == "cuda":
@@ -800,6 +818,35 @@ class DrugRespRunner:
     def _optimizer_parameters(self) -> list[nn.Parameter]:
         return [p for g in self.optimizer.param_groups for p in g["params"]]
 
+    def _precompute_cell_embs(self, X_cell: np.ndarray) -> None:
+        """Precompute frozen backbone embeddings for all cell lines once per fold (head_only only)."""
+        raw = self.model.module if isinstance(self.model, DDP) else self.model
+        raw.backbone.eval()
+        n_cells = X_cell.shape[0]
+        infer_batch = int(getattr(self.task_cfg, "batch_size", 8)) * int(
+            getattr(self.task_cfg, "grad_accumulation_steps", 1)
+        )
+        infer_batch = max(1, infer_batch)
+        all_embs: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, n_cells, infer_batch):
+                rows = X_cell[start : start + infer_batch]
+                seqs = []
+                for i in range(rows.shape[0]):
+                    row = rows[i]
+                    if sparse.issparse(row):
+                        arr = row.toarray().ravel()
+                    else:
+                        arr = np.asarray(row).ravel()
+                    arr = np.append(arr, self.special_token_id)
+                    seqs.append(torch.as_tensor(arr, dtype=torch.long))
+                tokens = torch.stack(seqs).to(self.device)
+                h = raw.backbone(tokens)          # (b, seq_len, dim)
+                all_embs.append(h.mean(dim=1).cpu())
+        self.cell_emb_cache = torch.cat(all_embs, dim=0).to(self.device)  # (n_cells, dim)
+        if self.is_master:
+            log.info("Precomputed cell embeddings: shape %s", tuple(self.cell_emb_cache.shape))
+
     # ------------------------------------------------------------------
     # Training and evaluation
     # ------------------------------------------------------------------
@@ -807,41 +854,61 @@ class DrugRespRunner:
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_enable_backbone_optimizer(epoch)
         if self.is_distributed:
-            self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
         self.model.train()
         self.model.zero_grad(set_to_none=True)
 
-        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
+
+        # Deterministic per-epoch shuffle identical across all ranks
+        all_cell_idxs = list(self.cell_to_train_pairs.keys())
+        rng = np.random.default_rng(
+            int(getattr(self.task_cfg, "random_seed", 42)) + epoch * 7919
+        )
+        rng.shuffle(all_cell_idxs)
+
+        # Pad to a multiple of world_size so every rank gets the same step count
+        n_cells = len(all_cell_idxs)
+        n_per_rank = math.ceil(n_cells / self.world_size)
+        if n_cells < self.world_size * n_per_rank:
+            all_cell_idxs = all_cell_idxs + all_cell_idxs[: self.world_size * n_per_rank - n_cells]
+        rank_cells = all_cell_idxs[self.rank :: self.world_size]
+
         running_loss = 0.0
 
-        for step_idx, (tokens, drug_emb, targets) in enumerate(self.train_loader, start=1):
-            tokens = tokens.to(self.device, non_blocking=True)
-            drug_emb = drug_emb.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
+        for cell_idx in rank_cells:
+            pair_indices = np.array(self.cell_to_train_pairs[cell_idx])
 
-            use_no_sync = (
-                self.is_distributed
-                and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
-            )
-            sync_context = self.model.no_sync() if use_no_sync else nullcontext()
+            drug_embs_t = torch.as_tensor(
+                self.drug_emb_matrix_ref[self.train_drug_idxs[pair_indices]], dtype=torch.float32
+            ).to(self.device, non_blocking=True)
+            targets_t = torch.as_tensor(
+                self.train_ic50[pair_indices], dtype=torch.float32
+            ).to(self.device, non_blocking=True)
 
-            with sync_context:
-                preds = self.model(tokens, drug_emb)    # (B,)
-                loss = F.mse_loss(preds, targets)
-                (loss / grad_acc_steps).backward()
+            if self.cell_emb_cache is not None:
+                # head_only: frozen embedding cached once per fold, shape (1, dim)
+                cell_emb = self.cell_emb_cache[cell_idx].unsqueeze(0)
+                tokens_arg = None
+            else:
+                # adapters / full_ft: run backbone once for this cell
+                row = self.X_cell_ref[cell_idx]
+                arr = row.toarray().ravel() if sparse.issparse(row) else np.asarray(row).ravel()
+                arr = np.append(arr, self.special_token_id)
+                tokens_arg = torch.as_tensor(arr, dtype=torch.long).unsqueeze(0).to(self.device)
+                cell_emb = None
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
-                torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
-                self.optimizer.step()
-                self.model.zero_grad(set_to_none=True)
+            preds = self.model(tokens_arg, drug_embs_t, cell_emb)  # (n_pairs,)
+            loss = F.mse_loss(preds, targets_t)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
+            self.optimizer.step()
+            self.model.zero_grad(set_to_none=True)
 
             running_loss += loss.item()
 
-        epoch_loss = running_loss / len(self.train_loader)
+        epoch_loss = running_loss / len(rank_cells)
         if self.is_distributed:
             epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
         self.scheduler.step()
@@ -857,11 +924,14 @@ class DrugRespRunner:
             dist.barrier()
 
         with torch.no_grad():
-            for tokens, drug_emb, targets in self.test_loader:
-                tokens = tokens.to(self.device, non_blocking=True)
+            for cell_idxs_b, tokens, drug_emb, targets in self.test_loader:
                 drug_emb = drug_emb.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                preds = self.model(tokens, drug_emb)    # (B,)
+                if self.cell_emb_cache is not None:
+                    cell_emb = self.cell_emb_cache[cell_idxs_b.to(self.device)]
+                    preds = self.model(None, drug_emb, cell_emb)    # (B,)
+                else:
+                    preds = self.model(tokens.to(self.device, non_blocking=True), drug_emb)    # (B,)
                 loss = F.mse_loss(preds, targets)
                 running_loss += loss.item()
                 all_preds.append(preds)
@@ -988,11 +1058,16 @@ class DrugRespRunner:
         return aggregate
 
     def _cleanup_fold_state(self) -> None:
-        self.train_loader = None
         self.test_loader = None
+        self.cell_to_train_pairs = None
+        self.train_drug_idxs = None
+        self.train_ic50 = None
+        self.X_cell_ref = None
+        self.drug_emb_matrix_ref = None
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.cell_emb_cache = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1045,12 +1120,17 @@ class DrugRespRunner:
                             model_key, fold_idx, len(splits), len(train_idx), len(test_idx),
                         )
 
-                    self._build_loaders(
+                    self._build_cell_centric_train(
                         X_cell, drug_emb_matrix,
                         cell_idxs[train_idx], drug_idxs[train_idx], ic50_values[train_idx],
+                    )
+                    self._build_test_loader(
+                        X_cell, drug_emb_matrix,
                         cell_idxs[test_idx], drug_idxs[test_idx], ic50_values[test_idx],
                     )
                     self._build_model(checkpoint_path, drug_emb_dim)
+                    if self._finetune_mode() == "head_only":
+                        self._precompute_cell_embs(X_cell)
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan")}

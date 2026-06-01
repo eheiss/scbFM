@@ -548,10 +548,42 @@ class SurvPredRunner:
         if not gex_cols:
             raise ValueError(f"No 'gex_*' columns found in {data_path}.")
 
-        gene_ids = [c[len("gex_"):].split("|")[0].split(".")[0] for c in gex_cols]
-        X = df[gex_cols].values.astype(np.float32)
+        # SurvBoard TCGA columns are "gex_HUGO|ENTREZ_ID" (Entrez, not ENSG).
+        # Map HUGO symbols → ENSG IDs via bulkformer_gene_info.csv, then
+        # reindex_to_gene_list will align to gene_list.txt (ENSG).
+        gene_info_path_cfg = getattr(self.task_cfg, "gene_info_path", None)
+        if gene_info_path_cfg:
+            gene_info_path_abs = Path(hydra.utils.to_absolute_path(str(gene_info_path_cfg)))
+        else:
+            gene_info_path_abs = Path(__file__).resolve().parents[3] / "data" / "bulkformer_gene_info.csv"
+        gene_info = pd.read_csv(gene_info_path_abs)
+        sym2ensg = dict(zip(gene_info["gene_symbol"].astype(str), gene_info["ensg_id"].astype(str)))
+
+        # Extract HUGO symbols (part before "|") and map to ENSG
+        hugo_symbols = [c[len("gex_"):].split("|")[0] for c in gex_cols]
+        mapped_cols, mapped_ensg = [], []
+        seen_ensg: set[str] = set()
+        for col, sym in zip(gex_cols, hugo_symbols):
+            ensg = sym2ensg.get(sym)
+            if ensg and ensg not in seen_ensg:
+                mapped_cols.append(col)
+                mapped_ensg.append(ensg)
+                seen_ensg.add(ensg)
+
+        if not mapped_cols:
+            raise ValueError(
+                f"No SurvBoard GEX columns could be mapped to ENSG IDs via {gene_info_path_abs}. "
+                f"Sample columns: {gex_cols[:5]}"
+            )
+        if self.is_master:
+            log.info(
+                "SurvBoard GEX: %d gex columns → %d mapped to ENSG IDs (%d unmapped/duplicate)",
+                len(gex_cols), len(mapped_cols), len(gex_cols) - len(mapped_cols),
+            )
+
+        X = df[mapped_cols].values.astype(np.float32)
         adata = ad.AnnData(X=X)
-        adata.var_names = gene_ids
+        adata.var_names = mapped_ensg
 
         gene_list_path = self._resolve_gene_list_path()
         if bool(getattr(self.task_cfg, "preprocess", True)):
@@ -621,8 +653,8 @@ class SurvPredRunner:
             if not p.exists():
                 raise FileNotFoundError(f"SurvBoard split file not found: {p}")
 
-        train_df = pd.read_csv(train_path)
-        test_df = pd.read_csv(test_path)
+        train_df = pd.read_csv(train_path, header=None)
+        test_df = pd.read_csv(test_path, header=None)
 
         outer_splits = list(getattr(self.task_cfg, "outer_splits", list(range(len(train_df)))))
         train_splits, test_splits = [], []
@@ -787,6 +819,9 @@ class SurvPredRunner:
             self.backbone_optimizer_enabled = (
                 int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
             )
+
+        if finetune_mode in ("adapters", "full_ft"):
+            model.enable_grad_checkpoint()
 
         model = model.to(self.device)
         if self.is_distributed:
@@ -1114,14 +1149,13 @@ class SurvPredRunner:
                                 }
                             )
 
-                    # Predict on test set
+                    # Predict on test and train sets — all ranks must participate
+                    # because _predict_log_hazard uses distributed_concat (all_gather).
                     test_lh = self._predict_log_hazard(self.test_loader, len(test_ix))
+                    train_lh = self._predict_log_hazard(self.train_infer_loader, len(train_ix))
 
                     if self.is_master:
                         # Fit Breslow on train set (shared by Antolini C-index + SurvBoard output)
-                        train_lh = self._predict_log_hazard(
-                            self.train_infer_loader, len(train_ix)
-                        )
                         breslow = BreslowEstimator()
                         breslow.fit(train_lh, train_times, train_events)
                         event_times = np.unique(train_times[train_events.astype(bool)])

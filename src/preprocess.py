@@ -126,16 +126,6 @@ def quantile_bin(
     if bin_num < 1:
         raise ValueError("--bin-num must be at least 1.")
 
-    if sparse.issparse(adata.X):
-        min_val = adata.X.data.min() if adata.X.nnz > 0 else 0.0
-    else:
-        min_val = np.asarray(adata.X).min()
-    if min_val < 0:
-        raise ValueError(
-            f"Expression matrix contains negative values (min={min_val:.4g}). "
-            "Input must be non-negative (raw counts, CPM, TPM, log1p, etc.)."
-        )
-
     rng = np.random.RandomState(0)
 
     if sparse.issparse(adata.X):

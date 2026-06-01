@@ -2,6 +2,7 @@ import math
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint as _grad_ckpt
 from einops import rearrange, repeat
 
 from functools import partial
@@ -213,11 +214,12 @@ class Chunk(nn.Module):
         return torch.cat([self.fn(c, **kwargs) for c in chunks], dim = self.dim)
 
 class SequentialSequence(nn.Module):
-    def __init__(self, layers, args_route = {}):
+    def __init__(self, layers, args_route = {}, use_grad_checkpoint = False):
         super().__init__()
         assert all(len(route) == len(layers) for route in args_route.values()), 'each argument route map must have the same depth as the number of sequential layers'
         self.layers = layers
         self.args_route = args_route
+        self.use_grad_checkpoint = use_grad_checkpoint
 
     def forward(self, x, output_attentions = False, **kwargs):
         args = route_args(self.args_route, kwargs, len(self.layers))
@@ -238,9 +240,24 @@ class SequentialSequence(nn.Module):
                     x = attn_adapter(x)
                 attn_weights.append(layer_attn_weights.unsqueeze(0))
             else:
-                x = x + f(x, **f_args)
-                if exists(attn_adapter):
-                    x = attn_adapter(x)
+                if self.use_grad_checkpoint and torch.is_grad_enabled():
+                    # partial captures current f/g and f_args/g_args by value, avoiding
+                    # the closure-over-loop-variable bug that lambdas would introduce
+                    attn_fn = partial(f, **f_args)
+                    ff_fn = partial(g, **g_args)
+                    attn_out = _grad_ckpt(attn_fn, x, use_reentrant=False)
+                    x = x + attn_out
+                    if exists(attn_adapter):
+                        x = attn_adapter(x)
+                    x = x + _grad_ckpt(ff_fn, x, use_reentrant=False)
+                else:
+                    x = x + f(x, **f_args)
+                    if exists(attn_adapter):
+                        x = attn_adapter(x)
+                    x = x + g(x, **g_args)
+                if exists(ff_adapter):
+                    x = ff_adapter(x)
+                continue
 
             x = x + g(x, **g_args)
             if exists(ff_adapter):
@@ -541,6 +558,9 @@ class PerformerLM(nn.Module):
 
     def adapter_parameters(self):
         return self.performer.adapter_parameters()
+
+    def enable_grad_checkpoint(self):
+        self.performer.net.use_grad_checkpoint = True
 
     def forward(self, x, return_encodings = False, output_attentions = False, **kwargs):
         b, n, device = *x.shape, x.device

@@ -663,6 +663,9 @@ class DeconvRunner:
                 int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
             )
 
+        if finetune_mode in ("adapters", "full_ft"):
+            model.enable_grad_checkpoint()
+
         model = model.to(self.device)
         if self.is_distributed:
             if self.device.type == "cuda":

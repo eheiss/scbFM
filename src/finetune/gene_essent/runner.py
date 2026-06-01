@@ -695,6 +695,9 @@ class GeneEssentRunner:
                 int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
             )
 
+        if finetune_mode in ("adapters", "full_ft"):
+            model.enable_grad_checkpoint()
+
         model = model.to(self.device)
         if self.is_distributed:
             if self.device.type == "cuda":
@@ -791,6 +794,14 @@ class GeneEssentRunner:
     # Training and evaluation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _masked_mse(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """MSE over finite target values only — handles NaN CRISPR scores for unscreened entries."""
+        finite = torch.isfinite(targets)
+        if not finite.any():
+            return torch.zeros(1, device=preds.device, requires_grad=True).squeeze()
+        return F.mse_loss(preds[finite], targets[finite])
+
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_enable_backbone_optimizer(epoch)
         if self.is_distributed:
@@ -818,7 +829,7 @@ class GeneEssentRunner:
 
             with sync_context:
                 preds = self.model(data)                         # (B, gene_num)
-                loss = F.mse_loss(preds[:, valid_mask], targets[:, valid_mask])
+                loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
                 (loss / grad_acc_steps).backward()
 
             if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
@@ -849,7 +860,7 @@ class GeneEssentRunner:
                 data = data.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 preds = self.model(data)                          # (B, gene_num)
-                loss = F.mse_loss(preds[:, valid_mask], targets[:, valid_mask])
+                loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
                 running_loss += loss.item()
                 all_preds.append(preds[:, valid_mask])
                 all_targets.append(targets[:, valid_mask])

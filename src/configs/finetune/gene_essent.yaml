@@ -58,7 +58,7 @@ batch_size: 8
 grad_accumulation_steps: 2
 head_learning_rate: 1e-4
 backbone_learning_rate: 1e-6
-max_grad_norm: 1e6
+max_grad_norm: 1.0
 random_seed: 42
 
 # Scheduler
