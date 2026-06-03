@@ -7,7 +7,7 @@ resume_checkpoint: null
 epochs: 5
 batch_size: 4
 valid_every: 1
-grad_acc: 60
+grad_acc: 4
 max_grad_norm: 1e2
 
 # model

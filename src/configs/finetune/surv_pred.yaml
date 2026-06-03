@@ -62,8 +62,8 @@ head_dropout: 0.1
 
 # Training
 epochs: 30
-batch_size: 16
-grad_accumulation_steps: 1
+batch_size: 4
+grad_accumulation_steps: 4
 head_learning_rate: 1e-4
 backbone_learning_rate: 1e-6
 max_grad_norm: 1e6

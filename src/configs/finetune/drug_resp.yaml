@@ -62,7 +62,7 @@ head_dropout: 0.1
 cv_folds: 5
 epochs: 20
 batch_size: 8
-grad_accumulation_steps: 4
+grad_accumulation_steps: 2
 head_learning_rate: 1.0e-4
 backbone_learning_rate: 1.0e-6
 max_grad_norm: 1.0e6

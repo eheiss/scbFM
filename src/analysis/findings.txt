@@ -1,0 +1,18 @@
+Pre-training:
+
+
+Canc_class:
+Performance as good as in BulkRNABert, pre-training does not provide significant benefit in canc_class (5 and 33) - in BulkRNABert, they also do this comparsion but only with full finetuning, optimization loss may lead to their result of pre-training being beneficial. canc_class is just a too easy task
+
+Deconv:
+Random init performs best, overall performance is very similar across all models and not too good with JS-divergence of ~0.4 - pre-training again not beneficial
+
+Diesease_class:
+Performance as good as in BulkFormer, performance is very similar across all models, pre-training does not provide significant benefit, BulkFormer does no no-pre-training ablation
+
+Drug_resp:
+All models perform very similarly, pre-training does not provide significant benefit, performance (PCC: ~0.85) is close to BulkFormer (PCC: ~0.91) and scFMs (PCC: ~0.84-0.88)
+
+Gene_essent:
+
+Surv_pred:
