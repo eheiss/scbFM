@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
-import math
 import os
-from functools import reduce
 from pathlib import Path
 
 import anndata as ad
@@ -21,8 +19,12 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from performer_pytorch import PerformerLM
-from preprocess import preprocess_adata_for_tokens, validate_token_matrix
+from cancerfoundation_backbone import (
+    CancerFoundationBackbone,
+    ExpressionBinDecoder,
+    ExpressionClsDecoder,
+)
+from preprocess import read_gene_list
 from utils import (
     CosineAnnealingWarmupRestarts,
     SequentialDistributedSampler,
@@ -35,102 +37,185 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[3]
 
 
-def prob_mask_like(tensor, prob):
-    return torch.zeros_like(tensor).float().uniform_(0, 1) < prob
+def _digitize(x: np.ndarray, bins: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    left_digits = np.digitize(x, bins)
+    right_digits = np.digitize(x, bins, right=True)
+    random_offsets = rng.random(len(x))
+    digits = random_offsets * (right_digits - left_digits) + left_digits
+    return np.ceil(digits).astype(np.int64)
 
 
-def mask_with_tokens(tensor, token_ids):
-    init_no_mask = torch.full_like(tensor, False, dtype=torch.bool)
-    return reduce(lambda acc, token_id: acc | (tensor == token_id), token_ids, init_no_mask)
+def quantile_bin_expression(values: np.ndarray, bin_num: int, rng: np.random.Generator) -> np.ndarray:
+    if bin_num < 2:
+        raise ValueError("bin_num must be at least 2 because bin 0 is reserved for zero expression.")
+
+    values = np.asarray(values, dtype=np.float32)
+    binned = np.zeros(values.shape, dtype=np.int64)
+    nonzero = values > 0
+    if not nonzero.any():
+        return binned
+
+    nonzero_values = values[nonzero]
+    bins = np.quantile(nonzero_values, np.linspace(0, 1, bin_num - 1))
+    digits = _digitize(nonzero_values, bins, rng)
+    binned[nonzero] = np.clip(digits, 1, bin_num - 1)
+    return binned
 
 
-def get_mask_subset_with_prob(mask, prob):
-    batch, seq_len, device = *mask.shape, mask.device
-    max_masked = math.ceil(prob * seq_len)
-    num_tokens = mask.sum(dim=-1, keepdim=True)
-    mask_excess = torch.cat(
-        (torch.zeros(0), torch.arange(mask.size(-1)).repeat(mask.size(0)))
-    ).reshape(mask.size(0), mask.size(-1)).to(device)
-    mask_excess = mask_excess >= (num_tokens * prob).ceil()
-    mask_excess = mask_excess[:, :max_masked]
-    rand = torch.rand((batch, seq_len), device=device).masked_fill(~mask, -1e9)
-    _, sampled_indices = rand.topk(max_masked, dim=-1)
-    sampled_indices = (sampled_indices + 1).masked_fill_(mask_excess, 0)
-    new_mask = torch.zeros((batch, seq_len + 1), device=device)
-    new_mask.scatter_(-1, sampled_indices, 1)
-    return new_mask[:, 1:].bool()
+def hybrid_sample_gene_indices(
+    values: np.ndarray,
+    *,
+    selected_gene_count: int,
+    expressed_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if not 0.0 <= expressed_fraction <= 1.0:
+        raise ValueError("expressed_fraction must be between 0 and 1.")
 
+    expressed_cols = np.flatnonzero(values > 0)
+    zero_cols = np.flatnonzero(values == 0)
 
-def data_mask(
-    data,
-    mask_prob,
-    replace_prob,
-    num_tokens,
-    random_token_prob,
-    mask_token_id,
-    pad_token_id,
-    mask_ignore_token_ids,
-):
-    mask_ignore_token_ids = set([*mask_ignore_token_ids, pad_token_id])
-    no_mask = mask_with_tokens(data, mask_ignore_token_ids)
-    mask = get_mask_subset_with_prob(~no_mask, mask_prob)
-    masked_input = data.clone().detach()
+    requested_expressed = int(round(selected_gene_count * expressed_fraction))
+    requested_zero = selected_gene_count - requested_expressed
+    sampled_expressed = min(requested_expressed, expressed_cols.shape[0])
+    sampled_zero = min(requested_zero, zero_cols.shape[0])
 
-    if random_token_prob > 0:
-        random_token_mask = prob_mask_like(data, random_token_prob)
-        random_tokens = torch.randint(0, num_tokens, data.shape, device=data.device)
-        random_no_mask = mask_with_tokens(random_tokens, mask_ignore_token_ids)
-        random_token_mask &= ~random_no_mask
-        random_indices = torch.nonzero(random_token_mask, as_tuple=True)
-        masked_input[random_indices] = random_tokens[random_indices]
+    expressed_sample = (
+        rng.choice(expressed_cols, size=sampled_expressed, replace=False)
+        if sampled_expressed > 0
+        else np.empty(0, dtype=np.int64)
+    )
+    zero_sample = (
+        rng.choice(zero_cols, size=sampled_zero, replace=False)
+        if sampled_zero > 0
+        else np.empty(0, dtype=np.int64)
+    )
 
-    replace_mask = prob_mask_like(data, replace_prob)
-    masked_input = masked_input.masked_fill(mask & replace_mask, mask_token_id)
-    labels = data.masked_fill(~mask, pad_token_id)
-    return masked_input, labels
-
-
-class SCDataset(Dataset):
-    def __init__(self, data, bin_num, special_token_id, device):
-        super().__init__()
-        self.data = data
-        self.max_token_id = bin_num
-        self.special_token_id = special_token_id
-        self.device = device
-
-    def __getitem__(self, index):
-        row = self.data[index]
-        if sparse.issparse(row):
-            full_seq = row.toarray().ravel()
-        else:
-            full_seq = np.asarray(row).ravel()
-
-        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
-        full_seq = torch.cat((
-            full_seq,
-            torch.tensor([self.special_token_id], dtype=torch.long),
-        ))
-        return full_seq.to(self.device)
-
-    def __len__(self):
-        return self.data.shape[0]
-
-
-class ExprDecoder(nn.Module):
-    """Scalar regression head: hidden_dim → 1, matching scGPT's ExprDecoder MLP."""
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dim, dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dim, 1),
+    selected = np.concatenate((expressed_sample, zero_sample)).astype(np.int64, copy=False)
+    if selected.shape[0] < selected_gene_count:
+        selected_set = set(selected.tolist())
+        remaining = np.asarray(
+            [idx for idx in range(values.shape[0]) if idx not in selected_set],
+            dtype=np.int64,
         )
+        fill = rng.choice(
+            remaining,
+            size=selected_gene_count - selected.shape[0],
+            replace=False,
+        )
+        selected = np.concatenate((selected, fill)).astype(np.int64, copy=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x).squeeze(-1)  # (B, seq_len)
+    rng.shuffle(selected)
+    return selected
+
+
+class RawExpressionDataset(Dataset):
+    def __init__(
+        self,
+        *,
+        data_path: str,
+        indices: np.ndarray,
+        gene_num: int,
+        selected_gene_count: int,
+        bin_num: int,
+        hybrid_gene_sampling: bool,
+        expressed_gene_fraction: float,
+        seed: int,
+        cls_gene_id: int,
+        gene_token_offset: int,
+        cls_value: float,
+    ) -> None:
+        super().__init__()
+        self.data_path = data_path
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.gene_num = int(gene_num)
+        self.selected_gene_count = int(selected_gene_count)
+        self.bin_num = int(bin_num)
+        self.hybrid_gene_sampling = bool(hybrid_gene_sampling)
+        self.expressed_gene_fraction = float(expressed_gene_fraction)
+        self.seed = int(seed)
+        self.cls_gene_id = int(cls_gene_id)
+        self.gene_token_offset = int(gene_token_offset)
+        self.cls_value = float(cls_value)
+        self.epoch = 0
+        self._adata = None
+
+        if self.selected_gene_count <= 0:
+            raise ValueError("selected_gene_count must be positive.")
+        if self.selected_gene_count > self.gene_num:
+            raise ValueError(
+                f"Cannot sample {self.selected_gene_count} genes from only {self.gene_num} genes."
+            )
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_adata"] = None
+        return state
+
+    def __del__(self):
+        adata = getattr(self, "_adata", None)
+        if adata is not None:
+            file_obj = getattr(adata, "file", None)
+            if file_obj is not None:
+                file_obj.close()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _ensure_open(self):
+        if self._adata is None:
+            self._adata = ad.read_h5ad(self.data_path, backed="r")
+        return self._adata
+
+    def _read_row(self, source_index: int) -> np.ndarray:
+        adata = self._ensure_open()
+        row = adata.X[source_index]
+        if sparse.issparse(row):
+            return np.asarray(row.toarray()).ravel()
+        return np.asarray(row).ravel()
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        source_index = int(self.indices[index])
+        row = self._read_row(source_index)
+
+        # Deterministic per epoch/sample while still changing the selected gene
+        # subset across epochs.
+        rng_seed = self.seed + self.epoch * 1_000_003 + source_index
+        rng = np.random.default_rng(rng_seed)
+        if self.hybrid_gene_sampling:
+            selected_cols = hybrid_sample_gene_indices(
+                row,
+                selected_gene_count=self.selected_gene_count,
+                expressed_fraction=self.expressed_gene_fraction,
+                rng=rng,
+            )
+        else:
+            selected_cols = rng.choice(
+                self.gene_num,
+                size=self.selected_gene_count,
+                replace=False,
+            )
+
+        raw_values = row[selected_cols].astype(np.float32, copy=False)
+        binned_values = quantile_bin_expression(raw_values, self.bin_num, rng).astype(np.float32)
+        gene_ids = selected_cols.astype(np.int64, copy=False) + self.gene_token_offset
+
+        gene_ids = np.concatenate((
+            np.asarray([self.cls_gene_id], dtype=np.int64),
+            gene_ids,
+        ))
+        values = np.concatenate((
+            np.asarray([self.cls_value], dtype=np.float32),
+            binned_values,
+        ))
+
+        return {
+            "gene_ids": torch.from_numpy(gene_ids).long(),
+            "expr": torch.from_numpy(values).float(),
+        }
 
 
 class PreTrainRunner:
@@ -145,24 +230,39 @@ class PreTrainRunner:
         self.is_master = self.rank == 0
         self.device = torch.device("cpu")
 
-        self.class_count = self.pretrain_cfg.bin_num + 2
-        self.vocab_size = self.class_count + 1
-        self.pad_token_id = self.class_count - 1
-        self.mask_token_id = self.class_count - 1
-        self.special_token_id = self.class_count
-        self.mask_ignore_token_ids = list(dict.fromkeys([
-            *self.pretrain_cfg.mask_ignore_token_ids,
-            self.special_token_id,
-        ]))
+        self.bin_num = int(self.pretrain_cfg.bin_num)
+        self.value_bin_count = self.bin_num
+        self.cls_loss_weight = float(getattr(self.pretrain_cfg, "cls_loss_weight", 1.0))
+        self.gene_num = int(self.pretrain_cfg.gene_num)
+        self.selected_gene_count = int(getattr(self.pretrain_cfg, "selected_gene_count", 1199))
+        self.max_seq_len = int(getattr(self.pretrain_cfg, "max_seq_len", self.selected_gene_count + 1))
+        if self.max_seq_len != self.selected_gene_count + 1:
+            raise ValueError("max_seq_len must equal selected_gene_count + 1 for the <cls> token.")
 
+        self.cls_gene_id = 0
+        self.pad_gene_id = 1
+        self.gene_token_offset = 2
+        self.num_gene_tokens = self.gene_num + self.gene_token_offset
+        self.pad_value = float(getattr(self.pretrain_cfg, "pad_value", -2.0))
+        self.mask_value = float(getattr(self.pretrain_cfg, "mask_value", -1.0))
+        self.label_ignore_id = -100
+        self.mask_ignore_values = {
+            int(value) for value in getattr(self.pretrain_cfg, "mask_ignore_values", [])
+        }
+
+        self.train_dataset = None
+        self.val_dataset = None
         self.train_loader = None
         self.val_loader = None
         self.val_dataset_size = 0
         self.model = None
         self.expr_decoder = None
+        self.cls_decoder = None
         self.optimizer = None
         self.scheduler = None
         self.loss_fn = None
+        self.resume_checkpoint_data = None
+        self.loaded_optimizer_state = False
 
     def _setup_runtime(self) -> None:
         if self.is_distributed and not dist.is_initialized():
@@ -178,7 +278,7 @@ class PreTrainRunner:
         else:
             self.device = torch.device("cpu")
 
-        seed_all(self.pretrain_cfg.seed + self.rank)
+        seed_all(int(self.pretrain_cfg.seed) + self.rank)
 
     def _resolve_gene_list_path(self) -> Path:
         gene_list_path = getattr(self.pretrain_cfg, "gene_list_path", None)
@@ -186,227 +286,335 @@ class PreTrainRunner:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
         return ROOT / "data" / "gene_list.txt"
 
-    def _should_preprocess_input(self) -> bool:
-        return bool(getattr(self.pretrain_cfg, "preprocess", False))
-
-    def _load_data(self):
-        data_path = hydra.utils.to_absolute_path(self.pretrain_cfg.data_path)
-        log.info("Loading pretraining data from %s", data_path)
-        adata = ad.read_h5ad(data_path)
-        if self._should_preprocess_input():
-            adata, missing_genes = preprocess_adata_for_tokens(
-                adata,
-                gene_list_path=self._resolve_gene_list_path(),
-                min_genes=int(getattr(self.pretrain_cfg, "min_genes", 200)),
-                bin_num=int(self.pretrain_cfg.bin_num),
-                reindex_genes=bool(getattr(self.pretrain_cfg, "reindex_genes", True)),
-            )
-            log.info(
-                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
-                len(missing_genes),
-                adata.shape,
-            )
-
-        expected_gene_num = int(self.pretrain_cfg.gene_num)
-        if adata.n_vars != expected_gene_num:
+    def _load_data(self) -> tuple[np.ndarray, np.ndarray | None, str]:
+        if bool(getattr(self.pretrain_cfg, "preprocess", False)):
             raise ValueError(
-                f"Expected {expected_gene_num} genes for the scbFM backbone, got {adata.n_vars}."
+                "CancerFoundation pretraining expects the generated RAW h5ad files. "
+                "Set pretrain.preprocess=false."
             )
-        matrix = adata.X
-        validate_token_matrix(matrix, bin_num=int(self.pretrain_cfg.bin_num), name="pretraining data")
 
-        val_fraction = self.pretrain_cfg.validation_split
-        if matrix.shape[0] < 2 or val_fraction <= 0:
-            return matrix, None
+        data_path = hydra.utils.to_absolute_path(str(self.pretrain_cfg.data_path))
+        log.info("Loading pretraining metadata from %s", data_path)
+        backed = ad.read_h5ad(data_path, backed="r")
+        try:
+            n_obs, n_vars = map(int, backed.shape)
+            var_names = backed.var_names.astype(str).tolist()
+        finally:
+            backed.file.close()
 
-        return train_test_split(
-            matrix,
+        if n_vars != self.gene_num:
+            raise ValueError(
+                f"Expected {self.gene_num} genes for the scbFM CancerFoundation backbone, got {n_vars}."
+            )
+
+        gene_list = read_gene_list(self._resolve_gene_list_path())
+        if len(gene_list) != self.gene_num:
+            raise ValueError(
+                f"pretrain.gene_num={self.gene_num} but gene_list has {len(gene_list)} genes."
+            )
+        if var_names != gene_list:
+            first_mismatch = next(
+                (
+                    i
+                    for i, (observed, expected) in enumerate(zip(var_names, gene_list))
+                    if observed != expected
+                ),
+                None,
+            )
+            detail = (
+                f"first mismatch at position {first_mismatch}: "
+                f"observed={var_names[first_mismatch]!r}, expected={gene_list[first_mismatch]!r}"
+                if first_mismatch is not None
+                else "gene order mismatch"
+            )
+            raise ValueError(f"{data_path} is not aligned to gene_list.txt ({detail}).")
+
+        indices = np.arange(n_obs, dtype=np.int64)
+        val_fraction = float(self.pretrain_cfg.validation_split)
+        if n_obs < 2 or val_fraction <= 0:
+            return indices, None, data_path
+
+        train_idx, val_idx = train_test_split(
+            indices,
             test_size=val_fraction,
-            random_state=self.pretrain_cfg.seed,
+            random_state=int(self.pretrain_cfg.seed),
+        )
+        return (
+            np.asarray(train_idx, dtype=np.int64),
+            np.asarray(val_idx, dtype=np.int64),
+            data_path,
         )
 
-    def _build_loaders(self, train_data, val_data) -> None:
-        batch_size = self.pretrain_cfg.batch_size
-        train_dataset = SCDataset(
-            train_data,
-            self.pretrain_cfg.bin_num,
-            self.special_token_id,
-            self.device,
+    def _new_dataset(self, data_path: str, indices: np.ndarray) -> RawExpressionDataset:
+        return RawExpressionDataset(
+            data_path=data_path,
+            indices=indices,
+            gene_num=self.gene_num,
+            selected_gene_count=self.selected_gene_count,
+            bin_num=self.bin_num,
+            hybrid_gene_sampling=bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
+            expressed_gene_fraction=float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
+            seed=int(self.pretrain_cfg.seed) + self.rank,
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.pad_value,
         )
+
+    def _build_loaders(self, train_indices: np.ndarray, val_indices: np.ndarray | None, data_path: str) -> None:
+        batch_size = int(self.pretrain_cfg.batch_size)
+        self.train_dataset = self._new_dataset(data_path, train_indices)
 
         if self.is_distributed:
             train_sampler = DistributedSampler(
-                train_dataset,
+                self.train_dataset,
                 num_replicas=self.world_size,
                 rank=self.rank,
                 shuffle=True,
             )
             self.train_loader = DataLoader(
-                train_dataset,
+                self.train_dataset,
                 batch_size=batch_size,
                 sampler=train_sampler,
                 shuffle=False,
+                pin_memory=self.device.type == "cuda",
             )
         else:
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=self.device.type == "cuda",
+            )
 
-        if val_data is None:
+        if val_indices is None:
             self.val_loader = None
             self.val_dataset_size = 0
             return
 
-        val_dataset = SCDataset(
-            val_data,
-            self.pretrain_cfg.bin_num,
-            self.special_token_id,
-            self.device,
-        )
-        self.val_dataset_size = len(val_dataset)
+        self.val_dataset = self._new_dataset(data_path, val_indices)
+        self.val_dataset_size = len(self.val_dataset)
 
         if self.is_distributed:
             val_sampler = SequentialDistributedSampler(
-                val_dataset,
+                self.val_dataset,
                 batch_size=batch_size,
                 world_size=self.world_size,
                 rank=self.rank,
             )
             self.val_loader = DataLoader(
-                val_dataset,
+                self.val_dataset,
                 batch_size=batch_size,
                 sampler=val_sampler,
                 shuffle=False,
+                pin_memory=self.device.type == "cuda",
             )
         else:
-            self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            self.val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                pin_memory=self.device.type == "cuda",
+            )
 
     def _build_model(self) -> None:
-        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
-        model = PerformerLM(
-            num_tokens=self.vocab_size,
-            max_seq_len=self.pretrain_cfg.gene_num + 1,
-            dim=self.pretrain_cfg.dim,
-            depth=self.pretrain_cfg.depth,
-            heads=self.pretrain_cfg.heads,
-            dim_head=self.pretrain_cfg.dim_head,
-            ff_mult=self.pretrain_cfg.ff_mult,
-            nb_features=self.pretrain_cfg.nb_features,
-            feature_redraw_interval=self.pretrain_cfg.feature_redraw_interval,
-            ff_chunks=self.pretrain_cfg.ff_chunks,
-            ff_glu=self.pretrain_cfg.ff_glu,
-            emb_dropout=self.pretrain_cfg.emb_dropout,
-            ff_dropout=self.pretrain_cfg.ff_dropout,
-            attn_dropout=self.pretrain_cfg.attn_dropout,
-            use_scalenorm=self.pretrain_cfg.use_scalenorm,
-            use_rezero=self.pretrain_cfg.use_rezero,
-            no_projection=self.pretrain_cfg.no_projection,
-            tie_embed=self.pretrain_cfg.tie_embed,
-            g2v_position_emb=self.pretrain_cfg.g2v_position_emb,
-            auto_check_redraw=self.pretrain_cfg.auto_check_redraw,
-            qkv_bias=self.pretrain_cfg.qkv_bias,
-            embx_bin_num=int(self.pretrain_cfg.bin_num) if loss_type == "mse" else None,
+        model = CancerFoundationBackbone(
+            num_gene_tokens=self.num_gene_tokens,
+            d_model=int(self.pretrain_cfg.embsize),
+            nhead=int(self.pretrain_cfg.nheads),
+            d_hid=int(self.pretrain_cfg.d_hid),
+            nlayers=int(self.pretrain_cfg.nlayers),
+            dropout=float(self.pretrain_cfg.dropout),
+            pad_gene_id=self.pad_gene_id,
+            max_value=int(getattr(self.pretrain_cfg, "value_encoder_max_value", 512)),
+        ).to(self.device)
+        self.expr_decoder = ExpressionBinDecoder(
+            d_model=int(self.pretrain_cfg.embsize),
+        ).to(self.device)
+        self.cls_decoder = ExpressionClsDecoder(
+            d_model=int(self.pretrain_cfg.embsize),
         ).to(self.device)
 
-        if loss_type == "mse":
-            self.expr_decoder = ExprDecoder(dim=self.pretrain_cfg.dim).to(self.device)
-
         if self.pretrain_cfg.resume_checkpoint:
-            checkpoint_path = hydra.utils.to_absolute_path(self.pretrain_cfg.resume_checkpoint)
+            checkpoint_path = hydra.utils.to_absolute_path(str(self.pretrain_cfg.resume_checkpoint))
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.resume_checkpoint_data = checkpoint
             model.load_state_dict(checkpoint["model_state_dict"])
-            if "expr_decoder_state_dict" in checkpoint and self.expr_decoder is not None:
-                self.expr_decoder.load_state_dict(checkpoint["expr_decoder_state_dict"])
+            self.expr_decoder.load_state_dict(checkpoint["expr_decoder_state_dict"])
+            if "cls_decoder_state_dict" in checkpoint:
+                self.cls_decoder.load_state_dict(checkpoint["cls_decoder_state_dict"])
+            elif self.cls_loss_weight > 0:
+                log.warning(
+                    "Checkpoint %s has no cls_decoder_state_dict; initializing CLS decoder from scratch.",
+                    checkpoint_path,
+                )
             log.info("Loaded checkpoint from %s", checkpoint_path)
 
         if self.is_distributed:
-            # MSE mode never calls to_out inside the DDP forward (used only for
-            # no-grad accuracy stats), so those parameters appear unused to DDP.
-            find_unused = loss_type == "mse"
             if self.device.type == "cuda":
-                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=find_unused)
+                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank)
+                self.expr_decoder = DDP(
+                    self.expr_decoder,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                )
+                self.cls_decoder = DDP(
+                    self.cls_decoder,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                )
             else:
-                model = DDP(model, find_unused_parameters=find_unused)
-            if self.expr_decoder is not None:
-                if self.device.type == "cuda":
-                    self.expr_decoder = DDP(self.expr_decoder, device_ids=[self.local_rank], output_device=self.local_rank)
-                else:
-                    self.expr_decoder = DDP(self.expr_decoder)
+                model = DDP(model)
+                self.expr_decoder = DDP(self.expr_decoder)
+                self.cls_decoder = DDP(self.cls_decoder)
 
         self.model = model
 
-    def _compute_loss(self, hidden_or_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute masked MLM loss. CE receives logits; MSE receives hidden states."""
-        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
-        if loss_type == "ce":
-            return self.loss_fn(hidden_or_logits.transpose(1, 2), labels)
-
-        # MSE: scalar decoder head on hidden states, masked positions only (scGPT style).
-        pred = self.expr_decoder(hidden_or_logits)  # (B, seq_len)
-        valid = labels != self.pad_token_id
-        if not valid.any():
-            return pred.sum() * 0.0
-        mask = valid.float()
-        loss = nn.functional.mse_loss(pred * mask, labels.to(pred.dtype) * mask, reduction="sum")
-        return loss / mask.sum()
-
     def _build_optimization(self) -> None:
-        learning_rate = self.pretrain_cfg.learning_rate
-        loss_type = str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower()
-        if loss_type == "ce":
-            self.loss_fn = nn.CrossEntropyLoss(
-                ignore_index=self.pad_token_id,
-                reduction="mean",
-            ).to(self.device)
-            all_params = self.model.parameters()
-        else:
-            self.loss_fn = None
-            all_params = list(self.model.parameters()) + list(self.expr_decoder.parameters())
+        learning_rate = float(self.pretrain_cfg.learning_rate)
+        self.loss_fn = None
+        all_params = list(self.model.parameters()) + list(self.expr_decoder.parameters())
+        if self.cls_loss_weight > 0:
+            all_params += list(self.cls_decoder.parameters())
         self.optimizer = Adam(all_params, lr=learning_rate)
         self.scheduler = CosineAnnealingWarmupRestarts(
             self.optimizer,
-            first_cycle_steps=self.pretrain_cfg.first_cycle_steps,
-            cycle_mult=self.pretrain_cfg.cycle_mult,
+            first_cycle_steps=int(self.pretrain_cfg.first_cycle_steps),
+            cycle_mult=float(self.pretrain_cfg.cycle_mult),
             max_lr=learning_rate,
-            min_lr=self.pretrain_cfg.min_lr,
-            warmup_steps=self.pretrain_cfg.warmup_steps,
-            gamma=self.pretrain_cfg.gamma,
+            min_lr=float(self.pretrain_cfg.min_lr),
+            warmup_steps=int(self.pretrain_cfg.warmup_steps),
+            gamma=float(self.pretrain_cfg.gamma),
         )
+        if (
+            self.resume_checkpoint_data is not None
+            and bool(getattr(self.pretrain_cfg, "resume_optimizer_state", True))
+        ):
+            checkpoint = self.resume_checkpoint_data
+            missing_keys = [
+                key
+                for key in ("optimizer_state_dict", "scheduler_state_dict")
+                if key not in checkpoint
+            ]
+            if missing_keys:
+                log.warning(
+                    "Checkpoint has no %s; starting optimizer/scheduler from config.",
+                    ", ".join(missing_keys),
+                )
+                return
 
-    def _use_mse(self) -> bool:
-        return str(getattr(self.pretrain_cfg, "loss_type", "mse")).lower() == "mse"
-
-    def _forward_batch(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run model forward, returning (loss_input, predictions).
-
-        CE mode: loss_input == logits (vocab logits, B×L×V); predictions = logits (argmax externally).
-        MSE mode: loss_input = hidden (B×L×dim); predictions = integer bin IDs from ExprDecoder.
-        """
-        if not self._use_mse():
-            logits = self.model(batch)
-            return logits, logits
-
-        hidden = self.model(batch, return_encodings=True)
-        raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
-        with torch.no_grad():
-            pred_int = (
-                raw_decoder(hidden)
-                .squeeze(-1)
-                .round()
-                .clamp(0, self.pretrain_cfg.bin_num)
-                .long()
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.loaded_optimizer_state = True
+            log.info(
+                "Loaded optimizer and scheduler state from checkpoint; current learning rates: %s",
+                ", ".join(f"{lr:.6g}" for lr in self._current_learning_rates()),
             )
-        return hidden, pred_int
 
-    def _mask_batch(self, batch):
-        return data_mask(
-            batch,
-            mask_prob=self.pretrain_cfg.mask_prob,
-            replace_prob=self.pretrain_cfg.replace_prob,
-            num_tokens=self.vocab_size,
-            random_token_prob=self.pretrain_cfg.random_token_prob,
-            mask_token_id=self.mask_token_id,
-            pad_token_id=self.pad_token_id,
-            mask_ignore_token_ids=self.mask_ignore_token_ids,
+    def _current_learning_rates(self) -> list[float]:
+        if self.optimizer is None:
+            return []
+        return [float(group["lr"]) for group in self.optimizer.param_groups]
+
+    def _mask_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        gene_ids = batch["gene_ids"].to(self.device, non_blocking=True)
+        expr = batch["expr"].to(self.device, non_blocking=True)
+
+        probability = torch.full_like(expr, float(self.pretrain_cfg.mask_prob))
+        probability[:, 0] = 0.0  # never mask <cls>
+        probability[gene_ids.eq(self.pad_gene_id)] = 0.0
+        for value in self.mask_ignore_values:
+            probability[expr.eq(float(value))] = 0.0
+
+        mask = torch.bernoulli(probability).bool()
+        labels = torch.full(
+            expr.shape,
+            self.label_ignore_id,
+            dtype=torch.float,
+            device=self.device,
         )
+        labels[mask] = expr[mask]
+
+        masked_expr = expr.clone()
+        masked_expr[mask] = self.mask_value
+        padding_mask = gene_ids.eq(self.pad_gene_id)
+        attention_key_padding_mask = padding_mask.clone()
+        if bool(getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)):
+            # Masked genes are not usable context: visible tokens cannot attend
+            # to them, while masked query positions can still attend to visible keys.
+            attention_key_padding_mask |= mask
+        return gene_ids, masked_expr, labels, attention_key_padding_mask
+
+    def _forward_batch(
+        self,
+        gene_ids: torch.Tensor,
+        masked_expr: torch.Tensor,
+        attention_key_padding_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        model_output = self.model(
+            gene_ids,
+            masked_expr,
+            src_key_padding_mask=attention_key_padding_mask,
+            return_gene_embeddings=self.cls_loss_weight > 0,
+        )
+        if self.cls_loss_weight > 0:
+            hidden, gene_embeddings = model_output
+        else:
+            hidden = model_output
+            gene_embeddings = None
+
+        predicted_values = self.expr_decoder(hidden)
+        cls_predicted_values = None
+        if self.cls_loss_weight > 0:
+            cls_predicted_values = self.cls_decoder(hidden[:, 0, :], gene_embeddings)
+
+        predictions = predicted_values.round().clamp(0, self.value_bin_count - 1).long()
+        return predicted_values, cls_predicted_values, predictions
+
+    def _compute_losses(
+        self,
+        predicted_values: torch.Tensor,
+        cls_predicted_values: torch.Tensor | None,
+        labels: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        masked_positions = labels != float(self.label_ignore_id)
+        if not masked_positions.any():
+            zero_loss = predicted_values.sum() * 0.0
+            if cls_predicted_values is not None:
+                zero_loss = zero_loss + cls_predicted_values.sum() * 0.0
+            return {
+                "total": zero_loss,
+                "gene": zero_loss,
+                "cls": zero_loss,
+            }
+        mask = masked_positions.float()
+        gene_loss = nn.functional.mse_loss(
+            predicted_values * mask,
+            labels * mask,
+            reduction="sum",
+        )
+        gene_loss = gene_loss / mask.sum()
+
+        if self.cls_loss_weight > 0:
+            if cls_predicted_values is None:
+                raise RuntimeError("CLS loss is enabled but CLS predictions were not computed.")
+            cls_loss = nn.functional.mse_loss(
+                cls_predicted_values * mask,
+                labels * mask,
+                reduction="sum",
+            )
+            cls_loss = cls_loss / mask.sum()
+        else:
+            cls_loss = gene_loss.detach() * 0.0
+
+        total_loss = gene_loss + self.cls_loss_weight * cls_loss
+        return {
+            "total": total_loss,
+            "gene": gene_loss,
+            "cls": cls_loss,
+        }
 
     def _output_dir(self) -> Path:
         return ROOT / "output" / self._model_name()
@@ -451,20 +659,19 @@ class PreTrainRunner:
             writer.writerows(rows)
 
     def _new_mask_stats(self) -> dict[str, torch.Tensor]:
-        expression_token_count = self.pad_token_id
         return {
             "target_counts": torch.zeros(
-                expression_token_count,
+                self.value_bin_count,
                 dtype=torch.float64,
                 device=self.device,
             ),
             "predicted_counts": torch.zeros(
-                expression_token_count,
+                self.value_bin_count,
                 dtype=torch.float64,
                 device=self.device,
             ),
             "correct_counts": torch.zeros(
-                expression_token_count,
+                self.value_bin_count,
                 dtype=torch.float64,
                 device=self.device,
             ),
@@ -477,8 +684,8 @@ class PreTrainRunner:
         labels: torch.Tensor,
         predictions: torch.Tensor,
     ) -> None:
-        valid_mask = labels != self.pad_token_id
-        valid_labels = labels[valid_mask]
+        valid_mask = labels != self.label_ignore_id
+        valid_labels = labels[valid_mask].long()
         valid_predictions = predictions[valid_mask]
 
         stats["sample_count"] += labels.shape[0]
@@ -487,18 +694,18 @@ class PreTrainRunner:
 
         stats["target_counts"] += torch.bincount(
             valid_labels,
-            minlength=self.pad_token_id,
-        )[: self.pad_token_id].to(torch.float64)
+            minlength=self.value_bin_count,
+        )[: self.value_bin_count].to(torch.float64)
         stats["predicted_counts"] += torch.bincount(
             valid_predictions,
-            minlength=self.pad_token_id,
-        )[: self.pad_token_id].to(torch.float64)
+            minlength=self.value_bin_count,
+        )[: self.value_bin_count].to(torch.float64)
         correct_labels = valid_labels[valid_predictions == valid_labels]
         if correct_labels.numel() > 0:
             stats["correct_counts"] += torch.bincount(
                 correct_labels,
-                minlength=self.pad_token_id,
-            )[: self.pad_token_id].to(torch.float64)
+                minlength=self.value_bin_count,
+            )[: self.value_bin_count].to(torch.float64)
 
     def _reduce_mask_stats(self, stats: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if not self.is_distributed:
@@ -566,7 +773,6 @@ class PreTrainRunner:
             target_entropy = float(-np.sum(nonzero_distribution * np.log(nonzero_distribution)))
         else:
             majority_token_id = -1
-            majority_count = 0.0
             majority_fraction = float("nan")
             target_entropy = float("nan")
 
@@ -593,14 +799,22 @@ class PreTrainRunner:
             "majority_baseline_accuracy": 100.0 * majority_fraction,
             "target_entropy": target_entropy,
             "mask_prob": float(self.pretrain_cfg.mask_prob),
-            "replace_prob": float(self.pretrain_cfg.replace_prob),
-            "random_token_prob": float(self.pretrain_cfg.random_token_prob),
-            "mask_ignore_token_ids": ";".join(map(str, self.mask_ignore_token_ids)),
+            "mask_ignore_values": ";".join(map(str, sorted(self.mask_ignore_values))),
+            "exclude_masked_from_attention": bool(
+                getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)
+            ),
+            "selected_gene_count": self.selected_gene_count,
+            "hybrid_gene_sampling": bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
+            "expressed_gene_fraction": float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
+            "bin_num": self.bin_num,
+            "loss_type": "mse",
+            "cls_loss_weight": self.cls_loss_weight,
+            "loaded_optimizer_state": self.loaded_optimizer_state,
+            "learning_rates": ";".join(f"{lr:.6g}" for lr in self._current_learning_rates()),
         }
 
         bin_rows = []
-        ignored_token_ids = set(self.mask_ignore_token_ids)
-        for token_id in range(self.pad_token_id):
+        for token_id in range(self.value_bin_count):
             target_count = float(target_counts[token_id])
             bin_rows.append(
                 {
@@ -614,7 +828,7 @@ class PreTrainRunner:
                     "precision": float(precision[token_id]),
                     "recall": float(recall[token_id]),
                     "f1": float(f1[token_id]),
-                    "ignored_for_masking": int(token_id in ignored_token_ids),
+                    "ignored_for_masking": int(token_id in self.mask_ignore_values),
                 }
             )
         return summary_row, bin_rows
@@ -641,38 +855,49 @@ class PreTrainRunner:
         checkpoint_path = output_dir / f"{model_name}.pth"
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
+        raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
+        raw_cls_decoder = self.cls_decoder.module if isinstance(self.cls_decoder, DDP) else self.cls_decoder
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
+            "expr_decoder_state_dict": raw_decoder.state_dict(),
+            "cls_decoder_state_dict": raw_cls_decoder.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "losses": train_loss,
+            "backbone": "cancerfoundation",
+            "gene_num": self.gene_num,
+            "selected_gene_count": self.selected_gene_count,
+            "max_seq_len": self.max_seq_len,
+            "bin_num": self.bin_num,
+            "cls_loss_weight": self.cls_loss_weight,
+            "loaded_optimizer_state": self.loaded_optimizer_state,
         }
-        if self.expr_decoder is not None:
-            raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
-            checkpoint["expr_decoder_state_dict"] = raw_decoder.state_dict()
         torch.save(checkpoint, checkpoint_path)
         return checkpoint_path
 
     def _train_one_epoch(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]]:
+        if self.train_dataset is not None:
+            self.train_dataset.set_epoch(epoch)
         if self.is_distributed:
             self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
         self.model.train()
-        if self.expr_decoder is not None:
-            self.expr_decoder.train()
-        grad_acc_steps = self.pretrain_cfg.grad_acc
-        max_grad_norm = self.pretrain_cfg.max_grad_norm
+        self.expr_decoder.train()
+        self.cls_decoder.train()
+        grad_acc_steps = int(self.pretrain_cfg.grad_acc)
+        max_grad_norm = float(self.pretrain_cfg.max_grad_norm)
 
         running_loss = 0.0
+        running_gene_loss = 0.0
+        running_cls_loss = 0.0
         num_batches = 0
         mask_stats = self._new_mask_stats()
         self.optimizer.zero_grad(set_to_none=True)
 
         for step_idx, batch in enumerate(self.train_loader, start=1):
-            batch = batch.to(self.device, non_blocking=True)
-            masked_batch, labels = self._mask_batch(batch)
+            gene_ids, masked_expr, labels, attention_key_padding_mask = self._mask_batch(batch)
 
             use_no_sync = (
                 self.is_distributed
@@ -680,47 +905,56 @@ class PreTrainRunner:
                 and step_idx % grad_acc_steps != 0
             )
 
-            no_sync_contexts = [self.model.no_sync()]
-            if self._use_mse() and isinstance(self.expr_decoder, DDP):
-                no_sync_contexts.append(self.expr_decoder.no_sync())
-
             if use_no_sync:
                 from contextlib import ExitStack
                 with ExitStack() as stack:
-                    for ctx in no_sync_contexts:
-                        stack.enter_context(ctx)
-                    loss_input, logits = self._forward_batch(masked_batch)
-                    loss = self._compute_loss(loss_input, labels)
+                    stack.enter_context(self.model.no_sync())
+                    if isinstance(self.expr_decoder, DDP):
+                        stack.enter_context(self.expr_decoder.no_sync())
+                    if isinstance(self.cls_decoder, DDP):
+                        stack.enter_context(self.cls_decoder.no_sync())
+                    predicted_values, cls_predicted_values, predictions = self._forward_batch(
+                        gene_ids,
+                        masked_expr,
+                        attention_key_padding_mask,
+                    )
+                    loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
+                    loss = loss_dict["total"]
                     (loss / grad_acc_steps).backward()
             else:
-                loss_input, logits = self._forward_batch(masked_batch)
-                loss = self._compute_loss(loss_input, labels)
+                predicted_values, cls_predicted_values, predictions = self._forward_batch(
+                    gene_ids,
+                    masked_expr,
+                    attention_key_padding_mask,
+                )
+                loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
+                loss = loss_dict["total"]
                 (loss / grad_acc_steps).backward()
 
             if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
-                all_params = (
-                    list(self.model.parameters()) + list(self.expr_decoder.parameters())
-                    if self._use_mse()
-                    else self.model.parameters()
-                )
+                all_params = list(self.model.parameters()) + list(self.expr_decoder.parameters())
+                if self.cls_loss_weight > 0:
+                    all_params += list(self.cls_decoder.parameters())
                 torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                if self._use_mse():
-                    predictions = logits  # already integer bin IDs from ExprDecoder
-                else:
-                    predictions = logits[..., : self.pad_token_id].argmax(dim=-1)
                 self._update_mask_stats(mask_stats, labels, predictions)
 
             running_loss += loss.item()
+            running_gene_loss += loss_dict["gene"].item()
+            running_cls_loss += loss_dict["cls"].item()
             num_batches += 1
 
         epoch_loss = running_loss / max(num_batches, 1)
+        epoch_gene_loss = running_gene_loss / max(num_batches, 1)
+        epoch_cls_loss = running_cls_loss / max(num_batches, 1)
 
         if self.is_distributed:
             epoch_loss = get_reduced(epoch_loss, self.device, 0, self.world_size)
+            epoch_gene_loss = get_reduced(epoch_gene_loss, self.device, 0, self.world_size)
+            epoch_cls_loss = get_reduced(epoch_cls_loss, self.device, 0, self.world_size)
 
         self.scheduler.step()
         summary_row, bin_rows = self._format_mask_stats(
@@ -729,9 +963,13 @@ class PreTrainRunner:
             loss=epoch_loss,
             stats=mask_stats,
         )
+        summary_row["gene_loss"] = epoch_gene_loss
+        summary_row["cls_loss"] = epoch_cls_loss
         return (
             {
                 "train_loss": epoch_loss,
+                "train_gene_loss": epoch_gene_loss,
+                "train_cls_loss": epoch_cls_loss,
                 "train_accuracy": summary_row["accuracy"],
                 "train_masked_token_count": summary_row["masked_token_count"],
                 "train_nonzero_accuracy": summary_row["nonzero_accuracy"],
@@ -745,36 +983,45 @@ class PreTrainRunner:
     def _validate(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]] | None:
         if self.val_loader is None:
             return None
+        if self.val_dataset is not None:
+            self.val_dataset.set_epoch(0)
 
         self.model.eval()
-        if self.expr_decoder is not None:
-            self.expr_decoder.eval()
+        self.expr_decoder.eval()
+        self.cls_decoder.eval()
         if self.is_distributed:
             dist.barrier()
 
         running_loss = 0.0
+        running_gene_loss = 0.0
+        running_cls_loss = 0.0
         predictions = []
         truths = []
         num_batches = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
-                batch = batch.to(self.device, non_blocking=True)
-                masked_batch, labels = self._mask_batch(batch)
-                loss_input, logits = self._forward_batch(masked_batch)
-                loss = self._compute_loss(loss_input, labels)
+                gene_ids, masked_expr, labels, attention_key_padding_mask = self._mask_batch(batch)
+                predicted_values, cls_predicted_values, prediction = self._forward_batch(
+                    gene_ids,
+                    masked_expr,
+                    attention_key_padding_mask,
+                )
+                loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
+                loss = loss_dict["total"]
 
                 running_loss += loss.item()
-                if self._use_mse():
-                    predictions.append(logits)  # already integer bin IDs from ExprDecoder
-                else:
-                    predictions.append(logits[..., : self.pad_token_id].argmax(dim=-1))
+                running_gene_loss += loss_dict["gene"].item()
+                running_cls_loss += loss_dict["cls"].item()
+                predictions.append(prediction)
                 truths.append(labels)
                 num_batches += 1
 
         prediction_tensor = torch.cat(predictions, dim=0)
         truth_tensor = torch.cat(truths, dim=0)
         val_loss = running_loss / max(num_batches, 1)
+        val_gene_loss = running_gene_loss / max(num_batches, 1)
+        val_cls_loss = running_cls_loss / max(num_batches, 1)
 
         if self.is_distributed:
             prediction_tensor = distributed_concat(
@@ -788,6 +1035,8 @@ class PreTrainRunner:
                 self.world_size,
             )
             val_loss = get_reduced(val_loss, self.device, 0, self.world_size)
+            val_gene_loss = get_reduced(val_gene_loss, self.device, 0, self.world_size)
+            val_cls_loss = get_reduced(val_cls_loss, self.device, 0, self.world_size)
 
         mask_stats = self._new_mask_stats()
         self._update_mask_stats(mask_stats, truth_tensor, prediction_tensor)
@@ -798,9 +1047,13 @@ class PreTrainRunner:
             stats=mask_stats,
             reduce_stats=False,
         )
+        summary_row["gene_loss"] = val_gene_loss
+        summary_row["cls_loss"] = val_cls_loss
         return (
             {
                 "val_loss": val_loss,
+                "val_gene_loss": val_gene_loss,
+                "val_cls_loss": val_cls_loss,
                 "val_accuracy": summary_row["accuracy"],
                 "val_masked_token_count": summary_row["masked_token_count"],
                 "val_nonzero_accuracy": summary_row["nonzero_accuracy"],
@@ -813,13 +1066,13 @@ class PreTrainRunner:
 
     def run(self) -> dict:
         self._setup_runtime()
-        train_data, val_data = self._load_data()
-        self._build_loaders(train_data, val_data)
+        train_indices, val_indices, data_path = self._load_data()
+        self._build_loaders(train_indices, val_indices, data_path)
         self._build_model()
         self._build_optimization()
 
-        epochs = self.pretrain_cfg.epochs
-        validate_every = self.pretrain_cfg.valid_every
+        epochs = int(self.pretrain_cfg.epochs)
+        validate_every = int(self.pretrain_cfg.valid_every)
         history = []
         epoch_metric_rows = []
         bin_metric_rows = []
@@ -827,22 +1080,44 @@ class PreTrainRunner:
         last_train_loss = float("nan")
 
         if self.is_master:
-
             if self.pretrain_cfg.resume_checkpoint:
                 log.info(
-                    "Starting pre-adaptation of %s from checkpoint %s for up to %d epochs on device %s",
+                    "Starting CancerFoundation-style pre-adaptation of %s from checkpoint %s "
+                    "for up to %d epochs on device %s",
                     self._model_name(),
                     self.pretrain_cfg.resume_checkpoint,
                     epochs,
                     self.device,
                 )
-            else:   
+            else:
                 log.info(
-                    "Starting pretraining of %s for %d epochs on device %s",
+                    "Starting CancerFoundation-style pretraining of %s for %d epochs on device %s",
                     self._model_name(),
                     epochs,
                     self.device,
                 )
+            log.info(
+                "Input: %s | gene_num=%d | selected genes/sample=%d | max_seq_len=%d | bins=%d",
+                data_path,
+                self.gene_num,
+                self.selected_gene_count,
+                self.max_seq_len,
+                self.bin_num,
+            )
+            log.info(
+                "Gene sampling: hybrid=%s | expressed_gene_fraction=%.3f | "
+                "exclude_masked_from_attention=%s | cls_loss_weight=%.3f",
+                bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
+                float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
+                bool(getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)),
+                self.cls_loss_weight,
+            )
+            log.info(
+                "Optimizer: resume_optimizer_state=%s | loaded_optimizer_state=%s | learning_rates=%s",
+                bool(getattr(self.pretrain_cfg, "resume_optimizer_state", True)),
+                self.loaded_optimizer_state,
+                ", ".join(f"{lr:.6g}" for lr in self._current_learning_rates()),
+            )
 
         try:
             for epoch in range(1, epochs + 1):
@@ -852,12 +1127,15 @@ class PreTrainRunner:
                 if self.is_master:
                     log.info(
                         (
-                            "Epoch %d | Training Loss: %.6f | Accuracy: %.4f%% | "
+                            "Epoch %d | Training Loss: %.6f | Gene Loss: %.6f | CLS Loss: %.6f | "
+                            "Accuracy: %.4f%% | "
                             "Nonzero Accuracy: %.4f%% | Majority Baseline: %.4f%% | "
                             "Zero Target Fraction: %.6f"
                         ),
                         epoch,
                         train_metrics["train_loss"],
+                        train_metrics["train_gene_loss"],
+                        train_metrics["train_cls_loss"],
                         train_metrics["train_accuracy"],
                         train_metrics["train_nonzero_accuracy"],
                         train_metrics["train_majority_baseline_accuracy"],
@@ -874,12 +1152,15 @@ class PreTrainRunner:
                     if self.is_master and val_result is not None:
                         log.info(
                             (
-                                "Epoch %d | Validation Loss: %.6f | Accuracy: %.4f%% | "
+                                "Epoch %d | Validation Loss: %.6f | Gene Loss: %.6f | CLS Loss: %.6f | "
+                                "Accuracy: %.4f%% | "
                                 "Nonzero Accuracy: %.4f%% | Majority Baseline: %.4f%% | "
                                 "Zero Target Fraction: %.6f"
                             ),
                             epoch,
                             val_metrics["val_loss"],
+                            val_metrics["val_gene_loss"],
+                            val_metrics["val_cls_loss"],
                             val_metrics["val_accuracy"],
                             val_metrics["val_nonzero_accuracy"],
                             val_metrics["val_majority_baseline_accuracy"],

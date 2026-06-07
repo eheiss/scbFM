@@ -22,9 +22,15 @@ cellxgene_census = None
 # Paths
 # =========================
 
-GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
+GENE_LIST_PATH = Path(os.getenv(
+    "SCBFM_GENE_LIST_PATH",
+    str(Path(__file__).resolve().parent / "gene_list.txt"),
+))
 
-OUT_DIR = Path("/Users/enricoheiss/Downloads/sc")
+OUT_DIR = Path(os.getenv(
+    "SCBFM_SC_OUT_DIR",
+    "/cluster/work/boeva/eheiss/datasets/sc",
+))
 CHUNK_DIR = OUT_DIR / "census_RAW_chunks"
 MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,16 +48,30 @@ MISSING_GENES_OUT = OUT_DIR / "cellxgene_missing_genes_RAW.json"
 # =========================
 
 ORGANISM = "Homo sapiens"
-CENSUS_VERSION = "2025-11-08"
+CENSUS_ORGANISM_KEY = "homo_sapiens"
+CENSUS_VERSION = os.getenv("SCBFM_SC_CENSUS_VERSION", "2025-11-08")
 MIN_GENES = 200
-TARGET_TOTAL_CELLS = int(os.getenv("SCBFM_TARGET_TOTAL_CELLS", "560000"))
-DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_DOWNLOAD_CHUNK_SIZE", "5000"))
-PROCESS_BATCH_SIZE = int(os.getenv("SCBFM_PROCESS_BATCH_SIZE", "2048"))
-MERGE_BATCH_SIZE = int(os.getenv("SCBFM_MERGE_BATCH_SIZE", "4"))
-RANDOM_SEED = 2021
-INITIAL_OVERDRAW_FACTOR = 1.10
-MAX_SAMPLING_ATTEMPTS = 4
+TARGET_TOTAL_CELLS = int(os.getenv(
+    "SCBFM_SC_TARGET_TOTAL_CELLS",
+    os.getenv("SCBFM_TARGET_TOTAL_CELLS", "642406"),
+))
+DOWNLOAD_CHUNK_SIZE = int(os.getenv(
+    "SCBFM_SC_DOWNLOAD_CHUNK_SIZE",
+    os.getenv("SCBFM_DOWNLOAD_CHUNK_SIZE", "5000"),
+))
+PROCESS_BATCH_SIZE = int(os.getenv(
+    "SCBFM_SC_PROCESS_BATCH_SIZE",
+    os.getenv("SCBFM_PROCESS_BATCH_SIZE", "2048"),
+))
+MERGE_BATCH_SIZE = int(os.getenv(
+    "SCBFM_SC_MERGE_BATCH_SIZE",
+    os.getenv("SCBFM_MERGE_BATCH_SIZE", "4"),
+))
+RANDOM_SEED = int(os.getenv("SCBFM_SC_RANDOM_SEED", "2021"))
+INITIAL_OVERDRAW_FACTOR = float(os.getenv("SCBFM_SC_INITIAL_OVERDRAW_FACTOR", "1.10"))
+MAX_SAMPLING_ATTEMPTS = int(os.getenv("SCBFM_SC_MAX_SAMPLING_ATTEMPTS", "4"))
 RESUME = os.getenv("SCBFM_SC_RESUME", "1") != "0"
+OFFLINE = os.getenv("SCBFM_SC_OFFLINE", "0") == "1"
 
 TILEDB_CONFIG = {
     "py.init_buffer_bytes": 256 * 1024**2,
@@ -89,6 +109,31 @@ def read_json(path: Path):
         return json.load(f)
 
 
+def validate_cached_final(gene_list: list[str], target_total: int) -> bool:
+    if not FINAL_OUT.exists():
+        return False
+
+    cached_final = ad.read_h5ad(FINAL_OUT, backed="r")
+    try:
+        cached_gene_list = list(cached_final.var_names)
+        cached_shape = tuple(map(int, cached_final.shape))
+    finally:
+        close_backed_adata(cached_final)
+
+    if cached_gene_list == gene_list and cached_shape == (target_total, len(gene_list)):
+        print(
+            f"Reusing existing single-cell file at {FINAL_OUT}: "
+            f"{cached_shape[0]} samples x {cached_shape[1]} genes"
+        )
+        return True
+
+    print(
+        f"Ignoring cached single-cell file at {FINAL_OUT} because it does not "
+        f"match the current target/gene order (found {cached_shape[0]} x {cached_shape[1]})."
+    )
+    return False
+
+
 def close_backed_adata(adata: ad.AnnData) -> None:
     file_obj = getattr(adata, "file", None)
     if file_obj is not None:
@@ -122,7 +167,8 @@ def require_cellxgene_census():
         except ImportError as exc:
             raise ImportError(
                 "cellxgene_census is required for create_pretrain_data_sc_RAW.py "
-                "unless all needed chunks are already cached."
+                "unless SCBFM_SC_OFFLINE=1 and all needed sampling plans/chunks "
+                "or the final h5ad are already cached."
             ) from exc
         cellxgene_census = census_module
     return cellxgene_census
@@ -222,8 +268,25 @@ def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
     return out_path
 
 
+def get_census_experiment(census):
+    census_data = census["census_data"]
+    for organism_key in (CENSUS_ORGANISM_KEY, ORGANISM):
+        try:
+            return census_data[organism_key]
+        except KeyError:
+            continue
+    try:
+        available = list(census_data.keys())
+    except Exception:
+        available = []
+    raise KeyError(
+        f"Could not find CELLxGENE Census organism collection for "
+        f"{CENSUS_ORGANISM_KEY!r}. Available keys: {available}"
+    )
+
+
 def iter_obs_tables(census, column_names: list[str]):
-    exp = census["census_data"]["homo_sapiens"]
+    exp = get_census_experiment(census)
     return exp.obs.read(
         column_names=column_names,
         value_filter="is_primary_data == True",
@@ -491,18 +554,8 @@ def merge_chunks(chunk_paths: list[Path], gene_list: list[str], target_total: in
     if len(chunk_paths) == 0:
         raise ValueError("No CELLxGENE chunk files were created.")
 
-    if RESUME and FINAL_OUT.exists():
-        cached_final = ad.read_h5ad(FINAL_OUT, backed="r")
-        cached_gene_list = list(cached_final.var_names)
-        cached_n_obs = int(cached_final.n_obs)
-        close_backed_adata(cached_final)
-        if cached_gene_list == gene_list and cached_n_obs == target_total:
-            print(f"Reusing existing merged single-cell file at {FINAL_OUT}")
-            return FINAL_OUT
-        print(
-            f"Ignoring cached merged single-cell file at {FINAL_OUT} because it does not "
-            "match the current target or gene ordering."
-        )
+    if RESUME and validate_cached_final(gene_list, target_total):
+        return FINAL_OUT
 
     current_paths = list(chunk_paths)
     round_id = 0
@@ -537,6 +590,22 @@ def main() -> None:
 
     print(f"Target single-cell sample count: {target_total}")
     print(f"Target gene count: {len(gene_list)}")
+    print(f"Output directory: {OUT_DIR}")
+    print(f"Resume enabled: {RESUME}")
+    print(f"Offline mode: {OFFLINE}")
+
+    if DOWNLOAD_CHUNK_SIZE <= 0:
+        raise ValueError("SCBFM_SC_DOWNLOAD_CHUNK_SIZE must be positive.")
+    if PROCESS_BATCH_SIZE <= 0:
+        raise ValueError("SCBFM_SC_PROCESS_BATCH_SIZE must be positive.")
+    if MERGE_BATCH_SIZE <= 0:
+        raise ValueError("SCBFM_SC_MERGE_BATCH_SIZE must be positive.")
+    if target_total <= 0:
+        raise ValueError("SCBFM_SC_TARGET_TOTAL_CELLS must be positive.")
+    if OFFLINE and not RESUME:
+        raise ValueError("SCBFM_SC_OFFLINE=1 requires SCBFM_SC_RESUME=1.")
+    if RESUME and validate_cached_final(gene_list, target_total):
+        return
 
     previous_summary = read_json(SAMPLING_SUMMARY_OUT) if RESUME and SAMPLING_SUMMARY_OUT.exists() else {}
     missing_genes = read_json(MISSING_GENES_OUT) if RESUME and MISSING_GENES_OUT.exists() else None
@@ -581,6 +650,12 @@ def main() -> None:
                     .shape[0]
                 )
             else:
+                if OFFLINE:
+                    raise RuntimeError(
+                        f"SCBFM_SC_OFFLINE=1 requires a cached sampling plan for attempt "
+                        f"{attempt_id} at {sampling_plan_attempt_path(attempt_id)} "
+                        f"or {SAMPLING_PLAN_OUT}."
+                    )
                 if dataset_counts is None or group_counts_by_dataset is None:
                     dataset_counts, group_counts_by_dataset = count_sampling_groups(ensure_census())
 
@@ -604,7 +679,13 @@ def main() -> None:
                     target_total=target_total,
                     attempt_id=attempt_id,
                 )
-            except MissingChunkDownloadRequired:
+            except MissingChunkDownloadRequired as exc:
+                if OFFLINE:
+                    raise RuntimeError(
+                        "SCBFM_SC_OFFLINE=1 requires all CELLxGENE RAW chunks for the "
+                        f"cached sampling plan to exist under {CHUNK_DIR}. "
+                        f"Missing chunk detail: {exc}"
+                    ) from exc
                 if var_coords is None:
                     var_coords, missing_genes = build_var_coords(ensure_census(), gene_list)
                     write_json(missing_genes, MISSING_GENES_OUT)
@@ -681,7 +762,12 @@ def main() -> None:
         }
         write_json(summary, SAMPLING_SUMMARY_OUT)
 
-    merge_chunks(chunk_paths, gene_list, target_total)
+    final_path = merge_chunks(chunk_paths, gene_list, target_total)
+    final = ad.read_h5ad(final_path, backed="r")
+    try:
+        print(f"Final single-cell dataset dimensions: {final.n_obs} samples x {final.n_vars} genes")
+    finally:
+        close_backed_adata(final)
 
 
 if __name__ == "__main__":

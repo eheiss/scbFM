@@ -2,51 +2,53 @@
 model_name:
 data_path:
 resume_checkpoint: null
+resume_optimizer_state: true
 
 # training
 epochs: 5
-batch_size: 4
+batch_size: 16
 valid_every: 1
 grad_acc: 4
 max_grad_norm: 1e2
 
-# model
-bin_num: 10
-gene_num: 11964
+# CancerFoundation/scGPT-style expression bins:
+# bin 0 is zero expression, bins 1..50 are nonzero quantile bins.
+bin_num: 51
+gene_num: 13004
+selected_gene_count: 1199
+max_seq_len: 1200
 seed: 2021
-dim: 200
-depth: 6
-heads: 10
-dim_head: 64
-ff_mult: 4
-nb_features: null
-feature_redraw_interval: 1000
-ff_chunks: 1
-ff_glu: False
-emb_dropout: 0.
-ff_dropout: 0.
-attn_dropout: 0.
-use_scalenorm: False
-use_rezero: False
-no_projection: False
-tie_embed: False
-g2v_position_emb: False
-auto_check_redraw: True
-qkv_bias: True
+embsize: 256
+nlayers: 6
+nheads: 8
+d_hid: 512
+dropout: 0.2
+value_encoder_max_value: 512
+pad_value: -2.0
+mask_value: -1.0
 
 # data
-preprocess: true
+preprocess: false
 reindex_genes: true
 gene_list_path: ../data/gene_list.txt
 min_genes: 200
 validation_split: 0.05
 mask_prob: 0.15
-replace_prob: 0.9
-random_token_prob: 0.
-mask_ignore_token_ids: [0]
+mask_ignore_values: []
+exclude_masked_from_attention: true
+# CancerFoundation-style hybrid input sampling. The runner requests this
+# expressed/zero split per sample and fills deficits from the remaining genes.
+hybrid_gene_sampling: true
+expressed_gene_fraction: 0.5
 
 # loss
-loss_type: ce  # "ce" (cross-entropy) or "mse" (ordinal MSE over bin soft-predictions; also enables scGPT-style embx)
+# MSE over masked binned expression values, matching scGPT/CancerFoundation.
+loss_type: mse
+# Additional CancerFoundation-style objective:
+# MLP(h_cls || emb_gene(masked_gene)) predicts the same masked binned value.
+# Technology embeddings are intentionally omitted because this dataset has no
+# stable technology/domain label in the pretraining runner.
+cls_loss_weight: 1.0
 
 #optimizer
 learning_rate: 1e-4
@@ -55,4 +57,3 @@ cycle_mult: 1
 min_lr: 1e-6
 warmup_steps: 1
 gamma: 1.0
-
