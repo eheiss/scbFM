@@ -62,53 +62,6 @@ def quantile_bin_expression(values: np.ndarray, bin_num: int, rng: np.random.Gen
     return binned
 
 
-def hybrid_sample_gene_indices(
-    values: np.ndarray,
-    *,
-    selected_gene_count: int,
-    expressed_fraction: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    if not 0.0 <= expressed_fraction <= 1.0:
-        raise ValueError("expressed_fraction must be between 0 and 1.")
-
-    expressed_cols = np.flatnonzero(values > 0)
-    zero_cols = np.flatnonzero(values == 0)
-
-    requested_expressed = int(round(selected_gene_count * expressed_fraction))
-    requested_zero = selected_gene_count - requested_expressed
-    sampled_expressed = min(requested_expressed, expressed_cols.shape[0])
-    sampled_zero = min(requested_zero, zero_cols.shape[0])
-
-    expressed_sample = (
-        rng.choice(expressed_cols, size=sampled_expressed, replace=False)
-        if sampled_expressed > 0
-        else np.empty(0, dtype=np.int64)
-    )
-    zero_sample = (
-        rng.choice(zero_cols, size=sampled_zero, replace=False)
-        if sampled_zero > 0
-        else np.empty(0, dtype=np.int64)
-    )
-
-    selected = np.concatenate((expressed_sample, zero_sample)).astype(np.int64, copy=False)
-    if selected.shape[0] < selected_gene_count:
-        selected_set = set(selected.tolist())
-        remaining = np.asarray(
-            [idx for idx in range(values.shape[0]) if idx not in selected_set],
-            dtype=np.int64,
-        )
-        fill = rng.choice(
-            remaining,
-            size=selected_gene_count - selected.shape[0],
-            replace=False,
-        )
-        selected = np.concatenate((selected, fill)).astype(np.int64, copy=False)
-
-    rng.shuffle(selected)
-    return selected
-
-
 class RawExpressionDataset(Dataset):
     def __init__(
         self,
@@ -118,8 +71,6 @@ class RawExpressionDataset(Dataset):
         gene_num: int,
         selected_gene_count: int,
         bin_num: int,
-        hybrid_gene_sampling: bool,
-        expressed_gene_fraction: float,
         seed: int,
         cls_gene_id: int,
         gene_token_offset: int,
@@ -131,8 +82,6 @@ class RawExpressionDataset(Dataset):
         self.gene_num = int(gene_num)
         self.selected_gene_count = int(selected_gene_count)
         self.bin_num = int(bin_num)
-        self.hybrid_gene_sampling = bool(hybrid_gene_sampling)
-        self.expressed_gene_fraction = float(expressed_gene_fraction)
         self.seed = int(seed)
         self.cls_gene_id = int(cls_gene_id)
         self.gene_token_offset = int(gene_token_offset)
@@ -185,19 +134,11 @@ class RawExpressionDataset(Dataset):
         # subset across epochs.
         rng_seed = self.seed + self.epoch * 1_000_003 + source_index
         rng = np.random.default_rng(rng_seed)
-        if self.hybrid_gene_sampling:
-            selected_cols = hybrid_sample_gene_indices(
-                row,
-                selected_gene_count=self.selected_gene_count,
-                expressed_fraction=self.expressed_gene_fraction,
-                rng=rng,
-            )
-        else:
-            selected_cols = rng.choice(
-                self.gene_num,
-                size=self.selected_gene_count,
-                replace=False,
-            )
+        selected_cols = rng.choice(
+            self.gene_num,
+            size=self.selected_gene_count,
+            replace=False,
+        )
 
         raw_values = row[selected_cols].astype(np.float32, copy=False)
         binned_values = quantile_bin_expression(raw_values, self.bin_num, rng).astype(np.float32)
@@ -238,6 +179,12 @@ class PreTrainRunner:
         self.max_seq_len = int(getattr(self.pretrain_cfg, "max_seq_len", self.selected_gene_count + 1))
         if self.max_seq_len != self.selected_gene_count + 1:
             raise ValueError("max_seq_len must equal selected_gene_count + 1 for the <cls> token.")
+        self.gene_sampling = str(getattr(self.pretrain_cfg, "gene_sampling", "uniform_full_vocab"))
+        if self.gene_sampling != "uniform_full_vocab":
+            raise ValueError(
+                "Only gene_sampling='uniform_full_vocab' is supported. "
+                "Fixed expressed/zero ratio sampling has been removed."
+            )
 
         self.cls_gene_id = 0
         self.pad_gene_id = 1
@@ -352,8 +299,6 @@ class PreTrainRunner:
             gene_num=self.gene_num,
             selected_gene_count=self.selected_gene_count,
             bin_num=self.bin_num,
-            hybrid_gene_sampling=bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
-            expressed_gene_fraction=float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
             seed=int(self.pretrain_cfg.seed) + self.rank,
             cls_gene_id=self.cls_gene_id,
             gene_token_offset=self.gene_token_offset,
@@ -804,8 +749,7 @@ class PreTrainRunner:
                 getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)
             ),
             "selected_gene_count": self.selected_gene_count,
-            "hybrid_gene_sampling": bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
-            "expressed_gene_fraction": float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
+            "gene_sampling": self.gene_sampling,
             "bin_num": self.bin_num,
             "loss_type": "mse",
             "cls_loss_weight": self.cls_loss_weight,
@@ -868,6 +812,7 @@ class PreTrainRunner:
             "backbone": "cancerfoundation",
             "gene_num": self.gene_num,
             "selected_gene_count": self.selected_gene_count,
+            "gene_sampling": self.gene_sampling,
             "max_seq_len": self.max_seq_len,
             "bin_num": self.bin_num,
             "cls_loss_weight": self.cls_loss_weight,
@@ -1105,12 +1050,18 @@ class PreTrainRunner:
                 self.bin_num,
             )
             log.info(
-                "Gene sampling: hybrid=%s | expressed_gene_fraction=%.3f | "
-                "exclude_masked_from_attention=%s | cls_loss_weight=%.3f",
-                bool(getattr(self.pretrain_cfg, "hybrid_gene_sampling", True)),
-                float(getattr(self.pretrain_cfg, "expressed_gene_fraction", 0.5)),
+                "Gene sampling: %s | exclude_masked_from_attention=%s | "
+                "cls_loss_weight=%.3f",
+                self.gene_sampling,
                 bool(getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)),
                 self.cls_loss_weight,
+            )
+            log.info(
+                "Gene subsets are randomly resampled per sample and epoch from the full "
+                "%d-gene vocabulary; each sequence uses %d genes (%.2f%%).",
+                self.gene_num,
+                self.selected_gene_count,
+                100.0 * self.selected_gene_count / self.gene_num,
             )
             log.info(
                 "Optimizer: resume_optimizer_state=%s | loaded_optimizer_state=%s | learning_rates=%s",

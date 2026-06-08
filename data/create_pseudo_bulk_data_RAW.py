@@ -22,9 +22,15 @@ cellxgene_census = None
 # Paths
 # =========================
 
-GENE_LIST_PATH = Path(__file__).resolve().parent / "gene_list.txt"
+GENE_LIST_PATH = Path(os.getenv(
+    "SCBFM_GENE_LIST_PATH",
+    str(Path(__file__).resolve().parent / "gene_list.txt"),
+))
 
-OUT_DIR = Path("/cluster/work/boeva/eheiss/datasets/pseudo_bulk")
+OUT_DIR = Path(os.getenv(
+    "SCBFM_PSEUDO_OUT_DIR",
+    "/cluster/work/boeva/eheiss/datasets/pseudo_bulk",
+))
 CHUNK_DIR = OUT_DIR / "pseudo_bulk_RAW_chunks"
 SOURCE_CHUNK_DIR = OUT_DIR / "source_cell_chunks"
 MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"
@@ -47,15 +53,25 @@ SOURCE_ADATA_OUT = OUT_DIR / "sampled_source_cells_aligned.h5ad"
 # Settings
 # =========================
 
-ORGANISM = "Homo sapiens"
-CENSUS_VERSION = "2025-11-08"
-MIN_GENES = 200
-TARGET_PSEUDO_BULKS = int(os.getenv("SCBFM_TARGET_PSEUDO_BULKS", "20000"))
-CELLS_PER_PSEUDO_BULK = int(os.getenv("SCBFM_CELLS_PER_PSEUDO_BULK", "1000"))
+ORGANISM = os.getenv("SCBFM_PSEUDO_ORGANISM", "Homo sapiens")
+CENSUS_ORGANISM_KEY = os.getenv("SCBFM_PSEUDO_CENSUS_ORGANISM_KEY", "homo_sapiens")
+CENSUS_VERSION = os.getenv(
+    "SCBFM_PSEUDO_CENSUS_VERSION",
+    os.getenv("SCBFM_CENSUS_VERSION", "2025-11-08"),
+)
+MIN_GENES = int(os.getenv("SCBFM_PSEUDO_MIN_GENES", "200"))
+TARGET_PSEUDO_BULKS = int(os.getenv(
+    "SCBFM_PSEUDO_TARGET_PSEUDO_BULKS",
+    os.getenv("SCBFM_TARGET_PSEUDO_BULKS", "20000"),
+))
+CELLS_PER_PSEUDO_BULK = int(os.getenv(
+    "SCBFM_PSEUDO_CELLS_PER_PSEUDO_BULK",
+    os.getenv("SCBFM_CELLS_PER_PSEUDO_BULK", "1000"),
+))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("SCBFM_PSEUDO_DOWNLOAD_CHUNK_SIZE", "5000"))
 WRITE_CHUNK_SIZE = int(os.getenv("SCBFM_PSEUDO_WRITE_CHUNK_SIZE", "500"))
 MERGE_BATCH_SIZE = int(os.getenv("SCBFM_PSEUDO_MERGE_BATCH_SIZE", "8"))
-RANDOM_SEED = 2021
+RANDOM_SEED = int(os.getenv("SCBFM_PSEUDO_RANDOM_SEED", "2021"))
 
 MIN_CONTEXT_CELL_TYPES = int(os.getenv("SCBFM_MIN_CONTEXT_CELL_TYPES", "2"))
 MIN_AVAILABLE_CELLS_PER_CELLTYPE = int(
@@ -106,6 +122,111 @@ def read_json(path: Path):
         return json.load(f)
 
 
+def close_backed_adata(adata: ad.AnnData) -> None:
+    file_obj = getattr(adata, "file", None)
+    if file_obj is not None:
+        file_obj.close()
+
+
+def inspect_cached_h5ad(path: Path) -> tuple[tuple[int, int], list[str]]:
+    cached = ad.read_h5ad(path, backed="r")
+    try:
+        shape = tuple(map(int, cached.shape))
+        var_names = list(cached.var_names.astype(str))
+    finally:
+        close_backed_adata(cached)
+    return shape, var_names
+
+
+def cached_h5ad_matches(
+    path: Path,
+    gene_list: list[str],
+    *,
+    expected_n_obs: int | None = None,
+) -> tuple[bool, str, tuple[int, int] | None]:
+    try:
+        shape, cached_gene_list = inspect_cached_h5ad(path)
+    except Exception as exc:
+        return False, f"cannot be opened as h5ad ({exc})", None
+
+    if cached_gene_list != gene_list:
+        return (
+            False,
+            f"gene order/count mismatch (found {shape[1]} genes, expected {len(gene_list)})",
+            shape,
+        )
+    if expected_n_obs is not None and shape[0] != expected_n_obs:
+        return (
+            False,
+            f"row count mismatch (found {shape[0]}, expected {expected_n_obs})",
+            shape,
+        )
+    return True, f"{shape[0]} samples x {shape[1]} genes", shape
+
+
+def validate_cached_h5ad(
+    path: Path,
+    gene_list: list[str],
+    *,
+    label: str,
+    expected_n_obs: int | None = None,
+    allow_recompute: bool = False,
+) -> bool:
+    ok, reason, _shape = cached_h5ad_matches(
+        path,
+        gene_list,
+        expected_n_obs=expected_n_obs,
+    )
+    if ok:
+        return True
+    if allow_recompute:
+        print(f"Ignoring cached {label} at {path}: {reason}")
+        return False
+    raise ValueError(
+        f"Cached {label} at {path} is not compatible with the current "
+        f"gene list/setup: {reason}"
+    )
+
+
+def validate_cached_final(gene_list: list[str]) -> bool:
+    if not FINAL_OUT.exists():
+        return False
+
+    ok, reason, shape = cached_h5ad_matches(FINAL_OUT, gene_list)
+    if not ok:
+        print(f"Ignoring cached pseudo-bulk final at {FINAL_OUT}: {reason}")
+        return False
+
+    if not SUMMARY_OUT.exists():
+        print(
+            f"Ignoring cached pseudo-bulk final at {FINAL_OUT}: "
+            f"missing run summary {SUMMARY_OUT}."
+        )
+        return False
+
+    summary = read_json(SUMMARY_OUT)
+    summary_target = int(summary.get("target_pseudo_bulks", -1))
+    summary_cells = int(summary.get("cells_per_pseudo_bulk", -1))
+    summary_genes = int(summary.get("target_gene_count", -1))
+    if (
+        summary_target != TARGET_PSEUDO_BULKS
+        or summary_cells != CELLS_PER_PSEUDO_BULK
+        or summary_genes != len(gene_list)
+    ):
+        print(
+            f"Ignoring cached pseudo-bulk final at {FINAL_OUT}: summary "
+            "does not match the current target/cell/gene settings."
+        )
+        return False
+
+    assert shape is not None
+    print(
+        f"Reusing existing pseudo-bulk file at {FINAL_OUT}: "
+        f"{shape[0]} samples x {shape[1]} genes"
+    )
+    return True
+
+
 def require_cellxgene_census():
     global cellxgene_census
     if cellxgene_census is None:
@@ -145,10 +266,14 @@ def filter_raw_dense_block(
     return x.astype(np.float32, copy=False), keep_mask
 
 
-def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
+def merge_h5ad_group(paths: list[Path], out_path: Path, gene_list: list[str]) -> Path:
+    for path in paths:
+        validate_cached_h5ad(path, gene_list, label="merge input chunk")
     adatas = [ad.read_h5ad(p) for p in paths]
     merged = ad.concat(adatas, axis=0, join="outer", merge="same", index_unique=None)
     merged.obs_names_make_unique()
+    merged = merged[:, gene_list].copy()
+    merged.var_names = pd.Index(gene_list, dtype=str)
     write_h5ad_compat(merged, out_path)
 
     del adatas, merged
@@ -157,7 +282,7 @@ def merge_h5ad_group(paths: list[Path], out_path: Path) -> Path:
 
 
 def iter_obs_tables(census, column_names: list[str]):
-    exp = census["census_data"]["homo_sapiens"]
+    exp = census["census_data"][CENSUS_ORGANISM_KEY]
     return exp.obs.read(
         column_names=column_names,
         value_filter="is_primary_data == True",
@@ -560,12 +685,20 @@ def download_source_cells(
         end = min(start + DOWNLOAD_CHUNK_SIZE, sampled_meta.shape[0])
         chunk_path = SOURCE_CHUNK_DIR / f"source_cells_chunk_{chunk_id:05d}.h5ad"
         if RESUME and chunk_path.exists():
-            print(
-                f"Reusing downloaded source CELLxGENE chunk {chunk_id}: "
-                f"cells {start}:{end}"
-            )
-            chunk_paths.append(chunk_path)
-            continue
+            expected_n_obs = end - start
+            if validate_cached_h5ad(
+                chunk_path,
+                gene_list,
+                label=f"source CELLxGENE chunk {chunk_id}",
+                expected_n_obs=expected_n_obs,
+                allow_recompute=True,
+            ):
+                print(
+                    f"Reusing downloaded source CELLxGENE chunk {chunk_id}: "
+                    f"cells {start}:{end}"
+                )
+                chunk_paths.append(chunk_path)
+                continue
 
         meta_chunk = sampled_meta.iloc[start:end].copy()
         obs_coords = meta_chunk["soma_joinid"].astype(np.int64).tolist()
@@ -646,15 +779,22 @@ def build_source_row_index(
     }
 
 
-def get_source_chunk_paths(sampled_meta: pd.DataFrame) -> list[Path]:
+def get_source_chunk_paths(sampled_meta: pd.DataFrame, gene_list: list[str]) -> list[Path]:
     chunk_paths = []
-    for chunk_id, _start in enumerate(range(0, sampled_meta.shape[0], DOWNLOAD_CHUNK_SIZE)):
+    for chunk_id, start in enumerate(range(0, sampled_meta.shape[0], DOWNLOAD_CHUNK_SIZE)):
+        end = min(start + DOWNLOAD_CHUNK_SIZE, sampled_meta.shape[0])
         chunk_path = SOURCE_CHUNK_DIR / f"source_cells_chunk_{chunk_id:05d}.h5ad"
         if not chunk_path.exists():
             raise FileNotFoundError(
                 f"Missing cached source chunk {chunk_path}. "
                 "Run the download stage with internet access first."
             )
+        validate_cached_h5ad(
+            chunk_path,
+            gene_list,
+            label=f"source CELLxGENE chunk {chunk_id}",
+            expected_n_obs=end - start,
+        )
         chunk_paths.append(chunk_path)
     if not chunk_paths:
         raise ValueError("No cached source chunks were found.")
@@ -722,9 +862,15 @@ def generate_pseudo_bulk_chunks(
         chunk_plan = plan_rows[start:end]
         out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
         if RESUME and out_path.exists():
-            print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
-            chunk_paths.append(out_path)
-            continue
+            if validate_cached_h5ad(
+                out_path,
+                gene_list,
+                label=f"pseudo-bulk chunk {chunk_id}",
+                allow_recompute=True,
+            ):
+                print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
+                chunk_paths.append(out_path)
+                continue
 
         rng = np.random.default_rng(RANDOM_SEED + chunk_id)
 
@@ -805,9 +951,15 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
         chunk_plan = plan_rows[start:end]
         out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
         if RESUME and out_path.exists():
-            print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
-            chunk_paths.append(out_path)
-            continue
+            if validate_cached_h5ad(
+                out_path,
+                gene_list,
+                label=f"pseudo-bulk chunk {chunk_id}",
+                allow_recompute=True,
+            ):
+                print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
+                chunk_paths.append(out_path)
+                continue
 
         rng = np.random.default_rng(RANDOM_SEED + chunk_id)
         aggregated_rows: list[sparse.csr_matrix] = []
@@ -875,13 +1027,19 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
     return chunk_paths
 
 
-def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str]) -> Path:
+def merge_chunks(
+    chunk_paths: list[Path],
+    proportion_column_map: dict[str, str],
+    gene_list: list[str],
+) -> Path:
     if len(chunk_paths) == 0:
         raise ValueError("No pseudo-bulk chunk files were created.")
 
-    if RESUME and FINAL_OUT.exists():
-        print(f"Reusing existing merged pseudo-bulk file at {FINAL_OUT}")
+    if RESUME and validate_cached_final(gene_list):
         return FINAL_OUT
+
+    for path in chunk_paths:
+        validate_cached_h5ad(path, gene_list, label="pseudo-bulk chunk")
 
     current_paths = list(chunk_paths)
     round_id = 0
@@ -895,13 +1053,19 @@ def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str])
                 f"Merging pseudo-bulk batch round {round_id}, batch {batch_id}: "
                 f"{len(batch_paths)} files"
             )
-            next_paths.append(merge_h5ad_group(batch_paths, out_path))
+            next_paths.append(merge_h5ad_group(batch_paths, out_path, gene_list))
         current_paths = next_paths
         round_id += 1
 
     final_merged = ad.read_h5ad(current_paths[0])
     final_merged.obs_names_make_unique()
+    final_merged = final_merged[:, gene_list].copy()
+    final_merged.var_names = pd.Index(gene_list, dtype=str)
     store_proportion_metadata(final_merged, proportion_column_map)
+    print(
+        f"Pseudo-bulk merged: {final_merged.n_obs} samples x "
+        f"{final_merged.n_vars} genes"
+    )
     write_h5ad_compat(final_merged, FINAL_OUT)
 
     del final_merged
@@ -912,8 +1076,19 @@ def merge_chunks(chunk_paths: list[Path], proportion_column_map: dict[str, str])
 
 def main() -> None:
     gene_list = read_gene_list(GENE_LIST_PATH)
+    if len(set(gene_list)) != len(gene_list):
+        raise ValueError(f"Gene list contains duplicates: {GENE_LIST_PATH}")
+
     print(f"Target pseudo-bulk sample count: {TARGET_PSEUDO_BULKS}")
     print(f"Target gene count: {len(gene_list)}")
+    print(f"Gene list: {GENE_LIST_PATH}")
+    print(f"Output directory: {OUT_DIR}")
+    print(f"Census version: {CENSUS_VERSION}")
+    print(f"Resume enabled: {RESUME}")
+    print(f"Offline mode: {OFFLINE}")
+
+    if RESUME and validate_cached_final(gene_list):
+        return
 
     missing_genes = read_json(MISSING_GENES_OUT) if RESUME and MISSING_GENES_OUT.exists() else None
 
@@ -937,8 +1112,16 @@ def main() -> None:
         all_cell_types = []
 
     if not OFFLINE and RESUME and SOURCE_ADATA_OUT.exists():
-        print(f"Reusing downloaded source cells from {SOURCE_ADATA_OUT}")
-        source_adata = ad.read_h5ad(SOURCE_ADATA_OUT)
+        if validate_cached_h5ad(
+            SOURCE_ADATA_OUT,
+            gene_list,
+            label="aligned source cells",
+            allow_recompute=True,
+        ):
+            print(f"Reusing downloaded source cells from {SOURCE_ADATA_OUT}")
+            source_adata = ad.read_h5ad(SOURCE_ADATA_OUT)
+        else:
+            source_adata = None
     else:
         source_adata = None
 
@@ -1030,7 +1213,7 @@ def main() -> None:
     proportion_column_map = build_proportion_column_map(all_cell_types)
     if source_adata is None:
         sampled_source_meta = load_sampled_source_meta(SAMPLED_SOURCE_CELLS_OUT)
-        source_chunk_paths = get_source_chunk_paths(sampled_source_meta)
+        source_chunk_paths = get_source_chunk_paths(sampled_source_meta, gene_list)
         chunk_paths = generate_pseudo_bulk_chunks_from_cached_sources(
             sampled_source_meta,
             source_chunk_paths,
@@ -1049,7 +1232,13 @@ def main() -> None:
         )
         sampled_source_cells = int(source_adata.n_obs)
         source_mode = "aligned_source_adata"
-    merge_chunks(chunk_paths, proportion_column_map)
+    final_path = merge_chunks(chunk_paths, proportion_column_map, gene_list)
+
+    final = ad.read_h5ad(final_path, backed="r")
+    try:
+        print(f"Final pseudo-bulk dataset dimensions: {final.n_obs} samples x {final.n_vars} genes")
+    finally:
+        close_backed_adata(final)
 
     summary = {
         "census_version": CENSUS_VERSION,

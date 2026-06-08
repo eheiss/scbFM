@@ -36,10 +36,9 @@ validation_split: 0.05
 mask_prob: 0.15
 mask_ignore_values: []
 exclude_masked_from_attention: true
-# CancerFoundation-style hybrid input sampling. The runner requests this
-# expressed/zero split per sample and fills deficits from the remaining genes.
-hybrid_gene_sampling: true
-expressed_gene_fraction: 0.5
+# Uniformly sample genes from the full vocabulary per sample/epoch so zero genes
+# appear according to each sample's natural sparsity.
+gene_sampling: uniform_full_vocab
 
 # loss
 # MSE over masked binned expression values, matching scGPT/CancerFoundation.
