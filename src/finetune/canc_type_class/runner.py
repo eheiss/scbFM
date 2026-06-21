@@ -12,6 +12,7 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
+import scanpy as sc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -35,9 +36,9 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from performer_pytorch import PerformerLM
+from cancerfoundation_backbone import CancerFoundationBackbone
 from preprocess import (
-    preprocess_adata_for_tokens,
+    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -58,38 +59,84 @@ RANDOM_INIT_MODEL_KEY = "random_init"
 MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
 
 
+def _digitize_expression(
+    values: np.ndarray,
+    bins: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    left_digits = np.digitize(values, bins)
+    right_digits = np.digitize(values, bins, right=True)
+    random_offsets = rng.random(len(values))
+    digits = random_offsets * (right_digits - left_digits) + left_digits
+    return np.ceil(digits).astype(np.int64)
+
+
+def _quantile_bin_expression(
+    values: np.ndarray,
+    bin_num: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Apply the same per-sequence expression binning used during pretraining."""
+    if bin_num < 2:
+        raise ValueError("bin_num must be at least 2 because bin 0 is reserved for zero expression.")
+
+    values = np.asarray(values, dtype=np.float32)
+    binned = np.zeros(values.shape, dtype=np.int64)
+    nonzero = values > 0
+    if not nonzero.any():
+        return binned
+
+    nonzero_values = values[nonzero]
+    bins = np.quantile(nonzero_values, np.linspace(0, 1, bin_num - 1))
+    digits = _digitize_expression(nonzero_values, bins, rng)
+    binned[nonzero] = np.clip(digits, 1, bin_num - 1)
+    return binned
+
+
 class CancTypePredHead(nn.Module):
     def __init__(
         self,
-        seq_len: int,
         embedding_dim: int,
         output_dim: int,
-        hidden_dim: int = 128,
-        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 1, (1, embedding_dim))
-        self.act = nn.ReLU()
-        self.fc1 = nn.Linear(seq_len, 512, bias=True)
-        self.act1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(512, hidden_dim, bias=True)
-        self.act2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-        self.fc3 = nn.Linear(hidden_dim, output_dim, bias=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, 256),
+            nn.SELU(),
+            nn.Linear(256, 128),
+            nn.SELU(),
+            nn.Linear(128, output_dim),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x[:, None, :, :]
-        x = self.conv1(x)
-        x = self.act(x)
-        x = x.view(x.shape[0], -1)
-        x = self.fc1(x)
-        x = self.act1(x)
-        x = self.dropout1(x)
-        x = self.fc2(x)
-        x = self.act2(x)
-        x = self.dropout2(x)
-        return self.fc3(x)
+        # Position zero is the <cls> token. BulkRNABert does not use a CLS
+        # representation for classification; it mean-pools all gene tokens.
+        mean_gene_embedding = x[:, 1:, :].mean(dim=1)
+        return self.mlp(mean_gene_embedding)
+
+
+class CancerFoundationCancTypeClassifier(nn.Module):
+    def __init__(self, backbone: CancerFoundationBackbone, head: CancTypePredHead) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.to_out = head
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        hidden = self.backbone(
+            batch["gene_ids"],
+            batch["expr"],
+            src_key_padding_mask=batch.get("attention_key_padding_mask"),
+        )
+        return self.to_out(hidden)
+
+    def add_adapters(self, **kwargs) -> nn.ModuleList:
+        return self.backbone.add_adapters(**kwargs)
+
+    def adapter_parameters(self) -> list[nn.Parameter]:
+        return self.backbone.adapter_parameters()
+
+    def enable_grad_checkpoint(self) -> None:
+        self.backbone.enable_grad_checkpoint()
 
 
 class GroupedCosineAnnealingWarmupRestarts:
@@ -208,28 +255,91 @@ class CancTypeClassDataset(Dataset):
         data,
         labels: np.ndarray,
         bin_num: int,
-        special_token_id: int,
+        cls_gene_id: int,
+        gene_token_offset: int,
+        cls_value: float,
+        selected_gene_count: int,
+        seed: int,
+        do_binning: bool,
+        fixed_gene_indices: np.ndarray | None = None,
     ) -> None:
         self.data = data
         self.labels = np.asarray(labels, dtype=np.int64)
-        self.bin_num = bin_num
-        self.special_token_id = special_token_id
+        self.bin_num = int(bin_num)
+        self.cls_gene_id = int(cls_gene_id)
+        self.gene_token_offset = int(gene_token_offset)
+        self.cls_value = float(cls_value)
+        self.gene_num = int(data.shape[1])
+        self.selected_gene_count = int(selected_gene_count)
+        self.seed = int(seed)
+        self.do_binning = bool(do_binning)
+        self.epoch = 0
+        self.fixed_gene_indices = (
+            None
+            if fixed_gene_indices is None
+            else np.asarray(fixed_gene_indices, dtype=np.int64)
+        )
+
+        if self.selected_gene_count <= 0 or self.selected_gene_count > self.gene_num:
+            raise ValueError(
+                f"selected_gene_count must be in [1, {self.gene_num}], "
+                f"got {self.selected_gene_count}."
+            )
+        if (
+            self.fixed_gene_indices is not None
+            and self.fixed_gene_indices.shape != (self.selected_gene_count,)
+        ):
+            raise ValueError(
+                "fixed_gene_indices must contain exactly "
+                f"{self.selected_gene_count} genes."
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
     def __len__(self) -> int:
         return self.data.shape[0]
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         row = self.data[index]
         if sparse.issparse(row):
-            full_seq = row.toarray().ravel()
+            values = row.toarray().ravel()
         else:
-            full_seq = np.asarray(row).ravel()
-        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
-        full_seq = torch.cat(
-            (full_seq, torch.tensor([self.special_token_id], dtype=torch.long))
+            values = np.asarray(row).ravel()
+
+        # Fixed-HVG datasets must produce identical inputs across epochs. The
+        # epoch contributes to the RNG only for random gene-subset training.
+        rng_epoch = self.epoch if self.fixed_gene_indices is None else 0
+        rng_seed = self.seed + rng_epoch * 1_000_003 + index
+        rng = np.random.default_rng(rng_seed)
+        if self.fixed_gene_indices is None:
+            selected_cols = rng.choice(
+                self.gene_num,
+                size=self.selected_gene_count,
+                replace=False,
+            )
+        else:
+            selected_cols = self.fixed_gene_indices
+
+        selected_values = values[selected_cols].astype(np.float32, copy=False)
+        if self.do_binning:
+            selected_values = _quantile_bin_expression(
+                selected_values,
+                self.bin_num,
+                rng,
+            ).astype(np.float32)
+
+        gene_ids = torch.from_numpy(
+            selected_cols.astype(np.int64, copy=False) + self.gene_token_offset
         )
+        gene_ids = torch.cat((torch.tensor([self.cls_gene_id]), gene_ids))
+        expression = torch.from_numpy(selected_values)
+        expression = torch.cat((torch.tensor([self.cls_value]), expression))
         label = torch.tensor(self.labels[index], dtype=torch.long)
-        return full_seq, label
+        return {
+            "gene_ids": gene_ids,
+            "expr": expression,
+        }, label
 
 
 class CancTypeClassRunner:
@@ -247,9 +357,20 @@ class CancTypeClassRunner:
         self.is_master = self.rank == 0
         self.device = torch.device("cpu")
 
-        self.class_count = int(self.model_cfg.bin_num) + 2
-        self.vocab_size = self.class_count + 1
-        self.special_token_id = self.class_count
+        self.cls_gene_id = 0
+        self.pad_gene_id = 1
+        self.gene_token_offset = 2
+        self.num_gene_tokens = int(self.model_cfg.gene_num) + self.gene_token_offset
+        self.cls_value = float(getattr(self.model_cfg, "pad_value", -2.0))
+        self.selected_gene_count = int(getattr(self.model_cfg, "selected_gene_count", 1199))
+        self.max_seq_len = int(
+            getattr(self.model_cfg, "max_seq_len", self.selected_gene_count + 1)
+        )
+        if self.max_seq_len != self.selected_gene_count + 1:
+            raise ValueError(
+                "Cancer type classification expects max_seq_len to equal "
+                "selected_gene_count + 1 for the <cls> token."
+            )
 
         self.label_dict: np.ndarray | None = None
         self.train_loader: DataLoader | None = None
@@ -459,15 +580,11 @@ class CancTypeClassRunner:
         gene_list_path = self._resolve_gene_list_path()
         if self._should_preprocess_input():
             min_genes = int(getattr(self.task_cfg, "min_genes", 200))
-            adata, missing_genes = preprocess_adata_for_tokens(
-                adata,
-                gene_list_path=gene_list_path,
-                min_genes=min_genes,
-                bin_num=int(self.model_cfg.bin_num),
-                reindex_genes=True,
-            )
+            adata, missing_genes = reindex_adata_genes(adata, gene_list_path=gene_list_path)
+            adata = filter_min_genes(adata, min_genes=min_genes)
             log.info(
-                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
+                "Aligned raw input for on-the-fly sequence binning: "
+                "%d target genes missing, output shape %s",
                 len(missing_genes),
                 adata.shape,
             )
@@ -491,8 +608,66 @@ class CancTypeClassRunner:
                 "Provide a matching gene list or aligned input matrix."
             )
 
-        validate_token_matrix(adata.X, bin_num=int(self.model_cfg.bin_num), name="cancer type input data")
+        if not self._should_preprocess_input():
+            validate_token_matrix(
+                adata.X,
+                bin_num=int(self.model_cfg.bin_num),
+                name="cancer type input data",
+            )
+
         return adata
+
+    def _select_training_hvg_indices(self, adata: ad.AnnData) -> np.ndarray:
+        """Fit fold-level HVG selection on training data only."""
+        if adata.n_vars < self.selected_gene_count:
+            raise ValueError(
+                f"Cannot select {self.selected_gene_count} HVGs from only {adata.n_vars} genes."
+            )
+
+        batch_key = getattr(self.task_cfg, "hvg_batch_key", None)
+        if batch_key is not None:
+            batch_key = str(batch_key).strip() or None
+        if batch_key is not None and batch_key not in adata.obs:
+            raise ValueError(f"HVG batch key '{batch_key}' is not present in adata.obs.")
+
+        hvg_stats = sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=self.selected_gene_count,
+            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            batch_key=batch_key,
+            inplace=False,
+        )
+        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
+
+        # Scanpy can retain extra tied genes. Keep the requested sequence length
+        # deterministically while preserving its HVG ranking.
+        if selected.size > self.selected_gene_count:
+            ranking_column = (
+                "highly_variable_rank"
+                if "highly_variable_rank" in hvg_stats
+                else "dispersions_norm"
+            )
+            scores = hvg_stats[ranking_column].to_numpy()[selected]
+            if ranking_column == "highly_variable_rank":
+                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
+            else:
+                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
+            selected = selected[order[: self.selected_gene_count]]
+
+        if selected.size != self.selected_gene_count:
+            raise RuntimeError(
+                "Scanpy selected "
+                f"{selected.size} HVGs; expected exactly {self.selected_gene_count}."
+            )
+
+        log.info(
+            "Selected %d training-fold HVGs for training and evaluation "
+            "with flavor=%s, batch_key=%s",
+            selected.size,
+            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            batch_key,
+        )
+        return selected.astype(np.int64, copy=False)
 
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
@@ -572,17 +747,34 @@ class CancTypeClassRunner:
         )
 
         batch_size = int(getattr(self.task_cfg, "batch_size", 2))
+        random_seed = int(getattr(self.task_cfg, "random_seed", 42))
+        do_binning = self._should_preprocess_input()
+        # Fit feature selection on the training fold only. Use the resulting
+        # fixed vocabulary indices for both training and held-out samples.
+        fold_hvg_indices = self._select_training_hvg_indices(train_adata)
         train_dataset = CancTypeClassDataset(
             train_adata.X,
             train_labels,
             bin_num=int(self.model_cfg.bin_num),
-            special_token_id=self.special_token_id,
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.cls_value,
+            selected_gene_count=self.selected_gene_count,
+            seed=random_seed,
+            do_binning=do_binning,
+            fixed_gene_indices=fold_hvg_indices,
         )
         test_dataset = CancTypeClassDataset(
             test_adata.X,
             test_labels,
             bin_num=int(self.model_cfg.bin_num),
-            special_token_id=self.special_token_id,
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.cls_value,
+            selected_gene_count=self.selected_gene_count,
+            seed=random_seed,
+            do_binning=do_binning,
+            fixed_gene_indices=fold_hvg_indices,
         )
         self.test_dataset_size = len(test_dataset)
 
@@ -631,45 +823,31 @@ class CancTypeClassRunner:
                 f"Unsupported finetune_mode '{finetune_mode}'. Expected one of {sorted(valid_modes)}."
             )
 
-        model = PerformerLM(
-            num_tokens=self.vocab_size,
-            max_seq_len=int(self.model_cfg.gene_num) + 1,
-            dim=int(self.model_cfg.dim),
-            depth=int(self.model_cfg.depth),
-            heads=int(self.model_cfg.heads),
-            dim_head=int(self.model_cfg.dim_head),
-            ff_mult=int(self.model_cfg.ff_mult),
-            nb_features=self.model_cfg.nb_features,
-            feature_redraw_interval=int(self.model_cfg.feature_redraw_interval),
-            ff_chunks=int(self.model_cfg.ff_chunks),
-            ff_glu=bool(self.model_cfg.ff_glu),
-            emb_dropout=float(self.model_cfg.emb_dropout),
-            ff_dropout=float(self.model_cfg.ff_dropout),
-            attn_dropout=float(self.model_cfg.attn_dropout),
-            use_scalenorm=bool(self.model_cfg.use_scalenorm),
-            use_rezero=bool(self.model_cfg.use_rezero),
-            no_projection=bool(self.model_cfg.no_projection),
-            tie_embed=bool(self.model_cfg.tie_embed),
-            g2v_position_emb=bool(self.model_cfg.g2v_position_emb),
-            auto_check_redraw=bool(self.model_cfg.auto_check_redraw),
-            qkv_bias=bool(self.model_cfg.qkv_bias),
-            embx_bin_num=int(self.model_cfg.bin_num) if str(getattr(self.model_cfg, "loss_type", "ce")).lower() == "mse" else None,
+        backbone = CancerFoundationBackbone(
+            num_gene_tokens=self.num_gene_tokens,
+            d_model=int(self.model_cfg.embsize),
+            nhead=int(self.model_cfg.nheads),
+            d_hid=int(self.model_cfg.d_hid),
+            nlayers=int(self.model_cfg.nlayers),
+            dropout=float(self.model_cfg.dropout),
+            pad_gene_id=self.pad_gene_id,
+            max_value=int(getattr(self.model_cfg, "value_encoder_max_value", 512)),
         )
 
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
-            model.load_state_dict(state_dict)
+            backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
         else:
             log.info("Using randomly initialized backbone")
 
-        model.to_out = CancTypePredHead(
-            seq_len=int(self.model_cfg.gene_num) + 1,
-            embedding_dim=int(self.model_cfg.dim),
+        head = CancTypePredHead(
+            embedding_dim=int(self.model_cfg.embsize),
             output_dim=len(self.label_dict),
         )
+        model = CancerFoundationCancTypeClassifier(backbone=backbone, head=head)
 
         if finetune_mode == "adapters":
             model.add_adapters(
@@ -825,8 +1003,16 @@ class CancTypeClassRunner:
             for param in group["params"]
         ]
 
+    def _move_batch_to_device(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
+            key: value.to(self.device, non_blocking=True)
+            for key, value in batch.items()
+        }
+
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_enable_backbone_optimizer(epoch)
+
+        self.train_loader.dataset.set_epoch(epoch)
 
         if self.is_distributed:
             self.train_loader.sampler.set_epoch(epoch)
@@ -841,7 +1027,7 @@ class CancTypeClassRunner:
         running_acc = 0.0
 
         for step_idx, (data, labels) in enumerate(self.train_loader, start=1):
-            data = data.to(self.device, non_blocking=True)
+            data = self._move_batch_to_device(data)
             labels = labels.to(self.device, non_blocking=True)
 
             use_no_sync = (
@@ -869,8 +1055,8 @@ class CancTypeClassRunner:
         epoch_acc = 100.0 * running_acc / len(self.train_loader)
 
         if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
-            epoch_acc = get_reduced(epoch_acc, self.local_rank, 0, self.world_size)
+            epoch_loss = get_reduced(epoch_loss, self.device, 0, self.world_size)
+            epoch_acc = get_reduced(epoch_acc, self.device, 0, self.world_size)
 
         self.scheduler.step()
         return {"loss": epoch_loss, "accuracy": epoch_acc}
@@ -886,7 +1072,7 @@ class CancTypeClassRunner:
 
         with torch.no_grad():
             for data, labels in self.test_loader:
-                data = data.to(self.device, non_blocking=True)
+                data = self._move_batch_to_device(data)
                 labels = labels.to(self.device, non_blocking=True)
                 logits = self.model(data)
                 loss = self.loss_fn(logits, labels)
@@ -912,7 +1098,7 @@ class CancTypeClassRunner:
 
         test_loss = running_loss / len(self.test_loader)
         if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.local_rank, 0, self.world_size)
+            test_loss = get_reduced(test_loss, self.device, 0, self.world_size)
 
         return {
             "loss": float(test_loss),

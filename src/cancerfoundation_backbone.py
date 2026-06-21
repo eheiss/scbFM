@@ -67,6 +67,11 @@ class Adapter(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(bottleneck_dim, d_model),
         )
+        # Start as an exact identity through the residual path. This preserves
+        # the pretrained backbone at adapter insertion and lets the adapter
+        # contribution grow from zero during fine-tuning.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, hidden: Tensor) -> Tensor:
         return hidden + self.net(hidden)
