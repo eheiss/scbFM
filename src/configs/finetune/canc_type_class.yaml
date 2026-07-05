@@ -15,10 +15,18 @@ min_genes: 200
 # evaluation. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger
 hvg_batch_key:
+# false preserves mean pooling over the 1,199 gene tokens; true uses only the
+# CancerFoundation CLS embedding as input to the classification MLP.
+use_cls: false
+# Optional explicit pooling mode for the classification head. Leave empty to
+# preserve the legacy use_cls switch. Valid values: mean, cls, mean_cls.
+head_pooling:
 cv_folds: 5
 random_seed: 42
 
 finetune_mode: head_only
+# Optional experiment label appended to both the output directory and files.
+output_suffix: ""
 burn_in_epochs: 3
 adapter_bottleneck_dim: 32
 adapter_dropout: 0.0
@@ -27,9 +35,14 @@ adapter_after_attention: true
 adapter_after_ff: true
 epochs: 20
 batch_size: 4
+num_workers: 2
+prefetch_factor: 2
 grad_accumulation_steps: 4
+# 0.0 keeps ordinary unweighted cross-entropy. 1.0 uses inverse-frequency
+# balanced weights; intermediate values provide softer reweighting.
+class_weight_power: 0.0
 head_learning_rate: 1e-4
-backbone_learning_rate: 1e-6
+backbone_learning_rate: 1e-4
 max_grad_norm: 1e6
 
 first_cycle_steps: 20

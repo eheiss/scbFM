@@ -13,6 +13,7 @@ import anndata as ad
 import hydra
 import numpy as np
 import pandas as pd
+import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -26,9 +27,13 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from performer_pytorch import PerformerLM
+from cancerfoundation_backbone import CancerFoundationBackbone
+from finetune.canc_type_class.runner import (
+    GroupedCosineAnnealingWarmupRestarts,
+    _quantile_bin_expression,
+)
 from preprocess import (
-    preprocess_adata_for_tokens,
+    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -59,135 +64,83 @@ class DrugRespPredHead(nn.Module):
         self,
         cell_emb_dim: int,
         drug_emb_dim: int,
-        hidden_dim: int = 256,
-        dropout: float = 0.0,
+        hidden_dim: int = 512,
+        bottleneck_dim: int = 256,
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(cell_emb_dim + drug_emb_dim)
-        self.fc1 = nn.Linear(cell_emb_dim + drug_emb_dim, hidden_dim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim, 1)
+        input_dim = cell_emb_dim + drug_emb_dim
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.SELU(),
+            nn.Linear(bottleneck_dim, 1),
+        )
 
     def forward(self, cell_emb: torch.Tensor, drug_emb: torch.Tensor) -> torch.Tensor:
         # cell_emb: (B, cell_emb_dim)   drug_emb: (B, drug_emb_dim)
         x = torch.cat([cell_emb, drug_emb], dim=-1)
-        x = self.norm(x)
-        x = self.dropout(self.act(self.fc1(x)))
-        return self.fc2(x).squeeze(-1)  # (B,)
+        return self.mlp(x).squeeze(-1)  # (B,)
 
 
 class DrugRespModel(nn.Module):
-    """PerformerLM backbone (to_out=Identity) + mean-pool + DrugRespPredHead."""
+    """CancerFoundation backbone + sample/drug fusion head."""
 
-    def __init__(self, backbone: PerformerLM, head: DrugRespPredHead) -> None:
+    def __init__(
+        self,
+        backbone: CancerFoundationBackbone,
+        head: DrugRespPredHead,
+        cell_pooling: str = "cls",
+    ) -> None:
         super().__init__()
+        valid_pooling = {"cls", "mean", "max", "mean_cls"}
+        if cell_pooling not in valid_pooling:
+            raise ValueError(
+                f"Unsupported drug-response cell pooling '{cell_pooling}'. "
+                f"Expected one of {sorted(valid_pooling)}."
+            )
         self.backbone = backbone
         self.head = head
+        self.cell_pooling = cell_pooling
 
-    def forward(self, tokens: torch.Tensor | None, drug_emb: torch.Tensor, cell_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def pool_cell_embeddings(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.cell_pooling == "cls":
+            return hidden[:, 0, :]
+        if self.cell_pooling == "mean":
+            return hidden[:, 1:, :].mean(dim=1)
+        if self.cell_pooling == "mean_cls":
+            return torch.cat((hidden[:, 0, :], hidden[:, 1:, :].mean(dim=1)), dim=-1)
+        return hidden[:, 1:, :].amax(dim=1)
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor] | None,
+        drug_emb: torch.Tensor,
+        cell_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if cell_emb is None:
-            h = self.backbone(tokens)     # (1_or_B, seq_len, dim) — to_out is Identity
-            cell_emb = h.mean(dim=1)      # (1_or_B, dim)
+            if batch is None:
+                raise ValueError("A backbone input batch is required when cell_emb is absent.")
+            hidden = self.backbone(
+                batch["gene_ids"],
+                batch["expr"],
+                src_key_padding_mask=batch.get("attention_key_padding_mask"),
+            )
+            cell_emb = self.pool_cell_embeddings(hidden)
         # cell-centric: single cell embedding → expand to match all its drugs
         if cell_emb.shape[0] == 1 and drug_emb.shape[0] > 1:
             cell_emb = cell_emb.expand(drug_emb.shape[0], -1)
         return self.head(cell_emb, drug_emb)  # (B,)
+
+    def add_adapters(self, **kwargs) -> nn.ModuleList:
+        return self.backbone.add_adapters(**kwargs)
 
     def adapter_parameters(self):
         return self.backbone.adapter_parameters()
 
     def enable_grad_checkpoint(self):
         self.backbone.enable_grad_checkpoint()
-
-
-# ---------------------------------------------------------------------------
-# Scheduler (identical to gene_essent)
-# ---------------------------------------------------------------------------
-
-class GroupedCosineAnnealingWarmupRestarts:
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        first_cycle_steps: int,
-        max_lrs: list[float],
-        min_lr_ratio: float,
-        cycle_mult: float = 1.0,
-        warmup_steps: int = 0,
-        gamma: float = 1.0,
-    ) -> None:
-        if warmup_steps >= first_cycle_steps:
-            raise ValueError("warmup_steps must be smaller than first_cycle_steps.")
-        if len(max_lrs) != len(optimizer.param_groups):
-            raise ValueError("max_lrs must match optimizer.param_groups.")
-        self.optimizer = optimizer
-        self.first_cycle_steps = first_cycle_steps
-        self.cycle_mult = cycle_mult
-        self.base_max_lrs = [float(lr) for lr in max_lrs]
-        self.max_lrs = list(self.base_max_lrs)
-        self.min_lrs = [float(lr) * float(min_lr_ratio) for lr in self.base_max_lrs]
-        self.warmup_steps = warmup_steps
-        self.gamma = gamma
-        self.cur_cycle_steps = first_cycle_steps
-        self.cycle = 0
-        self.step_in_cycle = -1
-        self.last_epoch = -1
-        self._set_lrs(self.min_lrs)
-
-    def _set_lrs(self, lrs: list[float]) -> None:
-        for param_group, lr in zip(self.optimizer.param_groups, lrs):
-            param_group["lr"] = lr
-
-    def get_lr(self) -> list[float]:
-        if self.step_in_cycle == -1:
-            return self.min_lrs
-        if self.step_in_cycle < self.warmup_steps:
-            return [
-                min_lr + (max_lr - min_lr) * self.step_in_cycle / self.warmup_steps
-                for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-            ]
-        return [
-            min_lr
-            + (max_lr - min_lr)
-            * (1 + math.cos(math.pi * (self.step_in_cycle - self.warmup_steps)
-                            / (self.cur_cycle_steps - self.warmup_steps))) / 2
-            for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-        ]
-
-    def step(self, epoch: int | None = None) -> None:
-        if epoch is None:
-            epoch = self.last_epoch + 1
-            self.step_in_cycle += 1
-            if self.step_in_cycle >= self.cur_cycle_steps:
-                self.cycle += 1
-                self.step_in_cycle -= self.cur_cycle_steps
-                self.cur_cycle_steps = int(
-                    (self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult
-                ) + self.warmup_steps
-        else:
-            if epoch >= self.first_cycle_steps:
-                if self.cycle_mult == 1.0:
-                    self.step_in_cycle = epoch % self.first_cycle_steps
-                    self.cycle = epoch // self.first_cycle_steps
-                else:
-                    self.cycle = int(math.log(
-                        epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1,
-                        self.cycle_mult,
-                    ))
-                    self.step_in_cycle = epoch - int(
-                        self.first_cycle_steps * (self.cycle_mult ** self.cycle - 1)
-                        / (self.cycle_mult - 1)
-                    )
-                    self.cur_cycle_steps = self.first_cycle_steps * self.cycle_mult ** self.cycle
-            else:
-                self.cur_cycle_steps = self.first_cycle_steps
-                self.step_in_cycle = epoch
-        self.max_lrs = [lr * (self.gamma ** self.cycle) for lr in self.base_max_lrs]
-        self.last_epoch = math.floor(epoch)
-        self._set_lrs(self.get_lr())
-
-    def state_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if k != "optimizer"}
 
 
 # ---------------------------------------------------------------------------
@@ -199,38 +152,72 @@ class DrugRespDataset(Dataset):
 
     def __init__(
         self,
-        X_cell: np.ndarray,           # (n_cells, gene_num) token matrix
+        X_cell: np.ndarray,           # (n_cells, gene_num) expression matrix
         drug_emb_matrix: np.ndarray,  # (n_drugs, drug_emb_dim) float32
         cell_idxs: np.ndarray,        # (n_pairs,) int — index into X_cell
         drug_idxs: np.ndarray,        # (n_pairs,) int — index into drug_emb_matrix
         ic50_values: np.ndarray,      # (n_pairs,) float32
-        special_token_id: int,
+        fixed_gene_indices: np.ndarray,
+        bin_num: int,
+        cls_gene_id: int,
+        gene_token_offset: int,
+        cls_value: float,
+        seed: int,
+        do_binning: bool,
     ) -> None:
         self.X_cell = X_cell
         self.drug_emb_matrix = drug_emb_matrix
         self.cell_idxs = cell_idxs.astype(np.int64)
         self.drug_idxs = drug_idxs.astype(np.int64)
         self.ic50_values = ic50_values.astype(np.float32)
-        self.special_token_id = special_token_id
+        self.fixed_gene_indices = np.asarray(fixed_gene_indices, dtype=np.int64)
+        self.bin_num = int(bin_num)
+        self.cls_gene_id = int(cls_gene_id)
+        self.gene_token_offset = int(gene_token_offset)
+        self.cls_value = float(cls_value)
+        self.seed = int(seed)
+        self.do_binning = bool(do_binning)
 
     def __len__(self) -> int:
         return len(self.ic50_values)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self,
+        idx: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         cell_idx = int(self.cell_idxs[idx])
         row = self.X_cell[cell_idx]
         if sparse.issparse(row):
-            seq = row.toarray().ravel()
+            values = row.toarray().ravel()
         else:
-            seq = np.asarray(row).ravel()
-        seq = torch.as_tensor(seq, dtype=torch.long)
-        seq = torch.cat([seq, torch.tensor([self.special_token_id], dtype=torch.long)])
+            values = np.asarray(row).ravel()
+        selected_values = values[self.fixed_gene_indices].astype(np.float32, copy=False)
+        if self.do_binning:
+            rng = np.random.default_rng(self.seed + cell_idx)
+            selected_values = _quantile_bin_expression(
+                selected_values,
+                self.bin_num,
+                rng,
+            ).astype(np.float32)
+
+        gene_ids = torch.from_numpy(
+            self.fixed_gene_indices.astype(np.int64, copy=False)
+            + self.gene_token_offset
+        )
+        gene_ids = torch.cat((torch.tensor([self.cls_gene_id]), gene_ids))
+        expression = torch.from_numpy(selected_values)
+        expression = torch.cat((torch.tensor([self.cls_value]), expression))
 
         drug_emb = torch.as_tensor(
             self.drug_emb_matrix[self.drug_idxs[idx]], dtype=torch.float32
         )
         target = torch.as_tensor(self.ic50_values[idx], dtype=torch.float32)
-        return torch.tensor(cell_idx, dtype=torch.long), seq, drug_emb, target
+        return (
+            torch.tensor(cell_idx, dtype=torch.long),
+            {"gene_ids": gene_ids, "expr": expression},
+            drug_emb,
+            target,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,9 +239,20 @@ class DrugRespRunner:
         self.is_master = self.rank == 0
         self.device = torch.device("cpu")
 
-        self.class_count = int(self.model_cfg.bin_num) + 2
-        self.vocab_size = self.class_count + 1
-        self.special_token_id = self.class_count
+        self.cls_gene_id = 0
+        self.pad_gene_id = 1
+        self.gene_token_offset = 2
+        self.num_gene_tokens = int(self.model_cfg.gene_num) + self.gene_token_offset
+        self.cls_value = float(getattr(self.model_cfg, "pad_value", -2.0))
+        self.selected_gene_count = int(getattr(self.model_cfg, "selected_gene_count", 1199))
+        self.max_seq_len = int(
+            getattr(self.model_cfg, "max_seq_len", self.selected_gene_count + 1)
+        )
+        if self.max_seq_len != self.selected_gene_count + 1:
+            raise ValueError(
+                "Drug response expects max_seq_len to equal selected_gene_count + 1 "
+                "for the <cls> token."
+            )
 
         self.test_loader: DataLoader | None = None
         self.test_dataset_size: int = 0
@@ -268,6 +266,7 @@ class DrugRespRunner:
         self.scheduler = None
         self.backbone_optimizer_enabled = False
         self.cell_emb_cache: torch.Tensor | None = None
+        self.fold_gene_indices: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -494,20 +493,21 @@ class DrugRespRunner:
 
         gene_list_path = self._resolve_gene_list_path()
         should_preprocess = bool(getattr(self.task_cfg, "preprocess", True))
+        adata, missing_genes = reindex_adata_genes(
+            adata,
+            gene_list_path=gene_list_path,
+        )
         if should_preprocess:
-            adata, missing_genes = preprocess_adata_for_tokens(
+            adata = filter_min_genes(
                 adata,
-                gene_list_path=gene_list_path,
                 min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-                bin_num=int(self.model_cfg.bin_num),
-                reindex_genes=True,
             )
             log.info(
-                "Expression preprocessing done: %d target genes missing, shape %s",
+                "Aligned raw expression for on-the-fly sequence binning: "
+                "%d target genes missing, shape %s",
                 len(missing_genes), adata.shape,
             )
         else:
-            adata, missing_genes = reindex_adata_genes(adata, gene_list_path=gene_list_path)
             log.info(
                 "Expression reindexed (no preprocessing): %d genes missing, shape %s",
                 len(missing_genes), adata.shape,
@@ -523,9 +523,12 @@ class DrugRespRunner:
             raise ValueError(
                 f"Expected {expected_gene_num} genes after preprocessing, got {adata.n_vars}."
             )
-        validate_token_matrix(
-            adata.X, bin_num=int(self.model_cfg.bin_num), name="drug response expression input"
-        )
+        if not should_preprocess:
+            validate_token_matrix(
+                adata.X,
+                bin_num=int(self.model_cfg.bin_num),
+                name="drug response expression input",
+            )
 
         cell_id_to_row: dict[str, int] = {
             str(cid): i for i, cid in enumerate(adata.obs_names)
@@ -588,6 +591,82 @@ class DrugRespRunner:
 
         return X_cell, drug_emb_matrix, cell_idxs, drug_idxs, ic50_values, pair_cell_ids
 
+    def _select_training_hvg_indices(
+        self,
+        X_cell,
+        training_cell_idxs: np.ndarray,
+    ) -> np.ndarray:
+        """Fit the fixed sequence vocabulary on training-fold cell lines only."""
+        unique_training_cells = np.unique(training_cell_idxs).astype(np.int64)
+        if unique_training_cells.size == 0:
+            raise ValueError("The drug-response training fold contains no cell lines.")
+
+        hvg_adata = ad.AnnData(X=X_cell[unique_training_cells])
+        hvg_stats = sc.pp.highly_variable_genes(
+            hvg_adata,
+            n_top_genes=self.selected_gene_count,
+            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            inplace=False,
+        )
+        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
+        if selected.size > self.selected_gene_count:
+            ranking_column = (
+                "highly_variable_rank"
+                if "highly_variable_rank" in hvg_stats
+                else "dispersions_norm"
+            )
+            scores = hvg_stats[ranking_column].to_numpy()[selected]
+            if ranking_column == "highly_variable_rank":
+                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
+            else:
+                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
+            selected = selected[order[: self.selected_gene_count]]
+
+        if selected.size != self.selected_gene_count:
+            raise RuntimeError(
+                f"Scanpy selected {selected.size} HVGs; "
+                f"expected exactly {self.selected_gene_count}."
+            )
+        log.info(
+            "Selected %d HVGs from %d training-fold cell lines with flavor=%s",
+            selected.size,
+            unique_training_cells.size,
+            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+        )
+        return selected.astype(np.int64, copy=False)
+
+    def _cell_backbone_batch(self, X_cell, cell_indices: np.ndarray) -> dict[str, torch.Tensor]:
+        if self.fold_gene_indices is None:
+            raise RuntimeError("Training-fold HVGs have not been selected.")
+        expressions: list[torch.Tensor] = []
+        for cell_idx in np.asarray(cell_indices, dtype=np.int64):
+            row = X_cell[int(cell_idx)]
+            values = row.toarray().ravel() if sparse.issparse(row) else np.asarray(row).ravel()
+            selected_values = values[self.fold_gene_indices].astype(np.float32, copy=False)
+            if bool(getattr(self.task_cfg, "preprocess", True)):
+                rng = np.random.default_rng(
+                    int(getattr(self.task_cfg, "random_seed", 42)) + int(cell_idx)
+                )
+                selected_values = _quantile_bin_expression(
+                    selected_values,
+                    int(self.model_cfg.bin_num),
+                    rng,
+                ).astype(np.float32)
+            expression = torch.from_numpy(selected_values)
+            expressions.append(
+                torch.cat((torch.tensor([self.cls_value]), expression))
+            )
+
+        gene_ids = torch.from_numpy(
+            self.fold_gene_indices.astype(np.int64, copy=False)
+            + self.gene_token_offset
+        )
+        gene_ids = torch.cat((torch.tensor([self.cls_gene_id]), gene_ids))
+        return {
+            "gene_ids": gene_ids.unsqueeze(0).expand(len(expressions), -1),
+            "expr": torch.stack(expressions),
+        }
+
     # ------------------------------------------------------------------
     # CV splits
     # ------------------------------------------------------------------
@@ -635,9 +714,34 @@ class DrugRespRunner:
         ic50_test: np.ndarray,
     ) -> None:
         batch_size = int(getattr(self.task_cfg, "batch_size", 32))
+        num_workers = int(getattr(self.task_cfg, "num_workers", 0))
+        if num_workers < 0:
+            raise ValueError("finetune.drug_resp.num_workers must be non-negative.")
+        loader_kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            prefetch_factor = int(getattr(self.task_cfg, "prefetch_factor", 2))
+            if prefetch_factor <= 0:
+                raise ValueError("finetune.drug_resp.prefetch_factor must be positive.")
+            loader_kwargs.update(
+                {
+                    "prefetch_factor": prefetch_factor,
+                    "persistent_workers": False,
+                }
+            )
+        if self.fold_gene_indices is None:
+            raise RuntimeError("Training-fold HVGs have not been selected.")
         test_dataset = DrugRespDataset(
             X_cell, drug_emb_matrix, cell_idxs_test, drug_idxs_test, ic50_test,
-            self.special_token_id,
+            fixed_gene_indices=self.fold_gene_indices,
+            bin_num=int(self.model_cfg.bin_num),
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.cls_value,
+            seed=int(getattr(self.task_cfg, "random_seed", 42)),
+            do_binning=bool(getattr(self.task_cfg, "preprocess", True)),
         )
         self.test_dataset_size = len(test_dataset)
         if self.is_distributed:
@@ -645,10 +749,31 @@ class DrugRespRunner:
                 test_dataset, batch_size=batch_size, world_size=self.world_size, rank=self.rank,
             )
             self.test_loader = DataLoader(
-                test_dataset, batch_size=batch_size, sampler=test_sampler, shuffle=False
+                test_dataset,
+                batch_size=batch_size,
+                sampler=test_sampler,
+                shuffle=False,
+                **loader_kwargs,
             )
         else:
-            self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+            self.test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+        if self.is_master:
+            log.info(
+                "DataLoader: num_workers=%d | prefetch_factor=%s | pin_memory=%s | "
+                "persistent_workers=false",
+                num_workers,
+                (
+                    int(getattr(self.task_cfg, "prefetch_factor", 2))
+                    if num_workers > 0
+                    else "disabled"
+                ),
+                self.device.type == "cuda",
+            )
 
     # ------------------------------------------------------------------
     # Model
@@ -670,29 +795,15 @@ class DrugRespRunner:
                 f"Unsupported finetune_mode '{finetune_mode}'. Expected one of {sorted(valid_modes)}."
             )
 
-        backbone = PerformerLM(
-            num_tokens=self.vocab_size,
-            max_seq_len=int(self.model_cfg.gene_num) + 1,
-            dim=int(self.model_cfg.dim),
-            depth=int(self.model_cfg.depth),
-            heads=int(self.model_cfg.heads),
-            dim_head=int(self.model_cfg.dim_head),
-            ff_mult=int(self.model_cfg.ff_mult),
-            nb_features=self.model_cfg.nb_features,
-            feature_redraw_interval=int(self.model_cfg.feature_redraw_interval),
-            ff_chunks=int(self.model_cfg.ff_chunks),
-            ff_glu=bool(self.model_cfg.ff_glu),
-            emb_dropout=float(self.model_cfg.emb_dropout),
-            ff_dropout=float(self.model_cfg.ff_dropout),
-            attn_dropout=float(self.model_cfg.attn_dropout),
-            use_scalenorm=bool(self.model_cfg.use_scalenorm),
-            use_rezero=bool(self.model_cfg.use_rezero),
-            no_projection=bool(self.model_cfg.no_projection),
-            tie_embed=bool(self.model_cfg.tie_embed),
-            g2v_position_emb=bool(self.model_cfg.g2v_position_emb),
-            auto_check_redraw=bool(self.model_cfg.auto_check_redraw),
-            qkv_bias=bool(self.model_cfg.qkv_bias),
-            embx_bin_num=int(self.model_cfg.bin_num) if str(getattr(self.model_cfg, "loss_type", "ce")).lower() == "mse" else None,
+        backbone = CancerFoundationBackbone(
+            num_gene_tokens=self.num_gene_tokens,
+            d_model=int(self.model_cfg.embsize),
+            nhead=int(self.model_cfg.nheads),
+            d_hid=int(self.model_cfg.d_hid),
+            nlayers=int(self.model_cfg.nlayers),
+            dropout=float(self.model_cfg.dropout),
+            pad_gene_id=self.pad_gene_id,
+            max_value=int(getattr(self.model_cfg, "value_encoder_max_value", 512)),
         )
 
         if checkpoint_path:
@@ -704,14 +815,13 @@ class DrugRespRunner:
         else:
             log.info("Using randomly initialized backbone")
 
-        # Replace to_out with Identity so backbone returns (B, seq_len, dim)
-        backbone.to_out = nn.Identity()
-
+        cell_pooling = str(getattr(self.task_cfg, "cell_pooling", "cls"))
+        cell_emb_dim = int(self.model_cfg.embsize) * (2 if cell_pooling == "mean_cls" else 1)
         head = DrugRespPredHead(
-            cell_emb_dim=int(self.model_cfg.dim),
+            cell_emb_dim=cell_emb_dim,
             drug_emb_dim=drug_emb_dim,
-            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
-            dropout=float(getattr(self.task_cfg, "head_dropout", 0.0)),
+            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
         )
 
         if finetune_mode == "adapters":
@@ -722,7 +832,19 @@ class DrugRespRunner:
                 after_ff=bool(getattr(self.task_cfg, "adapter_after_ff", True)),
             )
 
-        model = DrugRespModel(backbone, head)
+        model = DrugRespModel(
+            backbone,
+            head,
+            cell_pooling=cell_pooling,
+        )
+        if self.is_master:
+            log.info(
+                "Drug response cell pooling: %s | fusion head dims: %d -> %d -> %d -> 1",
+                model.cell_pooling,
+                cell_emb_dim + drug_emb_dim,
+                int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+                int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
+            )
 
         if finetune_mode == "head_only":
             for param in model.backbone.parameters():
@@ -830,22 +952,23 @@ class DrugRespRunner:
         all_embs: list[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, n_cells, infer_batch):
-                rows = X_cell[start : start + infer_batch]
-                seqs = []
-                for i in range(rows.shape[0]):
-                    row = rows[i]
-                    if sparse.issparse(row):
-                        arr = row.toarray().ravel()
-                    else:
-                        arr = np.asarray(row).ravel()
-                    arr = np.append(arr, self.special_token_id)
-                    seqs.append(torch.as_tensor(arr, dtype=torch.long))
-                tokens = torch.stack(seqs).to(self.device)
-                h = raw.backbone(tokens)          # (b, seq_len, dim)
-                all_embs.append(h.mean(dim=1).cpu())
+                batch = self._cell_backbone_batch(
+                    X_cell,
+                    np.arange(start, min(start + infer_batch, n_cells)),
+                )
+                batch = {
+                    key: value.to(self.device, non_blocking=True)
+                    for key, value in batch.items()
+                }
+                hidden = raw.backbone(batch["gene_ids"], batch["expr"])
+                all_embs.append(raw.pool_cell_embeddings(hidden).cpu())
         self.cell_emb_cache = torch.cat(all_embs, dim=0).to(self.device)  # (n_cells, dim)
         if self.is_master:
-            log.info("Precomputed cell embeddings: shape %s", tuple(self.cell_emb_cache.shape))
+            log.info(
+                "Precomputed cell embeddings: pooling=%s, shape=%s",
+                raw.cell_pooling,
+                tuple(self.cell_emb_cache.shape),
+            )
 
     # ------------------------------------------------------------------
     # Training and evaluation
@@ -890,16 +1013,20 @@ class DrugRespRunner:
             if self.cell_emb_cache is not None:
                 # head_only: frozen embedding cached once per fold, shape (1, dim)
                 cell_emb = self.cell_emb_cache[cell_idx].unsqueeze(0)
-                tokens_arg = None
+                batch_arg = None
             else:
                 # adapters / full_ft: run backbone once for this cell
-                row = self.X_cell_ref[cell_idx]
-                arr = row.toarray().ravel() if sparse.issparse(row) else np.asarray(row).ravel()
-                arr = np.append(arr, self.special_token_id)
-                tokens_arg = torch.as_tensor(arr, dtype=torch.long).unsqueeze(0).to(self.device)
+                batch_arg = self._cell_backbone_batch(
+                    self.X_cell_ref,
+                    np.asarray([cell_idx]),
+                )
+                batch_arg = {
+                    key: value.to(self.device, non_blocking=True)
+                    for key, value in batch_arg.items()
+                }
                 cell_emb = None
 
-            preds = self.model(tokens_arg, drug_embs_t, cell_emb)  # (n_pairs,)
+            preds = self.model(batch_arg, drug_embs_t, cell_emb)  # (n_pairs,)
             loss = F.mse_loss(preds, targets_t)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
@@ -924,14 +1051,18 @@ class DrugRespRunner:
             dist.barrier()
 
         with torch.no_grad():
-            for cell_idxs_b, tokens, drug_emb, targets in self.test_loader:
+            for cell_idxs_b, batch, drug_emb, targets in self.test_loader:
                 drug_emb = drug_emb.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 if self.cell_emb_cache is not None:
                     cell_emb = self.cell_emb_cache[cell_idxs_b.to(self.device)]
                     preds = self.model(None, drug_emb, cell_emb)    # (B,)
                 else:
-                    preds = self.model(tokens.to(self.device, non_blocking=True), drug_emb)    # (B,)
+                    batch = {
+                        key: value.to(self.device, non_blocking=True)
+                        for key, value in batch.items()
+                    }
+                    preds = self.model(batch, drug_emb)    # (B,)
                 loss = F.mse_loss(preds, targets)
                 running_loss += loss.item()
                 all_preds.append(preds)
@@ -1068,6 +1199,7 @@ class DrugRespRunner:
         self.optimizer = None
         self.scheduler = None
         self.cell_emb_cache = None
+        self.fold_gene_indices = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1085,6 +1217,10 @@ class DrugRespRunner:
             drug_emb_dim = drug_emb_matrix.shape[1]
             n_pairs = len(ic50_values)
             splits = self._build_cv_splits(n_pairs)
+            fold_hvg_indices = [
+                self._select_training_hvg_indices(X_cell, cell_idxs[train_idx])
+                for train_idx, _ in splits
+            ]
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
 
@@ -1100,7 +1236,7 @@ class DrugRespRunner:
             epochs = int(getattr(self.task_cfg, "epochs", 20))
             aggregate_rows: list[dict] = []
 
-            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+            for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict] = []
                 cell_line_rows: list[dict] = []
 
@@ -1108,9 +1244,10 @@ class DrugRespRunner:
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
                         + self.rank
-                        + model_idx * 10000
                         + fold_idx
                     )
+
+                    self.fold_gene_indices = fold_hvg_indices[fold_idx - 1]
 
                     test_pair_cell_ids = pair_cell_ids[test_idx]
 

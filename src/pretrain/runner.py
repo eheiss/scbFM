@@ -307,6 +307,27 @@ class PreTrainRunner:
 
     def _build_loaders(self, train_indices: np.ndarray, val_indices: np.ndarray | None, data_path: str) -> None:
         batch_size = int(self.pretrain_cfg.batch_size)
+        num_workers = int(getattr(self.pretrain_cfg, "num_workers", 0))
+        if num_workers < 0:
+            raise ValueError("pretrain.num_workers must be non-negative.")
+
+        loader_kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            prefetch_factor = int(getattr(self.pretrain_cfg, "prefetch_factor", 2))
+            if prefetch_factor <= 0:
+                raise ValueError("pretrain.prefetch_factor must be positive.")
+            loader_kwargs.update(
+                {
+                    "prefetch_factor": prefetch_factor,
+                    # Workers must be recreated after dataset.set_epoch() so they
+                    # receive the new epoch used for deterministic gene sampling.
+                    "persistent_workers": False,
+                }
+            )
+
         self.train_dataset = self._new_dataset(data_path, train_indices)
 
         if self.is_distributed:
@@ -321,14 +342,14 @@ class PreTrainRunner:
                 batch_size=batch_size,
                 sampler=train_sampler,
                 shuffle=False,
-                pin_memory=self.device.type == "cuda",
+                **loader_kwargs,
             )
         else:
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                pin_memory=self.device.type == "cuda",
+                **loader_kwargs,
             )
 
         if val_indices is None:
@@ -351,14 +372,14 @@ class PreTrainRunner:
                 batch_size=batch_size,
                 sampler=val_sampler,
                 shuffle=False,
-                pin_memory=self.device.type == "cuda",
+                **loader_kwargs,
             )
         else:
             self.val_loader = DataLoader(
                 self.val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                pin_memory=self.device.type == "cuda",
+                **loader_kwargs,
             )
 
     def _build_model(self) -> None:
@@ -1055,6 +1076,17 @@ class PreTrainRunner:
                 self.gene_sampling,
                 bool(getattr(self.pretrain_cfg, "exclude_masked_from_attention", True)),
                 self.cls_loss_weight,
+            )
+            log.info(
+                "DataLoader: num_workers=%d | prefetch_factor=%s | pin_memory=%s | "
+                "persistent_workers=false",
+                int(getattr(self.pretrain_cfg, "num_workers", 0)),
+                (
+                    int(getattr(self.pretrain_cfg, "prefetch_factor", 2))
+                    if int(getattr(self.pretrain_cfg, "num_workers", 0)) > 0
+                    else "disabled"
+                ),
+                self.device.type == "cuda",
             )
             log.info(
                 "Gene subsets are randomly resampled per sample and epoch from the full "

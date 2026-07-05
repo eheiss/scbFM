@@ -7,6 +7,8 @@ resume_optimizer_state: true
 # training
 epochs: 5
 batch_size: 16
+num_workers: 2
+prefetch_factor: 2
 valid_every: 1
 grad_acc: 4
 max_grad_norm: 1e2

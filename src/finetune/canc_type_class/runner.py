@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -98,21 +99,44 @@ class CancTypePredHead(nn.Module):
         self,
         embedding_dim: int,
         output_dim: int,
+        hidden_dim: int = 256,
+        bottleneck_dim: int = 128,
+        use_cls: bool = False,
+        pooling: str | None = None,
     ) -> None:
         super().__init__()
+        if pooling is None:
+            pooling = "cls" if use_cls else "mean"
+        pooling = str(pooling).lower()
+        if pooling not in {"mean", "cls", "mean_cls"}:
+            raise ValueError(
+                f"Unsupported classification head pooling '{pooling}'. "
+                "Expected one of: mean, cls, mean_cls."
+            )
+        self.pooling = pooling
+        self.use_cls = pooling == "cls"
+        input_dim = embedding_dim * 2 if pooling == "mean_cls" else embedding_dim
         self.mlp = nn.Sequential(
-            nn.Linear(embedding_dim, 256),
+            nn.Linear(input_dim, hidden_dim),
             nn.SELU(),
-            nn.Linear(256, 128),
+            nn.Linear(hidden_dim, bottleneck_dim),
             nn.SELU(),
-            nn.Linear(128, output_dim),
+            nn.Linear(bottleneck_dim, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Position zero is the <cls> token. BulkRNABert does not use a CLS
-        # representation for classification; it mean-pools all gene tokens.
-        mean_gene_embedding = x[:, 1:, :].mean(dim=1)
-        return self.mlp(mean_gene_embedding)
+        # Position zero is the <cls> token. "mean" retains the existing
+        # BulkRNABert-style mean pooling over gene tokens only.
+        if self.pooling == "cls":
+            sample_embedding = x[:, 0, :]
+        elif self.pooling == "mean":
+            sample_embedding = x[:, 1:, :].mean(dim=1)
+        else:
+            sample_embedding = torch.cat(
+                (x[:, 0, :], x[:, 1:, :].mean(dim=1)),
+                dim=-1,
+            )
+        return self.mlp(sample_embedding)
 
 
 class CancerFoundationCancTypeClassifier(nn.Module):
@@ -380,6 +404,7 @@ class CancTypeClassRunner:
         self.optimizer: Adam | None = None
         self.scheduler = None
         self.loss_fn: nn.Module | None = None
+        self.train_class_weights: torch.Tensor | None = None
         self.backbone_optimizer_enabled = False
 
     @staticmethod
@@ -427,8 +452,8 @@ class CancTypeClassRunner:
             "finetune_mode",
             "checkpoint_path",
             "sample_id",
-            "case_id",
-            "project_id",
+            "patient_id",
+            "project",
             "true_label",
         ]
         fieldnames = [
@@ -487,6 +512,7 @@ class CancTypeClassRunner:
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "output_suffix": self._output_suffix(),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
@@ -545,20 +571,25 @@ class CancTypeClassRunner:
             raise FileNotFoundError(f"TCGA h5ad file not found: {data_path}")
 
         adata = ad.read_h5ad(data_path)
-        if "project_id" not in adata.obs:
-            raise ValueError("TCGA AnnData must contain obs['project_id'] to filter cohorts.")
+        required_obs = {"sample_id", "patient_id", "project"}
+        missing_obs = sorted(required_obs.difference(adata.obs.columns))
+        if missing_obs:
+            raise ValueError(f"TCGA AnnData is missing required obs columns: {missing_obs}.")
+
+        adata.obs["project"] = adata.obs["project"].astype(str).str.strip().str.upper()
 
         cohorts = list(getattr(self.task_cfg, "cohorts", DEFAULT_COHORTS))
-        selected_projects = {f"TCGA-{cohort}" for cohort in cohorts}
-        keep_mask = adata.obs["project_id"].astype(str).isin(selected_projects).to_numpy()
+        selected_cancer_types = {str(cohort).upper() for cohort in cohorts}
+        keep_mask = adata.obs["project"].isin(selected_cancer_types).to_numpy()
         adata = adata[keep_mask].copy()
 
         if adata.n_obs == 0:
             raise ValueError(
-                f"No TCGA samples matched cohorts {cohorts} in obs['project_id']."
+                f"No TCGA samples matched cohorts {cohorts} in the project metadata."
             )
 
-        adata.obs["cancer_type"] = adata.obs["project_id"].astype(str).str.removeprefix("TCGA-")
+        adata.obs["cancer_type"] = adata.obs["project"].astype(str)
+        adata.obs_names = adata.obs["sample_id"].astype(str)
         adata.obs_names_make_unique()
         adata.var_names_make_unique()
         return adata
@@ -681,12 +712,11 @@ class CancTypeClassRunner:
         adata = self._preprocess_adata(adata)
         self.label_dict = np.unique(np.asarray(adata.obs["cancer_type"]).astype(str))
         labels = np.asarray(adata.obs["cancer_type"]).astype(str)
+        patient_ids = adata.obs["patient_id"].astype(str).to_numpy()
         groups = None
-        if "case_id" in adata.obs:
-            case_ids = adata.obs["case_id"].astype(str).to_numpy()
-            if len(np.unique(case_ids)) < len(case_ids):
-                groups = case_ids
-                log.info("Duplicate TCGA case_id values detected; using case-grouped CV.")
+        if len(np.unique(patient_ids)) < len(patient_ids):
+            groups = patient_ids
+            log.info("Duplicate TCGA patient_id values detected; using patient-grouped CV.")
         return adata, labels, groups
 
     def _build_cv_splits(
@@ -709,7 +739,8 @@ class CancTypeClassRunner:
             unique_groups = np.unique(groups)
             if n_splits > unique_groups.size:
                 raise ValueError(
-                    f"cv_folds={n_splits} is larger than the number of case_id groups ({unique_groups.size})."
+                    f"cv_folds={n_splits} is larger than the number of patient_id "
+                    f"groups ({unique_groups.size})."
                 )
             if StratifiedGroupKFold is not None:
                 splitter = StratifiedGroupKFold(
@@ -746,7 +777,71 @@ class CancTypeClassRunner:
             dtype=np.int64,
         )
 
+        class_weight_power = float(
+            getattr(self.task_cfg, "class_weight_power", 0.0)
+        )
+        if not np.isfinite(class_weight_power) or class_weight_power < 0:
+            raise ValueError(
+                "class_weight_power must be a finite non-negative number."
+            )
+        if class_weight_power == 0.0:
+            # Preserve the previous behavior exactly rather than passing an
+            # all-ones tensor to CrossEntropyLoss.
+            self.train_class_weights = None
+        else:
+            class_counts = np.bincount(
+                train_labels,
+                minlength=len(self.label_dict),
+            ).astype(np.float64)
+            if np.any(class_counts == 0):
+                missing_labels = self.label_dict[class_counts == 0].tolist()
+                raise ValueError(
+                    "Cannot compute class weights because the training fold "
+                    f"contains no samples for classes {missing_labels}."
+                )
+            balanced_weights = (
+                len(train_labels) / (len(self.label_dict) * class_counts)
+            )
+            class_weights = np.power(balanced_weights, class_weight_power)
+            self.train_class_weights = torch.as_tensor(
+                class_weights,
+                dtype=torch.float32,
+            )
+
+        if self.is_master:
+            if self.train_class_weights is None:
+                log.info("Classification loss: unweighted cross-entropy")
+            else:
+                log.info(
+                    "Classification loss: class-weighted cross-entropy | "
+                    "power=%.3f | weight range=[%.4f, %.4f]",
+                    class_weight_power,
+                    float(self.train_class_weights.min()),
+                    float(self.train_class_weights.max()),
+                )
+
         batch_size = int(getattr(self.task_cfg, "batch_size", 2))
+        num_workers = int(getattr(self.task_cfg, "num_workers", 0))
+        if num_workers < 0:
+            raise ValueError("finetune.canc_type_class.num_workers must be non-negative.")
+
+        loader_kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            prefetch_factor = int(getattr(self.task_cfg, "prefetch_factor", 2))
+            if prefetch_factor <= 0:
+                raise ValueError(
+                    "finetune.canc_type_class.prefetch_factor must be positive."
+                )
+            loader_kwargs.update(
+                {
+                    "prefetch_factor": prefetch_factor,
+                    "persistent_workers": False,
+                }
+            )
+
         random_seed = int(getattr(self.task_cfg, "random_seed", 42))
         do_binning = self._should_preprocess_input()
         # Fit feature selection on the training fold only. Use the resulting
@@ -796,16 +891,41 @@ class CancTypeClassRunner:
                 batch_size=batch_size,
                 sampler=train_sampler,
                 shuffle=False,
+                **loader_kwargs,
             )
             self.test_loader = DataLoader(
                 test_dataset,
                 batch_size=batch_size,
                 sampler=test_sampler,
                 shuffle=False,
+                **loader_kwargs,
             )
         else:
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            )
+            self.test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+
+        if self.is_master:
+            log.info(
+                "DataLoader: num_workers=%d | prefetch_factor=%s | pin_memory=%s | "
+                "persistent_workers=false",
+                num_workers,
+                (
+                    int(getattr(self.task_cfg, "prefetch_factor", 2))
+                    if num_workers > 0
+                    else "disabled"
+                ),
+                self.device.type == "cuda",
+            )
 
     @staticmethod
     def _strip_module_prefix(state_dict: dict) -> dict:
@@ -846,7 +966,25 @@ class CancTypeClassRunner:
         head = CancTypePredHead(
             embedding_dim=int(self.model_cfg.embsize),
             output_dim=len(self.label_dict),
+            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+            use_cls=bool(getattr(self.task_cfg, "use_cls", False)),
+            pooling=getattr(self.task_cfg, "head_pooling", None),
         )
+        if self.is_master:
+            representation = {
+                "cls": "CLS token",
+                "mean": "mean-pooled gene tokens",
+                "mean_cls": "CLS token + mean-pooled gene tokens",
+            }[head.pooling]
+            log.info(
+                "Classification representation: %s | head dims: %d -> %d -> %d -> %d",
+                representation,
+                int(self.model_cfg.embsize) * (2 if head.pooling == "mean_cls" else 1),
+                int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+                int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+                len(self.label_dict),
+            )
         model = CancerFoundationCancTypeClassifier(backbone=backbone, head=head)
 
         if finetune_mode == "adapters":
@@ -967,7 +1105,12 @@ class CancTypeClassRunner:
             warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
             gamma=float(getattr(self.task_cfg, "gamma", 0.9)),
         )
-        self.loss_fn = nn.CrossEntropyLoss().to(self.device)
+        loss_weights = (
+            None
+            if self.train_class_weights is None
+            else self.train_class_weights.to(self.device)
+        )
+        self.loss_fn = nn.CrossEntropyLoss(weight=loss_weights).to(self.device)
 
         if self.is_master:
             group_summaries = [
@@ -1192,16 +1335,9 @@ class CancTypeClassRunner:
         prediction_indices = np.asarray(test_metrics["prediction_indices"], dtype=int)
         labels = self.label_dict.tolist()
         rows: list[dict[str, object]] = []
-        case_ids = (
-            test_adata.obs["case_id"].astype(str).to_numpy()
-            if "case_id" in test_adata.obs
-            else np.asarray([""] * test_adata.n_obs)
-        )
-        project_ids = (
-            test_adata.obs["project_id"].astype(str).to_numpy()
-            if "project_id" in test_adata.obs
-            else np.asarray([""] * test_adata.n_obs)
-        )
+        patient_ids = test_adata.obs["patient_id"].astype(str).to_numpy()
+        projects = test_adata.obs["project"].astype(str).to_numpy()
+        sample_ids = test_adata.obs["sample_id"].astype(str).to_numpy()
         for idx, (truth_idx, pred_idx) in enumerate(zip(truth_indices, prediction_indices)):
             rows.append(
                 {
@@ -1209,9 +1345,9 @@ class CancTypeClassRunner:
                     "fold": fold,
                     "finetune_mode": self._finetune_mode(),
                     "checkpoint_path": checkpoint_path,
-                    "sample_id": str(test_adata.obs_names[idx]),
-                    "case_id": case_ids[idx],
-                    "project_id": project_ids[idx],
+                    "sample_id": sample_ids[idx],
+                    "patient_id": patient_ids[idx],
+                    "project": projects[idx],
                     "true_idx": int(truth_idx),
                     "pred_idx": int(pred_idx),
                     "true_label": labels[int(truth_idx)],
@@ -1237,13 +1373,30 @@ class CancTypeClassRunner:
         self._write_csv(path, rows)
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return ROOT / "output" / self.task_name / self._output_variant()
 
     def _output_prefix(self) -> str:
-        return f"{self.task_name}_{self._finetune_mode()}"
+        return f"{self.task_name}_{self._output_variant()}"
 
     def _finetune_mode(self) -> str:
         return str(getattr(self.task_cfg, "finetune_mode", "head_only"))
+
+    def _output_suffix(self) -> str:
+        configured = getattr(self.task_cfg, "output_suffix", "")
+        suffix = "" if configured is None else str(configured).strip()
+        if suffix and re.fullmatch(r"[A-Za-z0-9_-]+", suffix) is None:
+            raise ValueError(
+                "output_suffix may contain only letters, numbers, underscores, and hyphens."
+            )
+        return suffix
+
+    def _output_variant(self) -> str:
+        suffix = self._output_suffix()
+        return (
+            f"{self._finetune_mode()}_{suffix}"
+            if suffix
+            else self._finetune_mode()
+        )
 
     def _write_model_results(
         self,
@@ -1280,6 +1433,7 @@ class CancTypeClassRunner:
         self.optimizer = None
         self.scheduler = None
         self.loss_fn = None
+        self.train_class_weights = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1301,7 +1455,7 @@ class CancTypeClassRunner:
             epochs = int(getattr(self.task_cfg, "epochs", 10))
             aggregate_rows: list[dict[str, object]] = []
 
-            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+            for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict[str, object]] = []
                 prediction_rows: list[dict[str, object]] = []
                 confusion_matrices: list[np.ndarray] = []
@@ -1309,7 +1463,6 @@ class CancTypeClassRunner:
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
                         + self.rank
-                        + model_idx * 10000
                         + fold_idx
                     )
                     train_adata = adata[train_idx].copy()

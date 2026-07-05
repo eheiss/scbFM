@@ -6,6 +6,8 @@ pretrained_model_paths:
 tcga_data_dir:
 gene_list_path: ../data/gene_list.txt
 
+# Same TCGA AnnData source as cancer type classification, but defaulting to
+# the 33 TCGA cancer cohorts used for BulkFormer prognosis modeling.
 cohorts:
   - ACC
   - BLCA
@@ -43,22 +45,20 @@ cohorts:
 merge_gbm_lgg: false
 preprocess: true
 min_genes: 200
-# Fold-level HVGs are fitted on training data and reused for training and
-# evaluation. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger
 hvg_batch_key:
-# Use the CancerFoundation CLS embedding plus mean-pooled gene embeddings as
-# input to the classification MLP.
-use_cls: true
+
+# BulkFormer-style binary prognosis endpoint for AUROC comparison:
+# classify OS event/status directly, 1 = event/deceased, 0 = censored/alive.
+survival_event_col: OS
+survival_time_col: OS.time
+
 head_pooling: mean_cls
-# Slightly larger classification head for the harder 33-class task:
-# 2 * embsize -> 512 -> 256 -> n_classes.
-head_hidden_dim: 512
-head_bottleneck_dim: 256
 cv_folds: 5
 random_seed: 42
 
 finetune_mode: head_only
+output_suffix: ""
 burn_in_epochs: 3
 adapter_bottleneck_dim: 32
 adapter_dropout: 0.0
@@ -70,8 +70,9 @@ batch_size: 4
 num_workers: 2
 prefetch_factor: 2
 grad_accumulation_steps: 4
-# 1.0 uses inverse-frequency balanced cross-entropy.
 class_weight_power: 1.0
+head_hidden_dim: 512
+head_bottleneck_dim: 256
 head_learning_rate: 1e-4
 backbone_learning_rate: 1e-4
 max_grad_norm: 1e6

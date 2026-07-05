@@ -10,34 +10,25 @@ disignatlas_data_path: /cluster/work/boeva/eheiss/datasets/DiSignAtlas/disignatl
 
 # Disease label column in adata.obs
 disease_label_col: label      # obs column containing the disease class label
+binary_label_col: binary_label
 
-# Data preprocessing (preprocess=true re-normalises and quantile-bins raw float values)
+# Raw values are aligned here; the selected 1,199-gene sequence is quantile-binned
+# deterministically inside each DataLoader worker.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
 min_genes: 200
-
-# Model architecture (must match the pretrained checkpoints)
-bin_num: 10
-gene_num: 11964
-dim: 200
-depth: 6
-heads: 10
-dim_head: 64
-ff_mult: 4
-nb_features:
-feature_redraw_interval: 1000
-ff_chunks: 1
-ff_glu: false
-emb_dropout: 0.
-ff_dropout: 0.
-attn_dropout: 0.
-use_scalenorm: false
-use_rezero: false
-no_projection: false
-tie_embed: false
-g2v_position_emb: false
-auto_check_redraw: true
-qkv_bias: true
+# Fold-level HVGs are fitted on training data and reused for training and
+# evaluation. Their count comes from pretrain.selected_gene_count (1199).
+hvg_flavor: cell_ranger
+hvg_batch_key:
+use_cls: true
+# Explicitly use CLS concatenated with mean-pooled gene-token embeddings.
+# This overrides the legacy use_cls switch in the shared classification head.
+head_pooling: mean_cls
+# Slightly larger classification head for the multi-class disease task:
+# 2 * embsize -> 512 -> 256 -> n_classes.
+head_hidden_dim: 512
+head_bottleneck_dim: 256
 
 # Finetuning mode
 finetune_mode: head_only       # head_only | adapters | full_ft
@@ -48,17 +39,17 @@ adapter_learning_rate: 1e-4
 adapter_after_attention: true
 adapter_after_ff: true
 
-# Classification head
-head_hidden_dim: 128
-head_dropout: 0.1
-
 # Training
 cv_folds: 5
 epochs: 20
 batch_size: 4
+num_workers: 2
+prefetch_factor: 2
 grad_accumulation_steps: 4
+# 1.0 uses inverse-frequency balanced cross-entropy.
+class_weight_power: 1.0
 head_learning_rate: 1e-4
-backbone_learning_rate: 1e-6
+backbone_learning_rate: 1e-4
 max_grad_norm: 1e6
 random_seed: 42
 

@@ -10,6 +10,8 @@ from finetune.disease_class import DiseaseClassRunner
 from finetune.drug_resp import DrugRespRunner
 from finetune.gene_essent import GeneEssentRunner
 from finetune.surv_pred import SurvPredRunner
+from finetune.surv_pred_binary import SurvPredBinaryRunner
+from finetune.surv_pred_survboard import SurvPredSurvBoardRunner
 from pretrain import PreTrainRunner
 
 
@@ -27,6 +29,10 @@ def main(cfg: DictConfig):
         runner = DeconvRunner(cfg)
     elif task_name == "finetune.surv_pred":
         runner = SurvPredRunner(cfg)
+    elif task_name == "finetune.surv_pred_survboard":
+        runner = SurvPredSurvBoardRunner(cfg)
+    elif task_name == "finetune.surv_pred_binary":
+        runner = SurvPredBinaryRunner(cfg)
     elif task_name == "finetune.disease_class":
         runner = DiseaseClassRunner(cfg)
     elif task_name == "finetune.gene_essent":
@@ -38,7 +44,8 @@ def main(cfg: DictConfig):
             f"Unsupported task '{task_name}'. "
             "Expected one of: ['pretrain', 'finetune.canc_type_class', "
             "'finetune.canc_type_class_33', 'finetune.deconv', 'finetune.surv_pred', "
-            "'finetune.disease_class', 'finetune.gene_essent', 'finetune.drug_resp']."
+            "'finetune.surv_pred_survboard', 'finetune.surv_pred_binary', 'finetune.disease_class', "
+            "'finetune.gene_essent', 'finetune.drug_resp']."
         )
     results = runner.run()
 

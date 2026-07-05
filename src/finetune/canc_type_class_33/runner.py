@@ -120,20 +120,25 @@ class CancTypeClass33Runner(CancTypeClassRunner):
             raise FileNotFoundError(f"TCGA h5ad file not found: {data_path}")
 
         adata = ad.read_h5ad(data_path)
-        if "project_id" not in adata.obs:
-            raise ValueError("TCGA AnnData must contain obs['project_id'] to filter cohorts.")
+        required_obs = {"sample_id", "patient_id", "project"}
+        missing_obs = sorted(required_obs.difference(adata.obs.columns))
+        if missing_obs:
+            raise ValueError(f"TCGA AnnData is missing required obs columns: {missing_obs}.")
+
+        adata.obs["project"] = adata.obs["project"].astype(str).str.strip().str.upper()
 
         cohorts = list(getattr(self.task_cfg, "cohorts", self.default_cohorts))
-        selected_projects = {f"TCGA-{cohort}" for cohort in cohorts}
-        keep_mask = adata.obs["project_id"].astype(str).isin(selected_projects).to_numpy()
+        selected_cancer_types = {str(cohort).upper() for cohort in cohorts}
+        keep_mask = adata.obs["project"].isin(selected_cancer_types).to_numpy()
         adata = adata[keep_mask].copy()
 
         if adata.n_obs == 0:
             raise ValueError(
-                f"No TCGA samples matched cohorts {cohorts} in obs['project_id']."
+                f"No TCGA samples matched cohorts {cohorts} in the project metadata."
             )
 
-        adata.obs["cancer_type"] = adata.obs["project_id"].astype(str).str.removeprefix("TCGA-")
+        adata.obs["cancer_type"] = adata.obs["project"].astype(str)
+        adata.obs_names = adata.obs["sample_id"].astype(str)
         adata.obs_names_make_unique()
         adata.var_names_make_unique()
         return adata

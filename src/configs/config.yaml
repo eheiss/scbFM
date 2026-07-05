@@ -5,6 +5,8 @@ defaults:
   - finetune@finetune.canc_type_class_33: canc_type_class_33
   - finetune@finetune.deconv: deconv
   - finetune@finetune.surv_pred: surv_pred
+  - finetune@finetune.surv_pred_survboard: surv_pred_survboard
+  - finetune@finetune.surv_pred_binary: surv_pred_binary
   - finetune@finetune.disease_class: disease_class
   - finetune@finetune.gene_essent: gene_essent
   - finetune@finetune.drug_resp: drug_resp

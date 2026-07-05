@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
+import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -25,9 +27,12 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from finetune.canc_type_class.runner import GroupedCosineAnnealingWarmupRestarts
-from performer_pytorch import PerformerLM
-from preprocess import preprocess_adata_for_tokens, reindex_adata_genes, validate_token_matrix
+from cancerfoundation_backbone import CancerFoundationBackbone
+from finetune.canc_type_class.runner import (
+    GroupedCosineAnnealingWarmupRestarts,
+    _quantile_bin_expression,
+)
+from preprocess import filter_min_genes, reindex_adata_genes, validate_token_matrix
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -47,35 +52,65 @@ MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
 class DeconvPredHead(nn.Module):
     def __init__(
         self,
-        seq_len: int,
         embedding_dim: int,
         output_dim: int,
-        hidden_dim: int = 128,
-        dropout: float = 0.0,
+        hidden_dim: int = 256,
+        bottleneck_dim: int = 128,
+        pooling: str = "mean",
     ) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 1, (1, embedding_dim))
-        self.act = nn.ReLU()
-        self.fc1 = nn.Linear(seq_len, 512, bias=True)
-        self.act1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(512, hidden_dim, bias=True)
-        self.act2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-        self.fc3 = nn.Linear(hidden_dim, output_dim, bias=True)
+        valid_pooling = {"mean", "cls", "mean_cls"}
+        if pooling not in valid_pooling:
+            raise ValueError(
+                f"Unsupported deconvolution head pooling '{pooling}'. "
+                f"Expected one of {sorted(valid_pooling)}."
+            )
+        self.pooling = pooling
+        input_dim = embedding_dim * 2 if pooling == "mean_cls" else embedding_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.SELU(),
+            nn.Linear(bottleneck_dim, output_dim),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x[:, None, :, :]
-        x = self.conv1(x)
-        x = self.act(x)
-        x = x.view(x.shape[0], -1)
-        x = self.fc1(x)
-        x = self.act1(x)
-        x = self.dropout1(x)
-        x = self.fc2(x)
-        x = self.act2(x)
-        x = self.dropout2(x)
-        return self.fc3(x)
+        # Position zero is the <cls> token. The default keeps the previous
+        # mean-pooling behavior; mean_cls concatenates the global CLS summary
+        # with the pooled gene-token signal.
+        mean_gene_embedding = x[:, 1:, :].mean(dim=1)
+        if self.pooling == "mean":
+            sample_embedding = mean_gene_embedding
+        elif self.pooling == "cls":
+            sample_embedding = x[:, 0, :]
+        else:
+            sample_embedding = torch.cat((x[:, 0, :], mean_gene_embedding), dim=-1)
+        return self.mlp(sample_embedding)
+
+
+class CancerFoundationDeconvModel(nn.Module):
+    def __init__(self, backbone: CancerFoundationBackbone, head: DeconvPredHead) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.to_out = head
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        hidden = self.backbone(
+            batch["gene_ids"],
+            batch["expr"],
+            src_key_padding_mask=batch.get("attention_key_padding_mask"),
+        )
+        return self.to_out(hidden)
+
+    def add_adapters(self, **kwargs) -> nn.ModuleList:
+        return self.backbone.add_adapters(**kwargs)
+
+    def adapter_parameters(self) -> list[nn.Parameter]:
+        return self.backbone.adapter_parameters()
+
+    def enable_grad_checkpoint(self) -> None:
+        self.backbone.enable_grad_checkpoint()
 
 
 class DeconvDataset(Dataset):
@@ -84,7 +119,13 @@ class DeconvDataset(Dataset):
         data,
         targets: np.ndarray,
         bin_num: int,
-        special_token_id: int,
+        cls_gene_id: int,
+        gene_token_offset: int,
+        cls_value: float,
+        selected_gene_count: int,
+        seed: int,
+        do_binning: bool,
+        fixed_gene_indices: np.ndarray,
     ) -> None:
         self.data = data
         targets = np.asarray(targets, dtype=np.float32)
@@ -92,24 +133,48 @@ class DeconvDataset(Dataset):
         if np.any(target_sums <= 0):
             raise ValueError("Every deconvolution target row must have a positive sum.")
         self.targets = targets / target_sums
-        self.bin_num = bin_num
-        self.special_token_id = special_token_id
+        self.bin_num = int(bin_num)
+        self.cls_gene_id = int(cls_gene_id)
+        self.gene_token_offset = int(gene_token_offset)
+        self.cls_value = float(cls_value)
+        self.selected_gene_count = int(selected_gene_count)
+        self.seed = int(seed)
+        self.do_binning = bool(do_binning)
+        self.fixed_gene_indices = np.asarray(fixed_gene_indices, dtype=np.int64)
+
+        if self.fixed_gene_indices.shape != (self.selected_gene_count,):
+            raise ValueError(
+                "fixed_gene_indices must contain exactly "
+                f"{self.selected_gene_count} genes."
+            )
 
     def __len__(self) -> int:
         return self.data.shape[0]
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         row = self.data[index]
         if sparse.issparse(row):
-            full_seq = row.toarray().ravel()
+            values = row.toarray().ravel()
         else:
-            full_seq = np.asarray(row).ravel()
-        full_seq = torch.as_tensor(full_seq, dtype=torch.long)
-        full_seq = torch.cat(
-            (full_seq, torch.tensor([self.special_token_id], dtype=torch.long))
+            values = np.asarray(row).ravel()
+
+        selected_values = values[self.fixed_gene_indices].astype(np.float32, copy=False)
+        if self.do_binning:
+            rng = np.random.default_rng(self.seed + index)
+            selected_values = _quantile_bin_expression(
+                selected_values,
+                self.bin_num,
+                rng,
+            ).astype(np.float32)
+
+        gene_ids = torch.from_numpy(
+            self.fixed_gene_indices.astype(np.int64, copy=False) + self.gene_token_offset
         )
+        gene_ids = torch.cat((torch.tensor([self.cls_gene_id]), gene_ids))
+        expression = torch.from_numpy(selected_values)
+        expression = torch.cat((torch.tensor([self.cls_value]), expression))
         target = torch.from_numpy(self.targets[index]).float()
-        return full_seq, target
+        return {"gene_ids": gene_ids, "expr": expression}, target
 
 
 class DeconvRunner:
@@ -127,15 +192,27 @@ class DeconvRunner:
         self.is_master = self.rank == 0
         self.device = torch.device("cpu")
 
-        self.class_count = int(self.model_cfg.bin_num) + 2
-        self.vocab_size = self.class_count + 1
-        self.special_token_id = self.class_count
+        self.cls_gene_id = 0
+        self.pad_gene_id = 1
+        self.gene_token_offset = 2
+        self.num_gene_tokens = int(self.model_cfg.gene_num) + self.gene_token_offset
+        self.cls_value = float(getattr(self.model_cfg, "pad_value", -2.0))
+        self.selected_gene_count = int(getattr(self.model_cfg, "selected_gene_count", 1199))
+        self.max_seq_len = int(
+            getattr(self.model_cfg, "max_seq_len", self.selected_gene_count + 1)
+        )
+        if self.max_seq_len != self.selected_gene_count + 1:
+            raise ValueError(
+                "Deconvolution expects max_seq_len to equal selected_gene_count + 1 "
+                "for the <cls> token."
+            )
 
         self.cell_types: list[str] = []
         self.target_columns: list[str] = []
         self.train_loader: DataLoader | None = None
         self.test_loader: DataLoader | None = None
         self.test_dataset_size = 0
+        self.fold_train_target_mean: np.ndarray | None = None
         self.model: nn.Module | None = None
         self.optimizer: Adam | None = None
         self.scheduler = None
@@ -241,6 +318,12 @@ class DeconvRunner:
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "output_suffix": self._output_suffix(),
+                "head_pooling": str(getattr(self.task_cfg, "head_pooling", "mean")),
+                "head_hidden_dim": int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+                "head_bottleneck_dim": int(
+                    getattr(self.task_cfg, "head_bottleneck_dim", 128)
+                ),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "git_commit": self._get_git_commit(),
                 "checkpoint_paths": checkpoint_paths,
@@ -456,15 +539,16 @@ class DeconvRunner:
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
         if self._should_preprocess_input():
-            adata, missing_genes = preprocess_adata_for_tokens(
+            adata, missing_genes = reindex_adata_genes(
+                adata, gene_list_path=self._resolve_gene_list_path()
+            )
+            adata = filter_min_genes(
                 adata,
-                gene_list_path=self._resolve_gene_list_path(),
                 min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-                bin_num=int(self.model_cfg.bin_num),
-                reindex_genes=bool(getattr(self.task_cfg, "reindex_genes", True)),
             )
             log.info(
-                "Applied shared raw preprocessing: %d target genes missing, output shape %s",
+                "Aligned raw input for on-the-fly sequence binning: "
+                "%d target genes missing, output shape %s",
                 len(missing_genes),
                 adata.shape,
             )
@@ -491,7 +575,12 @@ class DeconvRunner:
                 f"Expected {expected_gene_num} genes for the scbFM backbone, got {adata.n_vars}."
             )
 
-        validate_token_matrix(adata.X, bin_num=int(self.model_cfg.bin_num), name="deconvolution input data")
+        if not self._should_preprocess_input():
+            validate_token_matrix(
+                adata.X,
+                bin_num=int(self.model_cfg.bin_num),
+                name="deconvolution input data",
+            )
         groups = None
         if bool(getattr(self.task_cfg, "split_by_context", True)):
             context_columns = list(
@@ -505,6 +594,56 @@ class DeconvRunner:
             groups = adata.obs[context_columns].astype(str).agg("||".join, axis=1).to_numpy()
 
         return adata, targets, groups
+
+    def _select_training_hvg_indices(self, adata: ad.AnnData) -> np.ndarray:
+        """Fit the fixed sequence vocabulary on the training fold only."""
+        if adata.n_vars < self.selected_gene_count:
+            raise ValueError(
+                f"Cannot select {self.selected_gene_count} HVGs from only {adata.n_vars} genes."
+            )
+
+        batch_key = getattr(self.task_cfg, "hvg_batch_key", None)
+        if batch_key is not None:
+            batch_key = str(batch_key).strip() or None
+        if batch_key is not None and batch_key not in adata.obs:
+            raise ValueError(f"HVG batch key '{batch_key}' is not present in adata.obs.")
+
+        hvg_stats = sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=self.selected_gene_count,
+            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            batch_key=batch_key,
+            inplace=False,
+        )
+        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
+
+        if selected.size > self.selected_gene_count:
+            ranking_column = (
+                "highly_variable_rank"
+                if "highly_variable_rank" in hvg_stats
+                else "dispersions_norm"
+            )
+            scores = hvg_stats[ranking_column].to_numpy()[selected]
+            if ranking_column == "highly_variable_rank":
+                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
+            else:
+                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
+            selected = selected[order[: self.selected_gene_count]]
+
+        if selected.size != self.selected_gene_count:
+            raise RuntimeError(
+                f"Scanpy selected {selected.size} HVGs; "
+                f"expected exactly {self.selected_gene_count}."
+            )
+
+        log.info(
+            "Selected %d training-fold HVGs for training and evaluation "
+            "with flavor=%s, batch_key=%s",
+            selected.size,
+            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            batch_key,
+        )
+        return selected.astype(np.int64, copy=False)
 
     def _build_cv_splits(
         self,
@@ -541,17 +680,58 @@ class DeconvRunner:
         test_targets: np.ndarray,
     ) -> None:
         batch_size = int(getattr(self.task_cfg, "batch_size", 2))
+        num_workers = int(getattr(self.task_cfg, "num_workers", 0))
+        if num_workers < 0:
+            raise ValueError("finetune.deconv.num_workers must be non-negative.")
+
+        loader_kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            prefetch_factor = int(getattr(self.task_cfg, "prefetch_factor", 2))
+            if prefetch_factor <= 0:
+                raise ValueError("finetune.deconv.prefetch_factor must be positive.")
+            loader_kwargs.update(
+                {
+                    "prefetch_factor": prefetch_factor,
+                    "persistent_workers": False,
+                }
+            )
+
+        random_seed = int(getattr(self.task_cfg, "random_seed", 42))
+        do_binning = self._should_preprocess_input()
+        fold_hvg_indices = self._select_training_hvg_indices(train_adata)
+        train_target_sums = train_targets.sum(axis=1, keepdims=True)
+        if np.any(train_target_sums <= 0):
+            raise ValueError("Every deconvolution target row must have a positive sum.")
+        self.fold_train_target_mean = np.mean(
+            train_targets / train_target_sums,
+            axis=0,
+        )
         train_dataset = DeconvDataset(
             train_adata.X,
             train_targets,
             bin_num=int(self.model_cfg.bin_num),
-            special_token_id=self.special_token_id,
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.cls_value,
+            selected_gene_count=self.selected_gene_count,
+            seed=random_seed,
+            do_binning=do_binning,
+            fixed_gene_indices=fold_hvg_indices,
         )
         test_dataset = DeconvDataset(
             test_adata.X,
             test_targets,
             bin_num=int(self.model_cfg.bin_num),
-            special_token_id=self.special_token_id,
+            cls_gene_id=self.cls_gene_id,
+            gene_token_offset=self.gene_token_offset,
+            cls_value=self.cls_value,
+            selected_gene_count=self.selected_gene_count,
+            seed=random_seed,
+            do_binning=do_binning,
+            fixed_gene_indices=fold_hvg_indices,
         )
         self.test_dataset_size = len(test_dataset)
 
@@ -573,16 +753,41 @@ class DeconvRunner:
                 batch_size=batch_size,
                 sampler=train_sampler,
                 shuffle=False,
+                **loader_kwargs,
             )
             self.test_loader = DataLoader(
                 test_dataset,
                 batch_size=batch_size,
                 sampler=test_sampler,
                 shuffle=False,
+                **loader_kwargs,
             )
         else:
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            )
+            self.test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+
+        if self.is_master:
+            log.info(
+                "DataLoader: num_workers=%d | prefetch_factor=%s | pin_memory=%s | "
+                "persistent_workers=false",
+                num_workers,
+                (
+                    int(getattr(self.task_cfg, "prefetch_factor", 2))
+                    if num_workers > 0
+                    else "disabled"
+                ),
+                self.device.type == "cuda",
+            )
 
     def _build_model(self, checkpoint_path: str) -> None:
         finetune_mode = self._finetune_mode()
@@ -592,47 +797,48 @@ class DeconvRunner:
                 f"Unsupported finetune_mode '{finetune_mode}'. Expected one of {sorted(valid_modes)}."
             )
 
-        model = PerformerLM(
-            num_tokens=self.vocab_size,
-            max_seq_len=int(self.model_cfg.gene_num) + 1,
-            dim=int(self.model_cfg.dim),
-            depth=int(self.model_cfg.depth),
-            heads=int(self.model_cfg.heads),
-            dim_head=int(self.model_cfg.dim_head),
-            ff_mult=int(self.model_cfg.ff_mult),
-            nb_features=self.model_cfg.nb_features,
-            feature_redraw_interval=int(self.model_cfg.feature_redraw_interval),
-            ff_chunks=int(self.model_cfg.ff_chunks),
-            ff_glu=bool(self.model_cfg.ff_glu),
-            emb_dropout=float(self.model_cfg.emb_dropout),
-            ff_dropout=float(self.model_cfg.ff_dropout),
-            attn_dropout=float(self.model_cfg.attn_dropout),
-            use_scalenorm=bool(self.model_cfg.use_scalenorm),
-            use_rezero=bool(self.model_cfg.use_rezero),
-            no_projection=bool(self.model_cfg.no_projection),
-            tie_embed=bool(self.model_cfg.tie_embed),
-            g2v_position_emb=bool(self.model_cfg.g2v_position_emb),
-            auto_check_redraw=bool(self.model_cfg.auto_check_redraw),
-            qkv_bias=bool(self.model_cfg.qkv_bias),
-            embx_bin_num=int(self.model_cfg.bin_num) if str(getattr(self.model_cfg, "loss_type", "ce")).lower() == "mse" else None,
+        backbone = CancerFoundationBackbone(
+            num_gene_tokens=self.num_gene_tokens,
+            d_model=int(self.model_cfg.embsize),
+            nhead=int(self.model_cfg.nheads),
+            d_hid=int(self.model_cfg.d_hid),
+            nlayers=int(self.model_cfg.nlayers),
+            dropout=float(self.model_cfg.dropout),
+            pad_gene_id=self.pad_gene_id,
+            max_value=int(getattr(self.model_cfg, "value_encoder_max_value", 512)),
         )
 
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
-            model.load_state_dict(state_dict)
+            backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
         else:
             log.info("Using randomly initialized backbone")
 
-        model.to_out = DeconvPredHead(
-            seq_len=int(self.model_cfg.gene_num) + 1,
-            embedding_dim=int(self.model_cfg.dim),
+        head = DeconvPredHead(
+            embedding_dim=int(self.model_cfg.embsize),
             output_dim=len(self.cell_types),
-            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 128)),
-            dropout=float(getattr(self.task_cfg, "head_dropout", 0.0)),
+            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+            pooling=str(getattr(self.task_cfg, "head_pooling", "mean")),
         )
+        if self.is_master:
+            input_dim = (
+                int(self.model_cfg.embsize) * 2
+                if head.pooling == "mean_cls"
+                else int(self.model_cfg.embsize)
+            )
+            log.info(
+                "Deconvolution head pooling: %s | head dims: %d -> %d -> %d -> %d",
+                head.pooling,
+                input_dim,
+                int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+                int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+                len(self.cell_types),
+            )
+        model = CancerFoundationDeconvModel(backbone=backbone, head=head)
 
         if finetune_mode == "adapters":
             model.add_adapters(
@@ -795,7 +1001,10 @@ class DeconvRunner:
         running_loss = 0.0
 
         for step_idx, (data, targets) in enumerate(self.train_loader, start=1):
-            data = data.to(self.device, non_blocking=True)
+            data = {
+                key: value.to(self.device, non_blocking=True)
+                for key, value in data.items()
+            }
             targets = targets.to(self.device, non_blocking=True)
 
             use_no_sync = (
@@ -922,7 +1131,10 @@ class DeconvRunner:
 
         with torch.no_grad():
             for data, targets in self.test_loader:
-                data = data.to(self.device, non_blocking=True)
+                data = {
+                    key: value.to(self.device, non_blocking=True)
+                    for key, value in data.items()
+                }
                 targets = targets.to(self.device, non_blocking=True)
                 logits = self.model(data)
                 loss = self._compute_loss(logits, targets)
@@ -945,6 +1157,10 @@ class DeconvRunner:
 
         per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
         per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))
+        per_type_prediction_mean = np.mean(predictions_np, axis=0)
+        per_type_prediction_std = np.std(predictions_np, axis=0)
+        per_type_truth_mean = np.mean(truths_np, axis=0)
+        per_type_truth_std = np.std(truths_np, axis=0)
         (
             cell_type_pearson_across_samples,
             cell_type_spearman_across_samples,
@@ -967,6 +1183,17 @@ class DeconvRunner:
             predictions_np,
             truths_np,
         )
+        if self.fold_train_target_mean is None:
+            raise RuntimeError("Training-fold target mean is unavailable during evaluation.")
+        mean_baseline = np.broadcast_to(
+            self.fold_train_target_mean,
+            predictions_np.shape,
+        )
+        (
+            mean_baseline_kl_divergence,
+            mean_baseline_js_distance,
+            mean_baseline_js_divergence,
+        ) = self._distribution_metrics(mean_baseline, truths_np)
         return {
             "loss": float(test_loss),
             "mae": float(mean_absolute_error(truths_np, predictions_np)),
@@ -978,6 +1205,16 @@ class DeconvRunner:
             "kl_divergence": kl_divergence,
             "js_distance": js_distance,
             "js_divergence": js_divergence,
+            "mean_baseline_mae": float(mean_absolute_error(truths_np, mean_baseline)),
+            "mean_baseline_rmse": float(
+                np.sqrt(mean_squared_error(truths_np, mean_baseline))
+            ),
+            "mean_baseline_kl_divergence": mean_baseline_kl_divergence,
+            "mean_baseline_js_distance": mean_baseline_js_distance,
+            "mean_baseline_js_divergence": mean_baseline_js_divergence,
+            "prediction_mae_from_train_mean": float(
+                np.mean(np.abs(predictions_np - mean_baseline))
+            ),
             "per_cell_type_mae": {
                 cell_type: float(value)
                 for cell_type, value in zip(self.cell_types, per_type_mae.tolist())
@@ -985,6 +1222,35 @@ class DeconvRunner:
             "per_cell_type_rmse": {
                 cell_type: float(value)
                 for cell_type, value in zip(self.cell_types, per_type_rmse.tolist())
+            },
+            "per_cell_type_prediction_mean": {
+                cell_type: float(value)
+                for cell_type, value in zip(
+                    self.cell_types,
+                    per_type_prediction_mean.tolist(),
+                )
+            },
+            "per_cell_type_prediction_std": {
+                cell_type: float(value)
+                for cell_type, value in zip(
+                    self.cell_types,
+                    per_type_prediction_std.tolist(),
+                )
+            },
+            "per_cell_type_truth_mean": {
+                cell_type: float(value)
+                for cell_type, value in zip(self.cell_types, per_type_truth_mean.tolist())
+            },
+            "per_cell_type_truth_std": {
+                cell_type: float(value)
+                for cell_type, value in zip(self.cell_types, per_type_truth_std.tolist())
+            },
+            "per_cell_type_train_mean": {
+                cell_type: float(value)
+                for cell_type, value in zip(
+                    self.cell_types,
+                    self.fold_train_target_mean.tolist(),
+                )
             },
             "per_cell_type_pearson_across_samples": cell_type_pearson_across_samples,
             "per_cell_type_spearman_across_samples": cell_type_spearman_across_samples,
@@ -1020,6 +1286,11 @@ class DeconvRunner:
         for metric_key, prefix in (
             ("per_cell_type_mae", "mae"),
             ("per_cell_type_rmse", "rmse"),
+            ("per_cell_type_prediction_mean", "prediction_mean"),
+            ("per_cell_type_prediction_std", "prediction_std"),
+            ("per_cell_type_truth_mean", "truth_mean"),
+            ("per_cell_type_truth_std", "truth_std"),
+            ("per_cell_type_train_mean", "train_mean"),
             ("per_cell_type_pearson_across_samples", "pearson_across_samples"),
             ("per_cell_type_spearman_across_samples", "spearman_across_samples"),
         ):
@@ -1057,6 +1328,8 @@ class DeconvRunner:
             col: test_adata.obs[col].astype(str).to_numpy()
             for col in context_columns
         }
+        if self.fold_train_target_mean is None:
+            raise RuntimeError("Training-fold target mean is unavailable for prediction export.")
 
         for sample_idx, sample_id in enumerate(test_adata.obs_names.astype(str)):
             row: dict[str, object] = {
@@ -1075,18 +1348,38 @@ class DeconvRunner:
                 true_value = float(truths[sample_idx, cell_idx])
                 row[f"pred_{cell_type}"] = pred_value
                 row[f"true_{cell_type}"] = true_value
+                row[f"train_mean_{cell_type}"] = float(
+                    self.fold_train_target_mean[cell_idx]
+                )
                 row[f"abs_error_{cell_type}"] = abs(pred_value - true_value)
             rows.append(row)
         return rows
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return ROOT / "output" / self.task_name / self._output_variant()
 
     def _output_prefix(self) -> str:
-        return f"{self.task_name}_{self._finetune_mode()}"
+        return f"{self.task_name}_{self._output_variant()}"
 
     def _finetune_mode(self) -> str:
         return str(getattr(self.task_cfg, "finetune_mode", "head_only"))
+
+    def _output_suffix(self) -> str:
+        configured = getattr(self.task_cfg, "output_suffix", "")
+        suffix = "" if configured is None else str(configured).strip()
+        if suffix and re.fullmatch(r"[A-Za-z0-9_-]+", suffix) is None:
+            raise ValueError(
+                "output_suffix may contain only letters, numbers, underscores, and hyphens."
+            )
+        return suffix
+
+    def _output_variant(self) -> str:
+        suffix = self._output_suffix()
+        return (
+            f"{self._finetune_mode()}_{suffix}"
+            if suffix
+            else self._finetune_mode()
+        )
 
     def _write_model_results(
         self,
@@ -1113,6 +1406,7 @@ class DeconvRunner:
     def _cleanup_fold_state(self) -> None:
         self.train_loader = None
         self.test_loader = None
+        self.fold_train_target_mean = None
         self.model = None
         self.optimizer = None
         self.scheduler = None
@@ -1138,14 +1432,13 @@ class DeconvRunner:
             epochs = int(getattr(self.task_cfg, "epochs", 10))
             aggregate_rows: list[dict[str, object]] = []
 
-            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+            for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict[str, object]] = []
                 prediction_rows: list[dict[str, object]] = []
                 for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
                         + self.rank
-                        + model_idx * 10000
                         + fold_idx
                     )
                     train_adata = adata[train_idx].copy()

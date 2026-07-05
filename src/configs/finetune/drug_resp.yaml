@@ -17,33 +17,13 @@ drug_id_col: Drug ID
 ic50_col: IC50
 dataset_col: Dataset Version
 
-# Expression preprocessing (quantile-bin the continuous expression values)
+# Raw values are aligned here; the selected 1,199-gene sequence is quantile-binned
+# deterministically for each cell line.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
 min_genes: 200
-
-# Model architecture (must match the pretrained checkpoints)
-bin_num: 10
-gene_num: 11964
-dim: 200
-depth: 6
-heads: 10
-dim_head: 64
-ff_mult: 4
-nb_features:
-feature_redraw_interval: 1000
-ff_chunks: 1
-ff_glu: false
-emb_dropout: 0.
-ff_dropout: 0.
-attn_dropout: 0.
-use_scalenorm: false
-use_rezero: false
-no_projection: false
-tie_embed: false
-g2v_position_emb: false
-auto_check_redraw: true
-qkv_bias: true
+# Fold-level HVGs are fitted on training cell lines and reused for all models.
+hvg_flavor: cell_ranger
 
 # Finetuning mode
 finetune_mode: head_only       # head_only | adapters | full_ft
@@ -54,17 +34,21 @@ adapter_learning_rate: 1.0e-4
 adapter_after_attention: true
 adapter_after_ff: true
 
-# Prediction head (cell_emb_dim=200, drug_emb_dim=2304 for KPGT base)
-head_hidden_dim: 256
-head_dropout: 0.1
+# Fusion head: CancerFoundation CLS + mean-pooled gene sample embedding
+# concatenated with the KPGT drug embedding, then an MLP predicts IC50.
+cell_pooling: mean_cls
+head_hidden_dim: 512
+head_bottleneck_dim: 256
 
 # Training
 cv_folds: 5
 epochs: 20
 batch_size: 8
+num_workers: 2
+prefetch_factor: 2
 grad_accumulation_steps: 2
 head_learning_rate: 1.0e-4
-backbone_learning_rate: 1.0e-6
+backbone_learning_rate: 1.0e-4
 max_grad_norm: 1.0e6
 random_seed: 42
 

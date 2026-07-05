@@ -1,0 +1,63 @@
+# Pretrained model checkpoints (all four required)
+pretrained_model_paths:
+  pretrain_sc:
+  pretrain_bulk:
+  preadapt_sc:
+  preadapt_bulk:
+
+# SurvBoard data (point at the data_reproduced/ folder from the Zenodo archive)
+survboard_data_dir:           # e.g. /path/to/survboard/data_reproduced
+project: TCGA                 # TCGA | ICGC | TARGET | METABRIC
+cancer:                       # e.g. BRCA
+
+# Which outer CV folds to run (0-indexed rows of the SurvBoard split CSVs)
+outer_splits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+
+# Survival column names in the SurvBoard preprocessed CSV
+os_col: OS
+os_days_col: OS_days
+
+# Data preprocessing (preprocess=true quantile-bins the raw float values)
+gene_list_path: ../data/gene_list.txt
+# Maps HUGO symbols in SurvBoard gex columns to ENSG IDs used by the backbone
+gene_info_path: ../data/bulkformer_gene_info.csv
+preprocess: true
+min_genes: 200
+# Fold-level HVGs are fitted on training samples only and reused for the held-out
+# split. Their count comes from pretrain.selected_gene_count (1199).
+hvg_flavor: cell_ranger
+hvg_batch_key:
+
+# Finetuning mode
+finetune_mode: head_only       # head_only | adapters | full_ft
+burn_in_epochs: 3
+adapter_bottleneck_dim: 32
+adapter_dropout: 0.0
+adapter_learning_rate: 1e-4
+adapter_after_attention: true
+adapter_after_ff: true
+
+# Survival Cox head
+head_pooling: mean_cls
+head_hidden_dim: 512
+head_bottleneck_dim: 256
+output_suffix: ""
+
+# Training
+epochs: 30
+batch_size: 4
+num_workers: 2
+prefetch_factor: 2
+grad_accumulation_steps: 4
+head_learning_rate: 1e-4
+backbone_learning_rate: 1e-4
+max_grad_norm: 1e6
+random_seed: 42
+
+# Scheduler
+first_cycle_steps: 30
+cycle_mult: 1
+min_lr: 1e-6
+min_lr_ratio:
+warmup_steps: 2
+gamma: 1.0

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
+import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -25,9 +27,10 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from performer_pytorch import PerformerLM
+from cancerfoundation_backbone import CancerFoundationBackbone
+from finetune.canc_type_class.runner import _quantile_bin_expression
 from preprocess import (
-    preprocess_adata_for_tokens,
+    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -48,27 +51,88 @@ MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
 
 
 class GeneEssentPredHead(nn.Module):
-    """Per-gene-token MLP: (B, seq_len, dim) → (B, gene_num) essentiality scores."""
+    """Shared per-gene MLP mapping selected gene states to essentiality scores."""
 
     def __init__(
         self,
-        gene_num: int,
         embedding_dim: int,
-        hidden_dim: int = 128,
-        dropout: float = 0.0,
+        hidden_dim: int = 512,
+        bottleneck_dim: int = 256,
+        context_pooling: str = "none",
     ) -> None:
         super().__init__()
-        self.gene_num = gene_num
-        self.fc1 = nn.Linear(embedding_dim, hidden_dim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim, 1)
+        valid_pooling = {"none", "cls", "mean", "mean_cls"}
+        if context_pooling not in valid_pooling:
+            raise ValueError(
+                f"Unsupported gene-essentiality context pooling '{context_pooling}'. "
+                f"Expected one of {sorted(valid_pooling)}."
+            )
+        self.context_pooling = context_pooling
+        context_multiplier = {
+            "none": 0,
+            "cls": 1,
+            "mean": 1,
+            "mean_cls": 2,
+        }[context_pooling]
+        input_dim = embedding_dim * (1 + context_multiplier)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.SELU(),
+            nn.Linear(bottleneck_dim, 1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, seq_len, dim) — seq_len = gene_num + 1 (special token at end)
-        x = x[:, : self.gene_num, :]          # (B, gene_num, dim)
-        x = self.dropout(self.act(self.fc1(x)))  # (B, gene_num, hidden_dim)
-        return self.fc2(x).squeeze(-1)         # (B, gene_num)
+        return self.mlp(x).squeeze(-1)
+
+
+class CancerFoundationGeneEssentModel(nn.Module):
+    """CancerFoundation backbone with one prediction per selected gene token."""
+
+    def __init__(
+        self,
+        backbone: CancerFoundationBackbone,
+        head: GeneEssentPredHead,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.to_out = head
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        hidden = self.backbone(
+            batch["gene_ids"],
+            batch["expr"],
+            src_key_padding_mask=batch.get("attention_key_padding_mask"),
+        )
+        # Position zero is the CancerFoundation <cls> token. Every remaining
+        # output stays aligned with the corresponding selected input gene.
+        gene_hidden = hidden[:, 1:, :]
+        if self.to_out.context_pooling == "none":
+            head_input = gene_hidden
+        else:
+            contexts = []
+            if self.to_out.context_pooling in {"cls", "mean_cls"}:
+                contexts.append(hidden[:, 0, :])
+            if self.to_out.context_pooling in {"mean", "mean_cls"}:
+                contexts.append(gene_hidden.mean(dim=1))
+            sample_context = torch.cat(contexts, dim=-1)
+            sample_context = sample_context[:, None, :].expand(
+                -1,
+                gene_hidden.shape[1],
+                -1,
+            )
+            head_input = torch.cat((gene_hidden, sample_context), dim=-1)
+        return self.to_out(head_input)
+
+    def add_adapters(self, **kwargs) -> nn.ModuleList:
+        return self.backbone.add_adapters(**kwargs)
+
+    def adapter_parameters(self) -> list[nn.Parameter]:
+        return self.backbone.adapter_parameters()
+
+    def enable_grad_checkpoint(self) -> None:
+        self.backbone.enable_grad_checkpoint()
 
 
 class GroupedCosineAnnealingWarmupRestarts:
@@ -184,27 +248,63 @@ class GroupedCosineAnnealingWarmupRestarts:
 class GeneEssentDataset(Dataset):
     def __init__(
         self,
-        X_tokens,
+        X_expression,
         Y_targets: np.ndarray,
-        special_token_id: int,
+        *,
+        fixed_gene_indices: np.ndarray,
+        bin_num: int,
+        cls_gene_id: int,
+        gene_token_offset: int,
+        cls_value: float,
+        seed: int,
+        do_binning: bool,
     ) -> None:
-        self.X = X_tokens          # n_cells × gene_num, int token matrix (dense or sparse)
-        self.Y = np.asarray(Y_targets, dtype=np.float32)  # n_cells × gene_num
-        self.special_token_id = special_token_id
+        self.X = X_expression
+        self.Y = np.asarray(Y_targets, dtype=np.float32)
+        self.fixed_gene_indices = np.asarray(fixed_gene_indices, dtype=np.int64)
+        self.bin_num = int(bin_num)
+        self.cls_gene_id = int(cls_gene_id)
+        self.gene_token_offset = int(gene_token_offset)
+        self.cls_value = float(cls_value)
+        self.seed = int(seed)
+        self.do_binning = bool(do_binning)
+
+        if self.fixed_gene_indices.ndim != 1 or self.fixed_gene_indices.size == 0:
+            raise ValueError("fixed_gene_indices must be a non-empty one-dimensional array.")
 
     def __len__(self) -> int:
         return self.X.shape[0]
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         row = self.X[index]
         if sparse.issparse(row):
-            seq = row.toarray().ravel()
+            values = row.toarray().ravel()
         else:
-            seq = np.asarray(row).ravel()
-        seq = torch.as_tensor(seq, dtype=torch.long)
-        seq = torch.cat([seq, torch.tensor([self.special_token_id], dtype=torch.long)])
-        target = torch.as_tensor(self.Y[index], dtype=torch.float32)
-        return seq, target
+            values = np.asarray(row).ravel()
+
+        rng = np.random.default_rng(self.seed + index)
+        selected_values = values[self.fixed_gene_indices].astype(np.float32, copy=False)
+        if self.do_binning:
+            selected_values = _quantile_bin_expression(
+                selected_values,
+                self.bin_num,
+                rng,
+            ).astype(np.float32)
+
+        gene_ids = torch.from_numpy(
+            self.fixed_gene_indices + self.gene_token_offset
+        )
+        gene_ids = torch.cat((torch.tensor([self.cls_gene_id]), gene_ids))
+        expression = torch.from_numpy(selected_values)
+        expression = torch.cat((torch.tensor([self.cls_value]), expression))
+        target = torch.as_tensor(
+            self.Y[index, self.fixed_gene_indices],
+            dtype=torch.float32,
+        )
+        return {"gene_ids": gene_ids, "expr": expression}, target
 
 
 class GeneEssentRunner:
@@ -222,13 +322,29 @@ class GeneEssentRunner:
         self.is_master = self.rank == 0
         self.device = torch.device("cpu")
 
-        self.class_count = int(self.model_cfg.bin_num) + 2
-        self.vocab_size = self.class_count + 1
-        self.special_token_id = self.class_count
+        self.cls_gene_id = 0
+        self.pad_gene_id = 1
+        self.gene_token_offset = 2
+        self.num_gene_tokens = int(self.model_cfg.gene_num) + self.gene_token_offset
+        self.cls_value = float(getattr(self.model_cfg, "pad_value", -2.0))
+        self.selected_gene_count = int(
+            getattr(self.model_cfg, "selected_gene_count", 1199)
+        )
+        self.max_seq_len = int(
+            getattr(self.model_cfg, "max_seq_len", self.selected_gene_count + 1)
+        )
+        if self.max_seq_len != self.selected_gene_count + 1:
+            raise ValueError(
+                "Gene essentiality expects max_seq_len to equal "
+                "selected_gene_count + 1 for the <cls> token."
+            )
 
         # Set at data load time: True for genes with CRISPR data in depmap
         self.valid_gene_mask: np.ndarray | None = None   # shape (gene_num,), bool
         self.n_valid_genes: int = 0
+        self.fold_gene_indices: np.ndarray | None = None
+        self.fold_valid_gene_mask: np.ndarray | None = None
+        self.fold_n_valid_genes: int = 0
 
         self.train_loader: DataLoader | None = None
         self.test_loader: DataLoader | None = None
@@ -259,11 +375,28 @@ class GeneEssentRunner:
     def _finetune_mode(self) -> str:
         return str(getattr(self.task_cfg, "finetune_mode", "head_only"))
 
+    def _output_suffix(self) -> str:
+        configured = getattr(self.task_cfg, "output_suffix", "")
+        suffix = "" if configured is None else str(configured).strip()
+        if suffix and re.fullmatch(r"[A-Za-z0-9_-]+", suffix) is None:
+            raise ValueError(
+                "output_suffix may contain only letters, numbers, underscores, and hyphens."
+            )
+        return suffix
+
+    def _output_variant(self) -> str:
+        suffix = self._output_suffix()
+        return (
+            f"{self._finetune_mode()}_{suffix}"
+            if suffix
+            else self._finetune_mode()
+        )
+
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / TASK_NAME / self._finetune_mode()
+        return ROOT / "output" / TASK_NAME / self._output_variant()
 
     def _output_prefix(self) -> str:
-        return f"{TASK_NAME}_{self._finetune_mode()}"
+        return f"{TASK_NAME}_{self._output_variant()}"
 
     def _resolve_gene_list_path(self) -> Path:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
@@ -412,16 +545,16 @@ class GeneEssentRunner:
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_depmap_data(self) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    def _load_depmap_data(self) -> tuple[object, np.ndarray, list[str]]:
         """Load expression + CRISPR data from the combined depmap.h5ad.
 
         The file must contain layers 'expr_array' (expression) and 'essen_array'
         (CRISPR scores), with ENSG IDs as var_names. Both layers share the same obs.
 
-        Returns (X_tokens, Y_targets, cell_ids).
+        Returns (X_expression, Y_targets, cell_ids).
         Y_targets has shape (n_cells, gene_num) — aligned to gene_list.txt.
         Genes absent from depmap are filled with 0; self.valid_gene_mask marks which genes
-        have actual CRISPR data (expected to be ~all 11,964 for a full DepMap screen).
+        have actual CRISPR data.
         """
         depmap_path_cfg = getattr(self.task_cfg, "depmap_data_path", None)
         if not depmap_path_cfg:
@@ -447,35 +580,37 @@ class GeneEssentRunner:
         essen_X = np.asarray(essen_X, dtype=np.float32)
         combined_obs_to_idx = {str(obs): i for i, obs in enumerate(combined.obs_names)}
 
-        # Build expression AnnData from the expr_array layer (var_names are already ENSG IDs)
+        # Build expression AnnData from the expr_array layer. Preserve sparse
+        # storage so each DDP rank does not materialize an unnecessary dense copy.
         expr_X = combined.layers["expr_array"]
         if sparse.issparse(expr_X):
-            expr_X = expr_X.toarray()
-        expr_adata = ad.AnnData(X=np.asarray(expr_X, dtype=np.float32))
+            expr_X = expr_X.tocsr().astype(np.float32, copy=False)
+        else:
+            expr_X = np.asarray(expr_X, dtype=np.float32)
+        expr_adata = ad.AnnData(X=expr_X)
         expr_adata.var_names = combined.var_names.copy()
         expr_adata.obs_names = combined.obs_names.copy()
 
-        # Preprocess expression → token bins (reindexed to gene_list.txt)
+        # Align raw expression to the backbone vocabulary. Quantile binning is
+        # deferred to Dataset.__getitem__ so DataLoader workers can do it.
         gene_list_path = self._resolve_gene_list_path()
         should_preprocess = bool(getattr(self.task_cfg, "preprocess", True))
+        expr_adata, missing_genes = reindex_adata_genes(
+            expr_adata,
+            gene_list_path=gene_list_path,
+        )
         if should_preprocess:
-            min_genes = int(getattr(self.task_cfg, "min_genes", 200))
-            expr_adata, missing_genes = preprocess_adata_for_tokens(
+            expr_adata = filter_min_genes(
                 expr_adata,
-                gene_list_path=gene_list_path,
-                min_genes=min_genes,
-                bin_num=int(self.model_cfg.bin_num),
-                reindex_genes=True,
+                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
             )
             log.info(
-                "Expression preprocessing done: %d target genes missing, shape %s",
+                "Aligned raw expression for worker-side sequence binning: "
+                "%d target genes missing, shape %s",
                 len(missing_genes),
                 expr_adata.shape,
             )
         else:
-            expr_adata, missing_genes = reindex_adata_genes(
-                expr_adata, gene_list_path=gene_list_path
-            )
             log.info(
                 "Expression reindexed (no preprocessing): %d genes missing, shape %s",
                 len(missing_genes),
@@ -492,9 +627,12 @@ class GeneEssentRunner:
             raise ValueError(
                 f"Expected {expected_gene_num} genes after preprocessing, got {expr_adata.n_vars}."
             )
-        validate_token_matrix(
-            expr_adata.X, bin_num=int(self.model_cfg.bin_num), name="gene essentiality expression input"
-        )
+        if not should_preprocess:
+            validate_token_matrix(
+                expr_adata.X,
+                bin_num=int(self.model_cfg.bin_num),
+                name="gene essentiality expression input",
+            )
 
         # Align CRISPR rows to the (possibly filtered) expr_adata obs order
         remaining_obs = list(expr_adata.obs_names.astype(str))
@@ -551,6 +689,53 @@ class GeneEssentRunner:
         cell_ids = remaining_obs
         return expr_adata.X, Y_targets, cell_ids
 
+    def _select_training_hvg_indices(
+        self,
+        X_expression,
+        train_idx: np.ndarray,
+    ) -> np.ndarray:
+        """Fit the 1,199-gene input vocabulary using training cell lines only."""
+        if X_expression.shape[1] < self.selected_gene_count:
+            raise ValueError(
+                f"Cannot select {self.selected_gene_count} HVGs from "
+                f"{X_expression.shape[1]} genes."
+            )
+        hvg_adata = ad.AnnData(X=X_expression[train_idx])
+        hvg_stats = sc.pp.highly_variable_genes(
+            hvg_adata,
+            n_top_genes=self.selected_gene_count,
+            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            inplace=False,
+        )
+        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
+        if selected.size > self.selected_gene_count:
+            ranking_column = (
+                "highly_variable_rank"
+                if "highly_variable_rank" in hvg_stats
+                else "dispersions_norm"
+            )
+            scores = hvg_stats[ranking_column].to_numpy()[selected]
+            if ranking_column == "highly_variable_rank":
+                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
+            else:
+                order = np.argsort(
+                    -np.nan_to_num(scores, nan=-np.inf),
+                    kind="stable",
+                )
+            selected = selected[order[: self.selected_gene_count]]
+        if selected.size != self.selected_gene_count:
+            raise RuntimeError(
+                f"Scanpy selected {selected.size} HVGs; expected exactly "
+                f"{self.selected_gene_count}."
+            )
+        log.info(
+            "Selected %d HVGs from %d training cell lines with flavor=%s",
+            selected.size,
+            len(train_idx),
+            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+        )
+        return selected.astype(np.int64, copy=False)
+
     # ------------------------------------------------------------------
     # CV splits
     # ------------------------------------------------------------------
@@ -572,14 +757,53 @@ class GeneEssentRunner:
 
     def _build_loaders(
         self,
-        X_tokens_train,
+        X_expression_train,
         Y_train: np.ndarray,
-        X_tokens_test,
+        X_expression_test,
         Y_test: np.ndarray,
     ) -> None:
+        if self.fold_gene_indices is None:
+            raise RuntimeError("Training-fold HVGs have not been selected.")
         batch_size = int(getattr(self.task_cfg, "batch_size", 8))
-        train_dataset = GeneEssentDataset(X_tokens_train, Y_train, self.special_token_id)
-        test_dataset = GeneEssentDataset(X_tokens_test, Y_test, self.special_token_id)
+        num_workers = int(getattr(self.task_cfg, "num_workers", 0))
+        if num_workers < 0:
+            raise ValueError("finetune.gene_essent.num_workers must be non-negative.")
+        loader_kwargs: dict[str, object] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            prefetch_factor = int(getattr(self.task_cfg, "prefetch_factor", 2))
+            if prefetch_factor <= 0:
+                raise ValueError(
+                    "finetune.gene_essent.prefetch_factor must be positive."
+                )
+            loader_kwargs.update(
+                {
+                    "prefetch_factor": prefetch_factor,
+                    "persistent_workers": False,
+                }
+            )
+
+        dataset_kwargs = {
+            "fixed_gene_indices": self.fold_gene_indices,
+            "bin_num": int(self.model_cfg.bin_num),
+            "cls_gene_id": self.cls_gene_id,
+            "gene_token_offset": self.gene_token_offset,
+            "cls_value": self.cls_value,
+            "seed": int(getattr(self.task_cfg, "random_seed", 42)),
+            "do_binning": bool(getattr(self.task_cfg, "preprocess", True)),
+        }
+        train_dataset = GeneEssentDataset(
+            X_expression_train,
+            Y_train,
+            **dataset_kwargs,
+        )
+        test_dataset = GeneEssentDataset(
+            X_expression_test,
+            Y_test,
+            **dataset_kwargs,
+        )
         self.test_dataset_size = len(test_dataset)
 
         if self.is_distributed:
@@ -596,14 +820,45 @@ class GeneEssentRunner:
                 rank=self.rank,
             )
             self.train_loader = DataLoader(
-                train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=False
+                train_dataset,
+                batch_size=batch_size,
+                sampler=train_sampler,
+                shuffle=False,
+                **loader_kwargs,
             )
             self.test_loader = DataLoader(
-                test_dataset, batch_size=batch_size, sampler=test_sampler, shuffle=False
+                test_dataset,
+                batch_size=batch_size,
+                sampler=test_sampler,
+                shuffle=False,
+                **loader_kwargs,
             )
         else:
-            self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            )
+            self.test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+
+        if self.is_master:
+            log.info(
+                "DataLoader: num_workers=%d | prefetch_factor=%s | pin_memory=%s | "
+                "persistent_workers=false",
+                num_workers,
+                (
+                    int(getattr(self.task_cfg, "prefetch_factor", 2))
+                    if num_workers > 0
+                    else "disabled"
+                ),
+                self.device.type == "cuda",
+            )
 
     # ------------------------------------------------------------------
     # Model
@@ -625,54 +880,55 @@ class GeneEssentRunner:
                 f"Unsupported finetune_mode '{finetune_mode}'. Expected one of {sorted(valid_modes)}."
             )
 
-        model = PerformerLM(
-            num_tokens=self.vocab_size,
-            max_seq_len=int(self.model_cfg.gene_num) + 1,
-            dim=int(self.model_cfg.dim),
-            depth=int(self.model_cfg.depth),
-            heads=int(self.model_cfg.heads),
-            dim_head=int(self.model_cfg.dim_head),
-            ff_mult=int(self.model_cfg.ff_mult),
-            nb_features=self.model_cfg.nb_features,
-            feature_redraw_interval=int(self.model_cfg.feature_redraw_interval),
-            ff_chunks=int(self.model_cfg.ff_chunks),
-            ff_glu=bool(self.model_cfg.ff_glu),
-            emb_dropout=float(self.model_cfg.emb_dropout),
-            ff_dropout=float(self.model_cfg.ff_dropout),
-            attn_dropout=float(self.model_cfg.attn_dropout),
-            use_scalenorm=bool(self.model_cfg.use_scalenorm),
-            use_rezero=bool(self.model_cfg.use_rezero),
-            no_projection=bool(self.model_cfg.no_projection),
-            tie_embed=bool(self.model_cfg.tie_embed),
-            g2v_position_emb=bool(self.model_cfg.g2v_position_emb),
-            auto_check_redraw=bool(self.model_cfg.auto_check_redraw),
-            qkv_bias=bool(self.model_cfg.qkv_bias),
-            embx_bin_num=int(self.model_cfg.bin_num) if str(getattr(self.model_cfg, "loss_type", "ce")).lower() == "mse" else None,
+        backbone = CancerFoundationBackbone(
+            num_gene_tokens=self.num_gene_tokens,
+            d_model=int(self.model_cfg.embsize),
+            nhead=int(self.model_cfg.nheads),
+            d_hid=int(self.model_cfg.d_hid),
+            nlayers=int(self.model_cfg.nlayers),
+            dropout=float(self.model_cfg.dropout),
+            pad_gene_id=self.pad_gene_id,
+            max_value=int(getattr(self.model_cfg, "value_encoder_max_value", 512)),
         )
 
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
-            model.load_state_dict(state_dict)
+            backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
         else:
             log.info("Using randomly initialized backbone")
 
-        model.to_out = GeneEssentPredHead(
-            gene_num=int(self.model_cfg.gene_num),
-            embedding_dim=int(self.model_cfg.dim),
-            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 128)),
-            dropout=float(getattr(self.task_cfg, "head_dropout", 0.0)),
+        head = GeneEssentPredHead(
+            embedding_dim=int(self.model_cfg.embsize),
+            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
+            context_pooling=str(getattr(self.task_cfg, "head_pooling", "none")),
         )
+        if self.is_master:
+            input_dim = int(self.model_cfg.embsize) * (
+                3 if head.context_pooling == "mean_cls"
+                else 2 if head.context_pooling in {"cls", "mean"}
+                else 1
+            )
+            log.info(
+                "Gene essentiality head pooling: %s | dims: %d -> %d -> %d -> 1",
+                head.context_pooling,
+                input_dim,
+                int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+                int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
+            )
 
         if finetune_mode == "adapters":
-            model.add_adapters(
+            backbone.add_adapters(
                 bottleneck_dim=int(getattr(self.task_cfg, "adapter_bottleneck_dim", 32)),
                 dropout=float(getattr(self.task_cfg, "adapter_dropout", 0.0)),
                 after_attention=bool(getattr(self.task_cfg, "adapter_after_attention", True)),
                 after_ff=bool(getattr(self.task_cfg, "adapter_after_ff", True)),
             )
+
+        model = CancerFoundationGeneEssentModel(backbone, head)
 
         if finetune_mode == "head_only":
             for param in model.parameters():
@@ -790,6 +1046,15 @@ class GeneEssentRunner:
     def _optimizer_parameters(self) -> list[torch.nn.Parameter]:
         return [p for g in self.optimizer.param_groups for p in g["params"]]
 
+    def _move_batch_to_device(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value.to(self.device, non_blocking=True)
+            for key, value in batch.items()
+        }
+
     # ------------------------------------------------------------------
     # Training and evaluation
     # ------------------------------------------------------------------
@@ -814,10 +1079,15 @@ class GeneEssentRunner:
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
         running_loss = 0.0
-        valid_mask = torch.as_tensor(self.valid_gene_mask, device=self.device)  # (gene_num,)
+        if self.fold_valid_gene_mask is None:
+            raise RuntimeError("Fold-level valid-gene mask is unavailable.")
+        valid_mask = torch.as_tensor(
+            self.fold_valid_gene_mask,
+            device=self.device,
+        )
 
-        for step_idx, (data, targets) in enumerate(self.train_loader, start=1):
-            data = data.to(self.device, non_blocking=True)
+        for step_idx, (batch, targets) in enumerate(self.train_loader, start=1):
+            batch = self._move_batch_to_device(batch)
             targets = targets.to(self.device, non_blocking=True)
 
             use_no_sync = (
@@ -828,7 +1098,7 @@ class GeneEssentRunner:
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
 
             with sync_context:
-                preds = self.model(data)                         # (B, gene_num)
+                preds = self.model(batch)
                 loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
                 (loss / grad_acc_steps).backward()
 
@@ -850,16 +1120,21 @@ class GeneEssentRunner:
         running_loss = 0.0
         all_preds: list[torch.Tensor] = []
         all_targets: list[torch.Tensor] = []
-        valid_mask = torch.as_tensor(self.valid_gene_mask, device=self.device)  # (gene_num,)
+        if self.fold_valid_gene_mask is None:
+            raise RuntimeError("Fold-level valid-gene mask is unavailable.")
+        valid_mask = torch.as_tensor(
+            self.fold_valid_gene_mask,
+            device=self.device,
+        )
 
         if self.is_distributed:
             dist.barrier()
 
         with torch.no_grad():
-            for data, targets in self.test_loader:
-                data = data.to(self.device, non_blocking=True)
+            for batch, targets in self.test_loader:
+                batch = self._move_batch_to_device(batch)
                 targets = targets.to(self.device, non_blocking=True)
-                preds = self.model(data)                          # (B, gene_num)
+                preds = self.model(batch)
                 loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
                 running_loss += loss.item()
                 all_preds.append(preds[:, valid_mask])
@@ -924,7 +1199,7 @@ class GeneEssentRunner:
             "test_pcc": float(test_metrics["pcc"]),
             "test_scc": float(test_metrics["scc"]),
             "n_test_samples": int(test_metrics["n_test_samples"]),
-            "n_valid_genes": self.n_valid_genes,
+            "n_valid_genes": self.fold_n_valid_genes,
         }
 
     def _per_cell_line_rows(
@@ -980,6 +1255,9 @@ class GeneEssentRunner:
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.fold_gene_indices = None
+        self.fold_valid_gene_mask = None
+        self.fold_n_valid_genes = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -991,9 +1269,13 @@ class GeneEssentRunner:
         try:
             self._setup_runtime()
 
-            X_tokens, Y_targets, cell_ids = self._load_depmap_data()
+            X_expression, Y_targets, cell_ids = self._load_depmap_data()
             n_samples = len(cell_ids)
             splits = self._build_cv_splits(n_samples)
+            fold_hvg_indices = [
+                self._select_training_hvg_indices(X_expression, train_idx)
+                for train_idx, _ in splits
+            ]
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
 
@@ -1008,7 +1290,7 @@ class GeneEssentRunner:
             epochs = int(getattr(self.task_cfg, "epochs", 20))
             aggregate_rows: list[dict[str, object]] = []
 
-            for model_idx, (model_key, checkpoint_path) in enumerate(checkpoint_paths.items()):
+            for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict[str, object]] = []
                 cell_line_rows: list[dict[str, object]] = []
 
@@ -1016,13 +1298,22 @@ class GeneEssentRunner:
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
                         + self.rank
-                        + model_idx * 10000
                         + fold_idx
                     )
 
-                    X_train = X_tokens[train_idx]
+                    self.fold_gene_indices = fold_hvg_indices[fold_idx - 1]
+                    self.fold_valid_gene_mask = self.valid_gene_mask[
+                        self.fold_gene_indices
+                    ]
+                    self.fold_n_valid_genes = int(self.fold_valid_gene_mask.sum())
+                    if self.fold_n_valid_genes < 2:
+                        raise ValueError(
+                            "Fewer than two selected HVGs have DepMap CRISPR targets."
+                        )
+
+                    X_train = X_expression[train_idx]
                     Y_train = Y_targets[train_idx]
-                    X_test = X_tokens[test_idx]
+                    X_test = X_expression[test_idx]
                     Y_test = Y_targets[test_idx]
                     test_cell_ids = [cell_ids[i] for i in test_idx]
 
