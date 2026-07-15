@@ -59,3 +59,13 @@ min_lr: 1.0e-6
 min_lr_ratio:
 warmup_steps: 5
 gamma: 1.0
+
+# Raw-expression MLP baseline. Launched with task=finetune.drug_resp_raw_mlp.
+# The model concatenates raw expression features with the drug feature vector.
+raw_mlp_feature_mode: all_genes  # drug_only | all_genes | hvg1199
+raw_mlp_variant:
+raw_mlp_target_params: 6560000
+raw_mlp_hidden_dim:
+raw_mlp_hidden_layers: 2
+raw_mlp_standardize: true
+raw_mlp_learning_rate: 1e-4

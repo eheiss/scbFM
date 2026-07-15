@@ -1,0 +1,42 @@
+# scGPT masked-value preadaptation on unsupervised bulk data only.
+model_name: scgpt_preadapt_bulk
+
+# Explicitly pass only the bulk pretrain and bulk preadapt datasets from the
+# job file. Do not include downstream fine-tuning datasets here.
+data_paths: []
+
+scgpt_repo_dir:
+scgpt_model_dir:
+scgpt_args_filename: scgpt_args.json
+scgpt_vocab_filename: scgpt_vocab.json
+scgpt_checkpoint_filename: scgpt_best_model.pt
+gene_info_path: ../data/bulkformer_gene_info.csv
+
+epochs: 5
+batch_size: 16
+num_workers: 2
+prefetch_factor: 2
+valid_every: 1
+grad_acc: 4
+max_grad_norm: 1e2
+
+seed: 2021
+validation_split: 0.05
+selected_gene_count: 1199
+max_seq_len: 1200
+mask_prob: 0.15
+min_mapped_genes: 200
+
+# Keep this false unless the scGPT container has flash-attn installed.
+use_fast_transformer: false
+
+# Standard scGPT masked value objective. MVC can be enabled later as an
+# ablation, but the conservative default is masked expression reconstruction.
+do_mvc: false
+
+learning_rate: 1e-4
+first_cycle_steps: 5
+cycle_mult: 1
+min_lr: 1e-6
+warmup_steps: 1
+gamma: 1.0

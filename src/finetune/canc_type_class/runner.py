@@ -649,10 +649,21 @@ class CancTypeClassRunner:
         return adata
 
     def _select_training_hvg_indices(self, adata: ad.AnnData) -> np.ndarray:
-        """Fit fold-level HVG selection on training data only."""
+        """Fit fold-level gene selection on training data only."""
         if adata.n_vars < self.selected_gene_count:
             raise ValueError(
-                f"Cannot select {self.selected_gene_count} HVGs from only {adata.n_vars} genes."
+                f"Cannot select {self.selected_gene_count} genes from only {adata.n_vars} genes."
+            )
+
+        selection_method = str(
+            getattr(self.task_cfg, "hvg_selection_method", "mad")
+        ).strip().lower()
+        if selection_method == "mad":
+            return self._select_training_mad_indices(adata)
+        if selection_method != "scanpy":
+            raise ValueError(
+                "hvg_selection_method must be one of: mad, scanpy. "
+                f"Got '{selection_method}'."
             )
 
         batch_key = getattr(self.task_cfg, "hvg_batch_key", None)
@@ -693,12 +704,45 @@ class CancTypeClassRunner:
 
         log.info(
             "Selected %d training-fold HVGs for training and evaluation "
-            "with flavor=%s, batch_key=%s",
+            "with method=scanpy, flavor=%s, batch_key=%s",
             selected.size,
             str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
             batch_key,
         )
         return selected.astype(np.int64, copy=False)
+
+    def _select_training_mad_indices(self, adata: ad.AnnData) -> np.ndarray:
+        """Select genes with highest median absolute deviation on log1p training data."""
+        matrix = adata.X
+        if sparse.issparse(matrix):
+            matrix = matrix.toarray()
+        matrix = np.asarray(matrix, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise ValueError(f"Expected 2D expression matrix, got shape {matrix.shape}.")
+
+        gene_medians = np.nanmedian(matrix, axis=0)
+        mad = np.nanmedian(np.abs(matrix - gene_medians), axis=0)
+        scores = np.nan_to_num(mad, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        if not np.any(np.isfinite(scores)):
+            raise ValueError("Could not compute finite MAD scores for any genes.")
+
+        ranked = np.lexsort((np.arange(scores.size), -scores))
+        selected = np.sort(ranked[: self.selected_gene_count]).astype(np.int64, copy=False)
+        if selected.size != self.selected_gene_count:
+            raise RuntimeError(
+                "MAD selection selected "
+                f"{selected.size} genes; expected exactly {self.selected_gene_count}."
+            )
+
+        log.info(
+            "Selected %d training-fold genes for training and evaluation "
+            "with method=mad on log1p expression | selected MAD min=%.6g median=%.6g max=%.6g",
+            selected.size,
+            float(np.min(scores[selected])),
+            float(np.median(scores[selected])),
+            float(np.max(scores[selected])),
+        )
+        return selected
 
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()

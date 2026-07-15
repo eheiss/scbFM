@@ -47,3 +47,12 @@ min_lr: 1e-6
 min_lr_ratio:
 warmup_steps: 2
 gamma: 1.0
+
+# Raw-expression MLP baseline. Launched with task=finetune.deconv_raw_mlp.
+raw_mlp_feature_mode: all_genes  # all_genes | hvg1199
+raw_mlp_variant:
+raw_mlp_target_params: 6560000
+raw_mlp_hidden_dim:
+raw_mlp_hidden_layers: 2
+raw_mlp_standardize: true
+raw_mlp_learning_rate: 1e-4

@@ -1,0 +1,60 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.5.1-cuda11.8-cudnn9-runtime
+
+%labels
+    Author Enrico Heiss
+    Application BulkFormer
+    Description BulkFormer feature extraction environment with PyTorch Geometric
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONNOUSERSITE=1
+
+%post
+    set -eux
+
+    python -m pip install --upgrade pip setuptools wheel
+
+    # Core scientific stack used by the scbFM BulkFormer PCA/RF runner.
+    python -m pip install --no-cache-dir \
+        hydra-core \
+        omegaconf \
+        numpy \
+        scipy \
+        scikit-learn \
+        pandas \
+        h5py \
+        anndata \
+        scanpy \
+        einops \
+        performer-pytorch==1.1.4
+
+    # PyTorch Geometric stack matching torch 2.5.x + CUDA 11.8.
+    # BulkFormer needs torch_geometric.nn.GCNConv and torch_geometric.typing.SparseTensor.
+    python -m pip install --no-cache-dir \
+        torch-scatter \
+        torch-sparse \
+        torch-cluster \
+        torch-spline-conv \
+        -f https://data.pyg.org/whl/torch-2.5.0+cu118.html
+
+    python -m pip install --no-cache-dir torch-geometric==2.6.1
+
+    # Quick import check at build time.
+    python - <<'PY'
+import torch
+import torch_geometric
+from torch_geometric.nn.conv import GCNConv
+from torch_geometric.typing import SparseTensor
+import performer_pytorch
+print("torch", torch.__version__)
+print("cuda", torch.version.cuda)
+print("torch_geometric", torch_geometric.__version__)
+print("BulkFormer imports OK")
+PY
+
+%runscript
+    exec "$@"

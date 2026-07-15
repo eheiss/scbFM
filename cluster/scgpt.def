@@ -1,0 +1,61 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
+
+%labels
+    Author Enrico Heiss
+    Application scGPT
+    Description scGPT embedding extraction environment for scbFM downstream baselines
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONNOUSERSITE=1
+
+%post
+    set -eux
+
+    python -m pip install --upgrade pip setuptools wheel
+
+    # Core scbFM/scGPT downstream stack.
+    python -m pip install --no-cache-dir \
+        hydra-core \
+        omegaconf \
+        numpy \
+        scipy \
+        scikit-learn \
+        pandas \
+        h5py \
+        anndata \
+        scanpy \
+        einops \
+        requests \
+        pycox \
+        'datasets>=2.3.2' \
+        matplotlib \
+        seaborn \
+        networkx \
+        tqdm \
+        ipython
+
+    # scGPT's GeneVocab imports torchtext.vocab. Keep torchtext pinned to the
+    # PyTorch 2.1.x ABI used by this image.
+    python -m pip install --no-cache-dir torchtext==0.16.2
+
+    # Build-time import check for the dependency that failed in scbfm.sif.
+    python - <<'PY'
+import torch
+import torchtext
+import datasets
+import seaborn
+import IPython
+print("torch", torch.__version__)
+print("cuda", torch.version.cuda)
+print("torchtext", torchtext.__version__)
+print("datasets", datasets.__version__)
+print("scGPT runtime dependencies OK")
+PY
+
+%runscript
+    exec "$@"

@@ -11,8 +11,11 @@ cohorts: [BRCA, BLCA, GBM, LGG, LUAD, UCEC]
 merge_gbm_lgg: true
 preprocess: true
 min_genes: 200
-# Fold-level HVGs are fitted on training data and reused for training and
-# evaluation. Their count comes from pretrain.selected_gene_count (1199).
+# Fold-level gene selection is fitted on training data and reused for training
+# and evaluation. Their count comes from pretrain.selected_gene_count (1199).
+# For bulk log1p data, MAD is the default practical alternative to Scanpy's
+# dispersion-based HVG selection.
+hvg_selection_method: mad  # mad | scanpy
 hvg_flavor: cell_ranger
 hvg_batch_key:
 # false preserves mean pooling over the 1,199 gene tokens; true uses only the
@@ -51,3 +54,99 @@ min_lr: 1e-6
 min_lr_ratio:
 warmup_steps: 2
 gamma: 1.0
+
+# Raw-expression MLP baseline. This task is launched with
+# task=finetune.canc_type_class_raw_mlp and reuses the same TCGA 5-type data,
+# folds and metrics as the transformer finetuning task.
+raw_mlp_feature_mode: all_genes  # all_genes | hvg1199
+raw_mlp_variant:
+raw_mlp_target_params: 6560000
+raw_mlp_hidden_dim:
+raw_mlp_hidden_layers: 2
+raw_mlp_standardize: true
+raw_mlp_learning_rate: 1e-4
+
+# Raw-expression PCA + random-forest baseline. This task is launched with
+# task=finetune.canc_type_class_raw_pca_rf and reuses the same TCGA 5-type
+# folds and metrics as the transformer finetuning task.
+raw_pca_rf_feature_mode: all_genes  # all_genes | hvg1199
+raw_pca_rf_variant:
+raw_pca_rf_components: 256
+raw_pca_rf_standardize: true
+raw_pca_rf_whiten: false
+raw_pca_rf_n_estimators: 500
+raw_pca_rf_max_depth:
+raw_pca_rf_min_samples_leaf: 1
+raw_pca_rf_min_samples_split: 2
+raw_pca_rf_max_features: sqrt
+raw_pca_rf_class_weight: balanced
+raw_pca_rf_bootstrap: true
+raw_pca_rf_n_jobs: -1
+
+# Backbone-embedding PCA + random-forest baseline. Launched with
+# task=finetune.canc_type_class_pca_rf.
+pca_rf_variant:
+pca_rf_pooling: mean_cls
+pca_rf_components: 256
+pca_rf_standardize: true
+pca_rf_whiten: false
+pca_rf_n_estimators: 500
+pca_rf_max_depth:
+pca_rf_min_samples_leaf: 1
+pca_rf_min_samples_split: 2
+pca_rf_max_features: sqrt
+pca_rf_class_weight: balanced
+pca_rf_bootstrap: true
+pca_rf_n_jobs: -1
+
+# External BulkFormer-147M baseline. Launched with
+# task=finetune.canc_type_class_bulkformer_pca_rf. This uses frozen
+# BulkFormer gene embeddings, sample-level aggregation, PCA and RF.
+bulkformer_variant: bulkformer_pca_rf
+bulkformer_repo_dir:
+bulkformer_checkpoint_path:
+bulkformer_tcga_data_path:
+bulkformer_gene_info_path:
+bulkformer_graph_path:
+bulkformer_graph_weight_path:
+bulkformer_gene_emb_path:
+bulkformer_interested_gene_list_path:
+bulkformer_batch_size: 4
+bulkformer_mask_prob: 0.1
+bulkformer_aggregate_type: mean  # mean | max | median | all
+bulkformer_pca_components: 256
+bulkformer_pca_standardize: true
+bulkformer_pca_whiten: false
+bulkformer_rf_n_estimators: 500
+bulkformer_rf_max_depth:
+bulkformer_rf_min_samples_leaf: 1
+bulkformer_rf_min_samples_split: 2
+bulkformer_rf_max_features: sqrt
+bulkformer_rf_class_weight: balanced
+bulkformer_rf_bootstrap: true
+bulkformer_rf_n_jobs: -1
+
+# External scGPT baseline. Launched with
+# task=finetune.canc_type_class_scgpt_pca_rf. This uses frozen scGPT CLS
+# embeddings, training-fold HVG selection, PCA and RF.
+scgpt_variant: scgpt_pca_rf
+scgpt_repo_dir:
+scgpt_model_dir:
+scgpt_args_filename: args.json
+scgpt_vocab_filename: vocab.json
+scgpt_checkpoint_filename: best_model.pt
+scgpt_gene_info_path:
+scgpt_batch_size: 32
+scgpt_max_seq_len: 1200
+scgpt_use_fast_transformer: false
+scgpt_pca_components: 256
+scgpt_pca_standardize: true
+scgpt_pca_whiten: false
+scgpt_rf_n_estimators: 500
+scgpt_rf_max_depth:
+scgpt_rf_min_samples_leaf: 1
+scgpt_rf_min_samples_split: 2
+scgpt_rf_max_features: sqrt
+scgpt_rf_class_weight: balanced
+scgpt_rf_bootstrap: true
+scgpt_rf_n_jobs: -1

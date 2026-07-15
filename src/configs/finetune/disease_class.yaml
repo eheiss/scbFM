@@ -60,3 +60,28 @@ min_lr: 1e-6
 min_lr_ratio:
 warmup_steps: 5
 gamma: 1.0
+
+# Raw-expression MLP baseline. Launched with task=finetune.disease_class_raw_mlp.
+raw_mlp_feature_mode: all_genes  # all_genes | hvg1199
+raw_mlp_variant:
+raw_mlp_target_params: 6560000
+raw_mlp_hidden_dim:
+raw_mlp_hidden_layers: 2
+raw_mlp_standardize: true
+raw_mlp_learning_rate: 1e-4
+
+# Backbone-embedding PCA + random-forest baseline. Launched with
+# task=finetune.disease_class_pca_rf.
+pca_rf_variant:
+pca_rf_pooling: mean_cls
+pca_rf_components: 256
+pca_rf_standardize: true
+pca_rf_whiten: false
+pca_rf_n_estimators: 500
+pca_rf_max_depth:
+pca_rf_min_samples_leaf: 1
+pca_rf_min_samples_split: 2
+pca_rf_max_features: sqrt
+pca_rf_class_weight: balanced
+pca_rf_bootstrap: true
+pca_rf_n_jobs: -1
