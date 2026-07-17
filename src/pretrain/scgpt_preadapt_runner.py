@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import anndata as ad
@@ -38,16 +39,20 @@ class ScGPTBulkMaskedDataset(Dataset):
         data_paths: list[str],
         path_indices: np.ndarray,
         row_indices: np.ndarray,
+        n_obs_by_path: list[int],
         source_gene_indices: list[np.ndarray],
         vocab_gene_ids: list[np.ndarray],
         cls_token_id: int,
         cls_value: float,
         selected_gene_count: int,
+        io_block_size: int,
+        io_cache_blocks: int,
         seed: int,
     ) -> None:
         self.data_paths = [str(path) for path in data_paths]
         self.path_indices = np.asarray(path_indices, dtype=np.int16)
         self.row_indices = np.asarray(row_indices, dtype=np.int64)
+        self.n_obs_by_path = [int(n_obs) for n_obs in n_obs_by_path]
         self.source_gene_indices = [
             np.asarray(indices, dtype=np.int64) for indices in source_gene_indices
         ]
@@ -55,9 +60,13 @@ class ScGPTBulkMaskedDataset(Dataset):
         self.cls_token_id = int(cls_token_id)
         self.cls_value = float(cls_value)
         self.selected_gene_count = int(selected_gene_count)
+        self.io_block_size = max(1, int(io_block_size))
+        self.io_cache_blocks = max(1, int(io_cache_blocks))
         self.seed = int(seed)
         self.epoch = 0
         self._adatas: dict[int, ad.AnnData] = {}
+        self._block_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._block_cache_order: list[tuple[int, int]] = []
 
         if self.path_indices.shape[0] != self.row_indices.shape[0]:
             raise ValueError("path_indices and row_indices must have equal length.")
@@ -68,6 +77,8 @@ class ScGPTBulkMaskedDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_adatas"] = {}
+        state["_block_cache"] = {}
+        state["_block_cache_order"] = []
         return state
 
     def __del__(self):
@@ -78,6 +89,8 @@ class ScGPTBulkMaskedDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        self._block_cache.clear()
+        self._block_cache_order.clear()
 
     def _ensure_open(self, path_idx: int) -> ad.AnnData:
         if path_idx not in self._adatas:
@@ -90,12 +103,33 @@ class ScGPTBulkMaskedDataset(Dataset):
             return np.asarray(row.toarray()).ravel()
         return np.asarray(row).ravel()
 
+    @staticmethod
+    def _to_dense_block(block) -> np.ndarray:
+        if sparse.issparse(block):
+            return np.asarray(block.toarray())
+        return np.asarray(block)
+
+    def _read_block(self, path_idx: int, row_idx: int) -> tuple[np.ndarray, int]:
+        block_start = (row_idx // self.io_block_size) * self.io_block_size
+        block_stop = min(block_start + self.io_block_size, self.n_obs_by_path[path_idx])
+        cache_key = (path_idx, block_start)
+        if cache_key not in self._block_cache:
+            adata = self._ensure_open(path_idx)
+            source_indices = self.source_gene_indices[path_idx]
+            block = self._to_dense_block(adata.X[block_start:block_stop, source_indices]).astype(
+                np.float32,
+                copy=False,
+            )
+            self._block_cache[cache_key] = block
+            self._block_cache_order.append(cache_key)
+            while len(self._block_cache_order) > self.io_cache_blocks:
+                old_key = self._block_cache_order.pop(0)
+                self._block_cache.pop(old_key, None)
+        return self._block_cache[cache_key], block_start
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         path_idx = int(self.path_indices[index])
         row_idx = int(self.row_indices[index])
-        adata = self._ensure_open(path_idx)
-
-        source_indices = self.source_gene_indices[path_idx]
         vocab_ids = self.vocab_gene_ids[path_idx]
 
         n_genes = int(vocab_ids.shape[0])
@@ -106,13 +140,10 @@ class ScGPTBulkMaskedDataset(Dataset):
         else:
             selected = np.arange(n_genes, dtype=np.int64)
 
-        # Read only the sampled genes from backed h5ad. Reading all mapped genes
-        # first is prohibitive for ARCHS4-scale bulk matrices and can exceed
-        # job memory before the first training epoch starts.
-        row = self._to_dense_row(adata.X[row_idx, source_indices[selected]]).astype(
-            np.float32,
-            copy=False,
-        )
+        # Read a row block from backed h5ad, then sample genes from memory.
+        # Per-sample backed fancy indexing is prohibitively slow for HDF5.
+        block, block_start = self._read_block(path_idx, row_idx)
+        row = block[row_idx - block_start, selected].astype(np.float32, copy=False)
 
         genes = np.concatenate(
             (
@@ -328,6 +359,7 @@ class ScGPTPreadaptRunner:
 
         source_gene_indices: list[np.ndarray] = []
         vocab_gene_ids: list[np.ndarray] = []
+        n_obs_by_path: list[int] = []
         train_path_ids = []
         train_row_ids = []
         val_path_ids = []
@@ -341,6 +373,7 @@ class ScGPTPreadaptRunner:
                 n_obs = int(backed.n_obs)
             finally:
                 backed.file.close()
+            n_obs_by_path.append(n_obs)
             src_idx, vocab_ids, mapped, total = self._map_genes_for_path(
                 data_path,
                 ensg_to_symbol,
@@ -366,36 +399,50 @@ class ScGPTPreadaptRunner:
 
         train_path_indices = np.concatenate(train_path_ids)
         train_row_indices = np.concatenate(train_row_ids)
+        train_order = np.lexsort((train_row_indices, train_path_indices))
+        train_path_indices = train_path_indices[train_order]
+        train_row_indices = train_row_indices[train_order]
         if val_path_ids:
             val_path_indices = np.concatenate(val_path_ids)
             val_row_indices = np.concatenate(val_row_ids)
+            val_order = np.lexsort((val_row_indices, val_path_indices))
+            val_path_indices = val_path_indices[val_order]
+            val_row_indices = val_row_indices[val_order]
         else:
             val_path_indices = np.asarray([], dtype=np.int16)
             val_row_indices = np.asarray([], dtype=np.int64)
 
         selected_gene_count = int(getattr(self.pretrain_cfg, "selected_gene_count", 1199))
+        io_block_size = int(getattr(self.pretrain_cfg, "io_block_size", 1024))
+        io_cache_blocks = int(getattr(self.pretrain_cfg, "io_cache_blocks", 2))
         pad_value = int(self.model_configs["pad_value"])
         cls_token_id = int(self.vocab["<cls>"])
         self.train_dataset = ScGPTBulkMaskedDataset(
             data_paths=data_path_strs,
             path_indices=train_path_indices,
             row_indices=train_row_indices,
+            n_obs_by_path=n_obs_by_path,
             source_gene_indices=source_gene_indices,
             vocab_gene_ids=vocab_gene_ids,
             cls_token_id=cls_token_id,
             cls_value=float(pad_value),
             selected_gene_count=selected_gene_count,
+            io_block_size=io_block_size,
+            io_cache_blocks=io_cache_blocks,
             seed=seed + self.rank,
         )
         self.val_dataset = ScGPTBulkMaskedDataset(
             data_paths=data_path_strs,
             path_indices=val_path_indices,
             row_indices=val_row_indices,
+            n_obs_by_path=n_obs_by_path,
             source_gene_indices=source_gene_indices,
             vocab_gene_ids=vocab_gene_ids,
             cls_token_id=cls_token_id,
             cls_value=float(pad_value),
             selected_gene_count=selected_gene_count,
+            io_block_size=io_block_size,
+            io_cache_blocks=io_cache_blocks,
             seed=seed,
         )
 
@@ -426,7 +473,7 @@ class ScGPTPreadaptRunner:
                 self.train_dataset,
                 num_replicas=self.world_size,
                 rank=self.rank,
-                shuffle=True,
+                shuffle=False,
             )
             self.train_loader = DataLoader(
                 self.train_dataset,
@@ -452,7 +499,7 @@ class ScGPTPreadaptRunner:
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=int(getattr(self.pretrain_cfg, "batch_size", 16)),
-                shuffle=True,
+                shuffle=False,
                 **loader_kwargs,
             )
             self.val_loader = DataLoader(
@@ -465,10 +512,13 @@ class ScGPTPreadaptRunner:
         if self.is_master:
             self._write_csv(self._output_dir() / f"{self._output_prefix()}_gene_mapping.csv", mapping_rows)
             log.info(
-                "Prepared scGPT bulk preadaptation data: train=%d, val=%d, files=%d",
+                "Prepared scGPT bulk preadaptation data: train=%d, val=%d, files=%d, io_block_size=%d, io_cache_blocks=%d, num_workers=%d",
                 len(self.train_dataset),
                 len(self.val_dataset),
                 len(data_paths),
+                io_block_size,
+                io_cache_blocks,
+                int(loader_kwargs["num_workers"]),
             )
 
     def _build_optimization(self) -> None:
@@ -584,9 +634,22 @@ class ScGPTPreadaptRunner:
 
         grad_acc = int(getattr(self.pretrain_cfg, "grad_acc", 1))
         max_grad_norm = float(getattr(self.pretrain_cfg, "max_grad_norm", 1e2))
+        log_every_batches = int(getattr(self.pretrain_cfg, "log_every_batches", 500))
         local_loss_sum = torch.zeros((), device=self.device)
         local_token_count = torch.zeros((), device=self.device)
         self.optimizer.zero_grad(set_to_none=True)
+        epoch_start = time.perf_counter()
+        last_log_time = epoch_start
+        num_batches = len(self.train_loader)
+
+        if self.is_master:
+            log.info(
+                "scGPT preadapt | epoch=%d | starting train loop: batches=%d | batch_size=%d | grad_acc=%d",
+                epoch,
+                num_batches,
+                int(getattr(self.pretrain_cfg, "batch_size", 16)),
+                grad_acc,
+            )
 
         for step, batch in enumerate(self.train_loader, start=1):
             loss, loss_sum, token_count = self._compute_loss(batch)
@@ -599,19 +662,76 @@ class ScGPTPreadaptRunner:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
+            if (
+                self.is_master
+                and log_every_batches > 0
+                and (step == 1 or step % log_every_batches == 0 or step == num_batches)
+            ):
+                now = time.perf_counter()
+                elapsed = now - epoch_start
+                recent = now - last_log_time
+                last_log_time = now
+                seen_tokens = float(local_token_count.detach().cpu().item())
+                running_loss = (
+                    float(local_loss_sum.detach().cpu().item()) / seen_tokens
+                    if seen_tokens
+                    else float("nan")
+                )
+                log.info(
+                    "scGPT preadapt | epoch=%d | train batch=%d/%d | running_loss=%.6f | masked_tokens=%d | elapsed=%.1fs | recent=%.1fs",
+                    epoch,
+                    step,
+                    num_batches,
+                    running_loss,
+                    int(seen_tokens),
+                    elapsed,
+                    recent,
+                )
+
         loss_sum, token_count = self._reduce_pair(local_loss_sum, local_token_count)
         return {"loss": loss_sum / token_count if token_count else float("nan"), "masked_tokens": token_count}
 
     def _validate(self, epoch: int) -> dict[str, float]:
         self.model.eval()
         self.val_dataset.set_epoch(0)
+        log_every_batches = int(getattr(self.pretrain_cfg, "log_every_batches", 500))
         local_loss_sum = torch.zeros((), device=self.device)
         local_token_count = torch.zeros((), device=self.device)
+        num_batches = len(self.val_loader)
+        val_start = time.perf_counter()
+
+        if self.is_master:
+            log.info(
+                "scGPT preadapt | epoch=%d | starting validation loop: batches=%d",
+                epoch,
+                num_batches,
+            )
+
         with torch.no_grad():
-            for batch in self.val_loader:
+            for step, batch in enumerate(self.val_loader, start=1):
                 _, loss_sum, token_count = self._compute_loss(batch)
                 local_loss_sum += loss_sum
                 local_token_count += token_count
+                if (
+                    self.is_master
+                    and log_every_batches > 0
+                    and (step == 1 or step % log_every_batches == 0 or step == num_batches)
+                ):
+                    seen_tokens = float(local_token_count.detach().cpu().item())
+                    running_loss = (
+                        float(local_loss_sum.detach().cpu().item()) / seen_tokens
+                        if seen_tokens
+                        else float("nan")
+                    )
+                    log.info(
+                        "scGPT preadapt | epoch=%d | val batch=%d/%d | running_loss=%.6f | masked_tokens=%d | elapsed=%.1fs",
+                        epoch,
+                        step,
+                        num_batches,
+                        running_loss,
+                        int(seen_tokens),
+                        time.perf_counter() - val_start,
+                    )
         loss_sum, token_count = self._reduce_pair(local_loss_sum, local_token_count)
         return {"loss": loss_sum / token_count if token_count else float("nan"), "masked_tokens": token_count}
 
