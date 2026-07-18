@@ -49,7 +49,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
 
     def _finetune_mode(self) -> str:
         variant = str(getattr(self.task_cfg, "pca_rf_variant", "") or "").strip()
-        return variant or "pca_rf_mean_cls"
+        return variant or "pca_rf"
 
     def _task_output_dir(self) -> Path:
         return ROOT / "output" / self.task_name / self._finetune_mode()
@@ -129,20 +129,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
         return backbone
 
     def _pool_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        pooling = str(getattr(self.task_cfg, "pca_rf_pooling", "mean_cls"))
-        cls_hidden = hidden[:, 0, :]
-        gene_hidden = hidden[:, 1:, :]
-        mean_hidden = gene_hidden.mean(dim=1)
-        if pooling == "cls":
-            return cls_hidden
-        if pooling == "mean":
-            return mean_hidden
-        if pooling == "mean_cls":
-            return torch.cat((cls_hidden, mean_hidden), dim=-1)
-        raise ValueError(
-            f"Unsupported finetune.{self.config_node}.pca_rf_pooling='{pooling}'. "
-            "Expected one of: cls, mean, mean_cls."
-        )
+        return hidden[:, 0, :]
 
     def _extract_embeddings(
         self,

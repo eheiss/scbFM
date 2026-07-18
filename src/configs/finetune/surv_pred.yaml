@@ -52,8 +52,7 @@ min_genes: 200
 hvg_flavor: cell_ranger
 hvg_batch_key:
 
-# Neural Cox head. Default uses CLS concatenated with mean-pooled gene tokens.
-head_pooling: mean_cls
+# Neural Cox head uses the CancerFoundation CLS embedding.
 head_hidden_dim: 512
 head_bottleneck_dim: 256
 output_suffix: ""

@@ -163,6 +163,110 @@ class ScGPTBulkMaskedDataset(Dataset):
         }
 
 
+class ScGPTPreTokenizedDataset(Dataset):
+    """Memmap-backed pre-tokenized scGPT dataset.
+
+    The cache stores gene ids and already-binned expression values. Runtime
+    masking is still done in the collator, so each epoch still sees fresh masks.
+    """
+
+    def __init__(
+        self,
+        *,
+        cache_dir: Path,
+        split: str,
+        n_samples: int,
+        seq_len: int,
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.split = str(split)
+        self.n_samples = int(n_samples)
+        self.seq_len = int(seq_len)
+        self.epoch = 0
+        self._genes: np.memmap | None = None
+        self._expr: np.memmap | None = None
+        self._opened_epoch: int | None = None
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_genes"] = None
+        state["_expr"] = None
+        state["_opened_epoch"] = None
+        return state
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        if self._opened_epoch != self.epoch:
+            self._genes = None
+            self._expr = None
+            self._opened_epoch = None
+
+    def _prefix(self) -> str:
+        return f"{self.split}_epoch{self.epoch:03d}"
+
+    def _ensure_open(self) -> None:
+        if self._opened_epoch == self.epoch and self._genes is not None and self._expr is not None:
+            return
+        prefix = self._prefix()
+        genes_path = self.cache_dir / f"{prefix}_genes.int32.dat"
+        expr_path = self.cache_dir / f"{prefix}_expr.int16.dat"
+        if not genes_path.exists() or not expr_path.exists():
+            raise FileNotFoundError(
+                f"Missing pre-tokenized scGPT cache for {self.split} epoch {self.epoch}: "
+                f"{genes_path}, {expr_path}"
+            )
+        self._genes = np.memmap(genes_path, mode="r", dtype=np.int32, shape=(self.n_samples, self.seq_len))
+        self._expr = np.memmap(expr_path, mode="r", dtype=np.int16, shape=(self.n_samples, self.seq_len))
+        self._opened_epoch = self.epoch
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        self._ensure_open()
+        assert self._genes is not None and self._expr is not None
+        genes = np.asarray(self._genes[index], dtype=np.int64)
+        expr = np.asarray(self._expr[index], dtype=np.float32)
+        return {
+            "genes": torch.as_tensor(genes, dtype=torch.long),
+            "expressions": torch.as_tensor(expr, dtype=torch.float32),
+        }
+
+
+class PreBinnedMaskCollator:
+    """Collator for pre-tokenized and pre-binned fixed-length scGPT examples."""
+
+    def __init__(
+        self,
+        *,
+        pad_value: int,
+        mask_value: int,
+        mlm_probability: float,
+        keep_first_n_tokens: int = 1,
+    ) -> None:
+        self.pad_value = int(pad_value)
+        self.mask_value = int(mask_value)
+        self.mlm_probability = float(mlm_probability)
+        self.keep_first_n_tokens = int(keep_first_n_tokens)
+        if self.mlm_probability <= 0 or self.mlm_probability >= 1:
+            raise ValueError("mlm_probability must be between 0 and 1.")
+
+    def __call__(self, examples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        genes = torch.stack([example["genes"] for example in examples], dim=0)
+        expressions = torch.stack([example["expressions"] for example in examples], dim=0)
+        probability_matrix = torch.full(expressions.shape, self.mlm_probability)
+        probability_matrix[expressions.eq(self.pad_value)] = 0
+        if self.keep_first_n_tokens > 0:
+            probability_matrix[:, : self.keep_first_n_tokens] = 0
+        mask = torch.bernoulli(probability_matrix).bool()
+        masked_expressions = expressions.masked_fill(mask, self.mask_value)
+        return {
+            "gene": genes,
+            "expr": expressions,
+            "masked_expr": masked_expressions,
+        }
+
+
 class ScGPTPreadaptRunner:
     """Continue scGPT masked-value training on unsupervised bulk data."""
 
@@ -186,6 +290,8 @@ class ScGPTPreadaptRunner:
         self.val_loader = None
         self.vocab = None
         self.model_configs: dict | None = None
+        self.scaler = None
+        self._pretokenize_context: dict[str, object] | None = None
 
     def _setup_runtime(self) -> None:
         if self.is_distributed and not dist.is_initialized():
@@ -245,10 +351,11 @@ class ScGPTPreadaptRunner:
             sys.path.insert(0, repo_dir_str)
         from scgpt.data_collator import DataCollator
         from scgpt.model import TransformerModel
+        from scgpt.preprocess import binning
         from scgpt.tokenizer import GeneVocab
         from scgpt.utils import load_pretrained
 
-        return DataCollator, TransformerModel, GeneVocab, load_pretrained
+        return DataCollator, TransformerModel, GeneVocab, load_pretrained, binning
 
     @staticmethod
     def _strip_ensembl_version(values: pd.Series | np.ndarray | list[str]) -> pd.Series:
@@ -296,7 +403,7 @@ class ScGPTPreadaptRunner:
         return source_indices, vocab_ids, int(source_indices.size), n_vars
 
     def _build_model(self, paths: dict[str, Path]) -> None:
-        _, TransformerModel, GeneVocab, load_pretrained = self._import_scgpt(paths["repo_dir"])
+        _, TransformerModel, GeneVocab, load_pretrained, _ = self._import_scgpt(paths["repo_dir"])
         vocab = GeneVocab.from_file(paths["vocab"])
         for token in ("<pad>", "<cls>", "<eoc>"):
             if token not in vocab:
@@ -332,13 +439,24 @@ class ScGPTPreadaptRunner:
         )
         log.info("Loading pretrained scGPT checkpoint from %s", paths["checkpoint"])
         load_pretrained(model, torch.load(paths["checkpoint"], map_location="cpu"), verbose=False)
+        if bool(getattr(self.pretrain_cfg, "freeze_unused_cls_decoder", True)) and hasattr(model, "cls_decoder"):
+            for param in model.cls_decoder.parameters():
+                param.requires_grad_(False)
+            if self.is_master:
+                log.info("Froze unused scGPT cls_decoder parameters for unsupervised preadaptation.")
         model = model.to(self.device)
 
         if self.is_distributed:
+            find_unused = bool(getattr(self.pretrain_cfg, "ddp_find_unused_parameters", False))
             if self.device.type == "cuda":
-                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank)
+                model = DDP(
+                    model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=find_unused,
+                )
             else:
-                model = DDP(model)
+                model = DDP(model, find_unused_parameters=find_unused)
 
         self.model = model
         self.vocab = vocab
@@ -352,8 +470,278 @@ class ScGPTPreadaptRunner:
         train_idx, val_idx = train_test_split(indices, test_size=val_fraction, random_state=seed)
         return np.asarray(train_idx, dtype=np.int64), np.asarray(val_idx, dtype=np.int64)
 
+    def _pretokenized_cache_dir(self) -> Path:
+        cache_dir = getattr(self.pretrain_cfg, "pretokenized_cache_dir", None)
+        if cache_dir:
+            return Path(hydra.utils.to_absolute_path(str(cache_dir)))
+        return self._output_dir() / "pretokenized_cache"
+
+    def _cache_prefix(self, split: str, epoch: int) -> str:
+        return f"{split}_epoch{int(epoch):03d}"
+
+    def _cache_paths(self, split: str, epoch: int) -> dict[str, Path]:
+        cache_dir = self._pretokenized_cache_dir()
+        prefix = self._cache_prefix(split, epoch)
+        return {
+            "dir": cache_dir,
+            "genes": cache_dir / f"{prefix}_genes.int32.dat",
+            "expr": cache_dir / f"{prefix}_expr.int16.dat",
+            "metadata": cache_dir / f"{prefix}_metadata.json",
+        }
+
+    def _cache_metadata(
+        self,
+        *,
+        split: str,
+        epoch: int,
+        n_samples: int,
+        seq_len: int,
+        data_path_strs: list[str],
+        seed: int,
+    ) -> dict[str, object]:
+        return {
+            "split": str(split),
+            "epoch": int(epoch),
+            "n_samples": int(n_samples),
+            "seq_len": int(seq_len),
+            "selected_gene_count": int(getattr(self.pretrain_cfg, "selected_gene_count", 1199)),
+            "n_bins": int(self.model_configs.get("n_bins", 51)),
+            "seed": int(seed),
+            "mask_prob": float(getattr(self.pretrain_cfg, "mask_prob", 0.15)),
+            "data_paths": [str(path) for path in data_path_strs],
+        }
+
+    @staticmethod
+    def _cache_is_ready(paths: dict[str, Path], expected_metadata: dict[str, object]) -> bool:
+        if not paths["genes"].exists() or not paths["expr"].exists() or not paths["metadata"].exists():
+            return False
+        try:
+            current = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return all(current.get(key) == value for key, value in expected_metadata.items())
+
+    def _write_pretokenized_cache(
+        self,
+        *,
+        split: str,
+        epoch: int,
+        path_indices: np.ndarray,
+        row_indices: np.ndarray,
+        data_path_strs: list[str],
+        n_obs_by_path: list[int],
+        source_gene_indices: list[np.ndarray],
+        vocab_gene_ids: list[np.ndarray],
+        cls_token_id: int,
+        pad_token_id: int,
+        cls_value: float,
+        pad_value: int,
+        selected_gene_count: int,
+        io_block_size: int,
+        seed: int,
+        binning,
+    ) -> None:
+        n_samples = int(row_indices.shape[0])
+        seq_len = int(selected_gene_count) + 1
+        paths = self._cache_paths(split, epoch)
+        metadata = self._cache_metadata(
+            split=split,
+            epoch=epoch,
+            n_samples=n_samples,
+            seq_len=seq_len,
+            data_path_strs=data_path_strs,
+            seed=seed,
+        )
+        if self._cache_is_ready(paths, metadata):
+            log.info("scGPT preadapt | using existing pre-tokenized cache: split=%s epoch=%d", split, epoch)
+            return
+
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+        tmp_genes = paths["genes"].with_suffix(paths["genes"].suffix + ".tmp")
+        tmp_expr = paths["expr"].with_suffix(paths["expr"].suffix + ".tmp")
+        tmp_metadata = paths["metadata"].with_suffix(paths["metadata"].suffix + ".tmp")
+        for path in (tmp_genes, tmp_expr, tmp_metadata):
+            if path.exists():
+                path.unlink()
+
+        genes_mm = np.memmap(tmp_genes, mode="w+", dtype=np.int32, shape=(n_samples, seq_len))
+        expr_mm = np.memmap(tmp_expr, mode="w+", dtype=np.int16, shape=(n_samples, seq_len))
+        genes_mm[:, :] = int(pad_token_id)
+        expr_mm[:, :] = int(pad_value)
+        genes_mm[:, 0] = int(cls_token_id)
+        expr_mm[:, 0] = int(cls_value)
+
+        start_time = time.perf_counter()
+        blocks_done = 0
+        cache_log_every_blocks = int(getattr(self.pretrain_cfg, "cache_log_every_blocks", 100))
+        if n_samples == 0:
+            genes_mm.flush()
+            expr_mm.flush()
+        else:
+            total_blocks = int(
+                sum(
+                    np.unique((row_indices[np.flatnonzero(path_indices == path_idx)] // int(io_block_size)) * int(io_block_size)).shape[0]
+                    for path_idx in np.unique(path_indices)
+                )
+            )
+            for path_idx in np.unique(path_indices):
+                path_idx_int = int(path_idx)
+                source_indices = source_gene_indices[path_idx_int]
+                vocab_ids = vocab_gene_ids[path_idx_int]
+                n_genes = int(vocab_ids.shape[0])
+                sample_positions = np.flatnonzero(path_indices == path_idx)
+                rows_for_path = row_indices[sample_positions]
+                block_starts = (rows_for_path // int(io_block_size)) * int(io_block_size)
+
+                backed = ad.read_h5ad(data_path_strs[path_idx_int], backed="r")
+                try:
+                    for block_start in np.unique(block_starts):
+                        block_start_int = int(block_start)
+                        block_stop = min(block_start_int + int(io_block_size), n_obs_by_path[path_idx_int])
+                        in_block = np.flatnonzero(block_starts == block_start)
+                        positions = sample_positions[in_block]
+                        rows = rows_for_path[in_block]
+                        block = ScGPTBulkMaskedDataset._to_dense_block(
+                            backed.X[block_start_int:block_stop, source_indices]
+                        ).astype(np.float32, copy=False)
+
+                        for pos, row_idx in zip(positions, rows, strict=False):
+                            if selected_gene_count < n_genes:
+                                rng = np.random.default_rng(seed + int(epoch) * 1_000_003 + int(pos))
+                                selected = rng.choice(n_genes, size=selected_gene_count, replace=False)
+                                selected.sort()
+                            else:
+                                selected = np.arange(n_genes, dtype=np.int64)
+                            selected_len = int(selected.shape[0])
+                            row = block[int(row_idx) - block_start_int, selected].astype(np.float32, copy=False)
+                            binned = binning(row=row, n_bins=int(self.model_configs.get("n_bins", 51)))
+                            genes_mm[int(pos), 1 : selected_len + 1] = vocab_ids[selected].astype(np.int32, copy=False)
+                            expr_mm[int(pos), 1 : selected_len + 1] = np.asarray(binned, dtype=np.int16)
+                        blocks_done += 1
+                        if cache_log_every_blocks > 0 and (
+                            blocks_done == 1
+                            or blocks_done % cache_log_every_blocks == 0
+                            or blocks_done == total_blocks
+                        ):
+                            log.info(
+                                "scGPT preadapt | cache split=%s epoch=%d block=%d/%d elapsed=%.1fs",
+                                split,
+                                epoch,
+                                blocks_done,
+                                total_blocks,
+                                time.perf_counter() - start_time,
+                            )
+                finally:
+                    backed.file.close()
+
+        genes_mm.flush()
+        expr_mm.flush()
+        del genes_mm
+        del expr_mm
+        tmp_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        tmp_genes.replace(paths["genes"])
+        tmp_expr.replace(paths["expr"])
+        tmp_metadata.replace(paths["metadata"])
+        log.info(
+            "scGPT preadapt | wrote pre-tokenized cache: split=%s epoch=%d samples=%d seq_len=%d elapsed=%.1fs",
+            split,
+            epoch,
+            n_samples,
+            seq_len,
+            time.perf_counter() - start_time,
+        )
+
+    def _ensure_pretokenized_cache(self, split: str, epoch: int) -> None:
+        if not bool(getattr(self.pretrain_cfg, "use_pretokenized_cache", False)):
+            return
+        if self._pretokenize_context is None:
+            raise RuntimeError("Pretokenized cache context has not been initialized.")
+        ctx = self._pretokenize_context
+        path_indices = ctx[f"{split}_path_indices"]
+        row_indices = ctx[f"{split}_row_indices"]
+        n_samples = int(row_indices.shape[0])
+        seq_len = int(ctx["selected_gene_count"]) + 1
+        data_path_strs = list(ctx["data_path_strs"])
+        seed = int(ctx["seed"])
+        paths = self._cache_paths(split, epoch)
+        metadata = self._cache_metadata(
+            split=split,
+            epoch=epoch,
+            n_samples=n_samples,
+            seq_len=seq_len,
+            data_path_strs=data_path_strs,
+            seed=seed,
+        )
+        cache_ready = self._cache_is_ready(paths, metadata)
+        build_cache = bool(getattr(self.pretrain_cfg, "build_pretokenized_cache", False))
+        if not cache_ready and not build_cache:
+            raise FileNotFoundError(
+                "Missing pre-tokenized scGPT cache for "
+                f"split={split}, epoch={epoch}: {paths['metadata']}. "
+                "Build it first with pretrain.pretokenize_only=true and "
+                "pretrain.build_pretokenized_cache=true, or set "
+                "pretrain.build_pretokenized_cache=true for single-process debugging."
+            )
+
+        if self.is_master and not cache_ready:
+            _, _, _, _, binning = self._import_scgpt(Path(ctx["repo_dir"]))
+            self._write_pretokenized_cache(
+                split=split,
+                epoch=epoch,
+                path_indices=path_indices,
+                row_indices=row_indices,
+                data_path_strs=data_path_strs,
+                n_obs_by_path=list(ctx["n_obs_by_path"]),
+                source_gene_indices=list(ctx["source_gene_indices"]),
+                vocab_gene_ids=list(ctx["vocab_gene_ids"]),
+                cls_token_id=int(ctx["cls_token_id"]),
+                pad_token_id=int(ctx["pad_token_id"]),
+                cls_value=float(ctx["cls_value"]),
+                pad_value=int(ctx["pad_value"]),
+                selected_gene_count=int(ctx["selected_gene_count"]),
+                io_block_size=int(ctx["io_block_size"]),
+                seed=seed,
+                binning=binning,
+            )
+        if self.is_distributed:
+            dist.barrier()
+        if not self._cache_is_ready(paths, metadata):
+            raise FileNotFoundError(f"Pre-tokenized cache was not created for split={split}, epoch={epoch}.")
+
+    def _pretokenize_all(self) -> dict[str, object]:
+        if not bool(getattr(self.pretrain_cfg, "use_pretokenized_cache", False)):
+            raise RuntimeError("pretokenize_only requires pretrain.use_pretokenized_cache=true.")
+
+        epochs = int(
+            getattr(
+                self.pretrain_cfg,
+                "pretokenize_epochs",
+                int(getattr(self.pretrain_cfg, "epochs", 5)),
+            )
+            or int(getattr(self.pretrain_cfg, "epochs", 5))
+        )
+        start_time = time.perf_counter()
+        if self.is_master:
+            log.info(
+                "scGPT preadapt | pre-tokenization-only mode: building val epoch=0 and train epochs=1..%d",
+                epochs,
+            )
+
+        self._ensure_pretokenized_cache("val", 0)
+        for epoch in range(1, epochs + 1):
+            self._ensure_pretokenized_cache("train", epoch)
+
+        elapsed = time.perf_counter() - start_time
+        if self.is_master:
+            log.info("scGPT preadapt | pre-tokenization complete in %.1fs", elapsed)
+        return {
+            "pretokenized_cache_dir": str(self._pretokenized_cache_dir()),
+            "pretokenize_epochs": epochs,
+            "elapsed_seconds": elapsed,
+        }
+
     def _build_loaders(self, data_paths: list[Path], paths: dict[str, Path]) -> None:
-        DataCollator, _, _, _ = self._import_scgpt(paths["repo_dir"])
+        DataCollator, _, _, _, _ = self._import_scgpt(paths["repo_dir"])
         ensg_to_symbol = self._gene_info_mapping(paths["gene_info"])
         data_path_strs = [str(path) for path in data_paths]
 
@@ -416,48 +804,90 @@ class ScGPTPreadaptRunner:
         io_block_size = int(getattr(self.pretrain_cfg, "io_block_size", 1024))
         io_cache_blocks = int(getattr(self.pretrain_cfg, "io_cache_blocks", 2))
         pad_value = int(self.model_configs["pad_value"])
+        pad_token_id = int(self.vocab[str(self.model_configs["pad_token"])])
         cls_token_id = int(self.vocab["<cls>"])
-        self.train_dataset = ScGPTBulkMaskedDataset(
-            data_paths=data_path_strs,
-            path_indices=train_path_indices,
-            row_indices=train_row_indices,
-            n_obs_by_path=n_obs_by_path,
-            source_gene_indices=source_gene_indices,
-            vocab_gene_ids=vocab_gene_ids,
-            cls_token_id=cls_token_id,
-            cls_value=float(pad_value),
-            selected_gene_count=selected_gene_count,
-            io_block_size=io_block_size,
-            io_cache_blocks=io_cache_blocks,
-            seed=seed + self.rank,
-        )
-        self.val_dataset = ScGPTBulkMaskedDataset(
-            data_paths=data_path_strs,
-            path_indices=val_path_indices,
-            row_indices=val_row_indices,
-            n_obs_by_path=n_obs_by_path,
-            source_gene_indices=source_gene_indices,
-            vocab_gene_ids=vocab_gene_ids,
-            cls_token_id=cls_token_id,
-            cls_value=float(pad_value),
-            selected_gene_count=selected_gene_count,
-            io_block_size=io_block_size,
-            io_cache_blocks=io_cache_blocks,
-            seed=seed,
-        )
+        use_pretokenized_cache = bool(getattr(self.pretrain_cfg, "use_pretokenized_cache", False))
+        if use_pretokenized_cache:
+            seq_len = selected_gene_count + 1
+            cache_dir = self._pretokenized_cache_dir()
+            self._pretokenize_context = {
+                "repo_dir": str(paths["repo_dir"]),
+                "data_path_strs": data_path_strs,
+                "n_obs_by_path": n_obs_by_path,
+                "source_gene_indices": source_gene_indices,
+                "vocab_gene_ids": vocab_gene_ids,
+                "train_path_indices": train_path_indices,
+                "train_row_indices": train_row_indices,
+                "val_path_indices": val_path_indices,
+                "val_row_indices": val_row_indices,
+                "cls_token_id": cls_token_id,
+                "pad_token_id": pad_token_id,
+                "cls_value": float(pad_value),
+                "pad_value": pad_value,
+                "selected_gene_count": selected_gene_count,
+                "io_block_size": io_block_size,
+                "seed": seed,
+            }
+            self.train_dataset = ScGPTPreTokenizedDataset(
+                cache_dir=cache_dir,
+                split="train",
+                n_samples=int(train_row_indices.shape[0]),
+                seq_len=seq_len,
+            )
+            self.val_dataset = ScGPTPreTokenizedDataset(
+                cache_dir=cache_dir,
+                split="val",
+                n_samples=int(val_row_indices.shape[0]),
+                seq_len=seq_len,
+            )
+            collator = PreBinnedMaskCollator(
+                pad_value=pad_value,
+                mask_value=int(self.model_configs.get("mask_value", -1)),
+                mlm_probability=float(getattr(self.pretrain_cfg, "mask_prob", 0.15)),
+                keep_first_n_tokens=1,
+            )
+        else:
+            self.train_dataset = ScGPTBulkMaskedDataset(
+                data_paths=data_path_strs,
+                path_indices=train_path_indices,
+                row_indices=train_row_indices,
+                n_obs_by_path=n_obs_by_path,
+                source_gene_indices=source_gene_indices,
+                vocab_gene_ids=vocab_gene_ids,
+                cls_token_id=cls_token_id,
+                cls_value=float(pad_value),
+                selected_gene_count=selected_gene_count,
+                io_block_size=io_block_size,
+                io_cache_blocks=io_cache_blocks,
+                seed=seed + self.rank,
+            )
+            self.val_dataset = ScGPTBulkMaskedDataset(
+                data_paths=data_path_strs,
+                path_indices=val_path_indices,
+                row_indices=val_row_indices,
+                n_obs_by_path=n_obs_by_path,
+                source_gene_indices=source_gene_indices,
+                vocab_gene_ids=vocab_gene_ids,
+                cls_token_id=cls_token_id,
+                cls_value=float(pad_value),
+                selected_gene_count=selected_gene_count,
+                io_block_size=io_block_size,
+                io_cache_blocks=io_cache_blocks,
+                seed=seed,
+            )
 
-        collator = DataCollator(
-            do_padding=True,
-            pad_token_id=int(self.vocab[str(self.model_configs["pad_token"])]),
-            pad_value=pad_value,
-            do_mlm=True,
-            do_binning=True,
-            mlm_probability=float(getattr(self.pretrain_cfg, "mask_prob", 0.15)),
-            mask_value=int(self.model_configs.get("mask_value", -1)),
-            max_length=selected_gene_count + 1,
-            sampling=False,
-            keep_first_n_tokens=1,
-        )
+            collator = DataCollator(
+                do_padding=True,
+                pad_token_id=pad_token_id,
+                pad_value=pad_value,
+                do_mlm=True,
+                do_binning=True,
+                mlm_probability=float(getattr(self.pretrain_cfg, "mask_prob", 0.15)),
+                mask_value=int(self.model_configs.get("mask_value", -1)),
+                max_length=selected_gene_count + 1,
+                sampling=False,
+                keep_first_n_tokens=1,
+            )
 
         loader_kwargs: dict[str, object] = {
             "num_workers": int(getattr(self.pretrain_cfg, "num_workers", 2)),
@@ -466,7 +896,7 @@ class ScGPTPreadaptRunner:
         }
         if loader_kwargs["num_workers"] > 0:
             loader_kwargs["prefetch_factor"] = int(getattr(self.pretrain_cfg, "prefetch_factor", 2))
-            loader_kwargs["persistent_workers"] = False
+            loader_kwargs["persistent_workers"] = bool(getattr(self.pretrain_cfg, "persistent_workers", False))
 
         if self.is_distributed:
             train_sampler = DistributedSampler(
@@ -512,18 +942,20 @@ class ScGPTPreadaptRunner:
         if self.is_master:
             self._write_csv(self._output_dir() / f"{self._output_prefix()}_gene_mapping.csv", mapping_rows)
             log.info(
-                "Prepared scGPT bulk preadaptation data: train=%d, val=%d, files=%d, io_block_size=%d, io_cache_blocks=%d, num_workers=%d",
+                "Prepared scGPT bulk preadaptation data: train=%d, val=%d, files=%d, io_block_size=%d, io_cache_blocks=%d, num_workers=%d, pretokenized_cache=%s",
                 len(self.train_dataset),
                 len(self.val_dataset),
                 len(data_paths),
                 io_block_size,
                 io_cache_blocks,
                 int(loader_kwargs["num_workers"]),
+                use_pretokenized_cache,
             )
 
     def _build_optimization(self) -> None:
         learning_rate = float(getattr(self.pretrain_cfg, "learning_rate", 1e-4))
-        self.optimizer = Adam(self.model.parameters(), lr=learning_rate)
+        trainable_params = [param for param in self.model.parameters() if param.requires_grad]
+        self.optimizer = Adam(trainable_params, lr=learning_rate)
         self.scheduler = CosineAnnealingWarmupRestarts(
             self.optimizer,
             first_cycle_steps=int(getattr(self.pretrain_cfg, "first_cycle_steps", 5)),
@@ -533,6 +965,14 @@ class ScGPTPreadaptRunner:
             warmup_steps=int(getattr(self.pretrain_cfg, "warmup_steps", 1)),
             gamma=float(getattr(self.pretrain_cfg, "gamma", 1.0)),
         )
+        amp_enabled = bool(getattr(self.pretrain_cfg, "amp", True)) and self.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+    def _amp_dtype(self) -> torch.dtype:
+        value = str(getattr(self.pretrain_cfg, "amp_dtype", "float16")).lower()
+        if value in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        return torch.float16
 
     def _model_name(self) -> str:
         return str(getattr(self.pretrain_cfg, "model_name", "scgpt_preadapt_bulk"))
@@ -590,31 +1030,33 @@ class ScGPTPreadaptRunner:
         mask_value = int(self.model_configs.get("mask_value", -1))
         masked_positions = masked_expr.eq(mask_value)
 
-        output = self.model(
-            gene,
-            masked_expr,
-            src_key_padding_mask=padding_mask,
-            MVC=bool(getattr(self.pretrain_cfg, "do_mvc", False)),
-        )
-        mask = masked_positions.float()
-        token_count = mask.sum()
-        if token_count.item() == 0:
-            loss_sum = output["mlm_output"].sum() * 0.0
-            return loss_sum, loss_sum.detach(), token_count.detach()
+        amp_enabled = bool(getattr(self.pretrain_cfg, "amp", True)) and self.device.type == "cuda"
+        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=self._amp_dtype()):
+            output = self.model(
+                gene,
+                masked_expr,
+                src_key_padding_mask=padding_mask,
+                MVC=bool(getattr(self.pretrain_cfg, "do_mvc", False)),
+            )
+            mask = masked_positions.float()
+            token_count = mask.sum()
+            if token_count.item() == 0:
+                loss_sum = output["mlm_output"].sum() * 0.0
+                return loss_sum, loss_sum.detach(), token_count.detach()
 
-        loss_sum = F.mse_loss(
-            output["mlm_output"] * mask,
-            target_expr * mask,
-            reduction="sum",
-        )
-        total_loss_sum = loss_sum
-        if bool(getattr(self.pretrain_cfg, "do_mvc", False)):
-            mvc_loss_sum = F.mse_loss(
-                output["mvc_output"] * mask,
+            loss_sum = F.mse_loss(
+                output["mlm_output"] * mask,
                 target_expr * mask,
                 reduction="sum",
             )
-            total_loss_sum = total_loss_sum + mvc_loss_sum
+            total_loss_sum = loss_sum
+            if bool(getattr(self.pretrain_cfg, "do_mvc", False)):
+                mvc_loss_sum = F.mse_loss(
+                    output["mvc_output"] * mask,
+                    target_expr * mask,
+                    reduction="sum",
+                )
+                total_loss_sum = total_loss_sum + mvc_loss_sum
         loss = total_loss_sum / token_count
         return loss, total_loss_sum.detach(), token_count.detach()
 
@@ -627,6 +1069,7 @@ class ScGPTPreadaptRunner:
         return float(loss_sum.detach().cpu().item()), float(token_count.detach().cpu().item())
 
     def _train_epoch(self, epoch: int) -> dict[str, float]:
+        self._ensure_pretokenized_cache("train", epoch)
         self.model.train()
         self.train_dataset.set_epoch(epoch)
         if self.is_distributed and isinstance(self.train_loader.sampler, DistributedSampler):
@@ -653,13 +1096,25 @@ class ScGPTPreadaptRunner:
 
         for step, batch in enumerate(self.train_loader, start=1):
             loss, loss_sum, token_count = self._compute_loss(batch)
-            (loss / grad_acc).backward()
+            if self.scaler is not None and self.scaler.is_enabled():
+                self.scaler.scale(loss / grad_acc).backward()
+            else:
+                (loss / grad_acc).backward()
             local_loss_sum += loss_sum
             local_token_count += token_count
 
             if step % grad_acc == 0 or step == len(self.train_loader):
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-                self.optimizer.step()
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [param for param in self.model.parameters() if param.requires_grad],
+                    max_grad_norm,
+                )
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
             if (
@@ -692,6 +1147,7 @@ class ScGPTPreadaptRunner:
         return {"loss": loss_sum / token_count if token_count else float("nan"), "masked_tokens": token_count}
 
     def _validate(self, epoch: int) -> dict[str, float]:
+        self._ensure_pretokenized_cache("val", 0)
         self.model.eval()
         self.val_dataset.set_epoch(0)
         log_every_batches = int(getattr(self.pretrain_cfg, "log_every_batches", 500))
@@ -756,6 +1212,7 @@ class ScGPTPreadaptRunner:
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict() if self.scaler is not None else None,
             },
             out_dir / f"{prefix}_{name}_training_checkpoint.pth",
         )
@@ -768,6 +1225,8 @@ class ScGPTPreadaptRunner:
             self._build_model(paths)
             self._save_config(paths, data_paths)
             self._build_loaders(data_paths, paths)
+            if bool(getattr(self.pretrain_cfg, "pretokenize_only", False)):
+                return self._pretokenize_all()
             self._build_optimization()
 
             history: list[dict[str, object]] = []
@@ -808,6 +1267,7 @@ class ScGPTPreadaptRunner:
                         self._output_dir() / f"{self._output_prefix()}_metrics.csv",
                         history,
                     )
+                self._save_checkpoint("latest", epoch, row["val_loss"])
 
             self._save_checkpoint("last", epochs, history[-1]["val_loss"])
             return {
@@ -817,5 +1277,4 @@ class ScGPTPreadaptRunner:
             }
         finally:
             if self.is_distributed and dist.is_initialized():
-                dist.barrier()
                 dist.destroy_process_group()

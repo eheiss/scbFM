@@ -53,7 +53,7 @@ hvg_batch_key:
 survival_event_col: OS
 survival_time_col: OS.time
 
-head_pooling: mean_cls
+# Binary survival head uses the CancerFoundation CLS embedding.
 cv_folds: 5
 random_seed: 42
 

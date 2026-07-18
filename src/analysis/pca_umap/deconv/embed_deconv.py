@@ -61,7 +61,7 @@ for name, ckpt_path in CHECKPOINTS.items():
         ckpt_path,
         adata,
         hvg_indices,
-        pooling="mean_cls",
+        pooling="cls",
     )
 
 save_dict: dict[str, np.ndarray] = {

@@ -228,15 +228,10 @@ def build_backbone(checkpoint_path: str | None) -> CancerFoundationBackbone:
     return model.to(DEVICE).eval()
 
 
-def pool_hidden(hidden: torch.Tensor, *, pooling: str = "mean_cls") -> torch.Tensor:
-    pooling = pooling.lower()
-    if pooling == "cls":
-        return hidden[:, 0, :]
-    if pooling == "mean":
-        return hidden[:, 1:, :].mean(dim=1)
-    if pooling == "mean_cls":
-        return torch.cat((hidden[:, 0, :], hidden[:, 1:, :].mean(dim=1)), dim=-1)
-    raise ValueError(f"Unsupported pooling: {pooling}")
+def pool_hidden(hidden: torch.Tensor, *, pooling: str = "cls") -> torch.Tensor:
+    if pooling.lower() != "cls":
+        raise ValueError("PCA/UMAP sample embeddings use the CLS embedding only.")
+    return hidden[:, 0, :]
 
 
 @torch.no_grad()
@@ -245,7 +240,7 @@ def extract_sample_embeddings(
     adata: ad.AnnData,
     fixed_gene_indices: np.ndarray,
     *,
-    pooling: str = "mean_cls",
+    pooling: str = "cls",
 ) -> np.ndarray:
     model = build_backbone(checkpoint_path)
     parts: list[np.ndarray] = []

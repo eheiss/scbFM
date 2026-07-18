@@ -173,17 +173,10 @@ class SurvivalPredHead(nn.Module):
         embedding_dim: int,
         hidden_dim: int = 512,
         bottleneck_dim: int = 256,
-        pooling: str = "cls",
     ) -> None:
         super().__init__()
-        valid_pooling = {"cls", "mean", "mean_cls"}
-        if pooling not in valid_pooling:
-            raise ValueError(
-                f"Unsupported survival head pooling '{pooling}'. "
-                f"Expected one of {sorted(valid_pooling)}."
-            )
-        self.pooling = pooling
-        input_dim = embedding_dim * 2 if pooling == "mean_cls" else embedding_dim
+        self.pooling = "cls"
+        input_dim = embedding_dim
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SELU(),
@@ -193,14 +186,7 @@ class SurvivalPredHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean_gene_embedding = x[:, 1:, :].mean(dim=1)
-        if self.pooling == "cls":
-            sample_embedding = x[:, 0, :]
-        elif self.pooling == "mean":
-            sample_embedding = mean_gene_embedding
-        else:
-            sample_embedding = torch.cat((x[:, 0, :], mean_gene_embedding), dim=-1)
-        return self.mlp(sample_embedding).squeeze(-1)  # (B,)
+        return self.mlp(x[:, 0, :]).squeeze(-1)  # (B,)
 
 
 class CancerFoundationSurvivalModel(nn.Module):
@@ -1181,18 +1167,11 @@ class SurvPredSurvBoardRunner:
             embedding_dim=int(self.model_cfg.embsize),
             hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 512)),
             bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
-            pooling=str(getattr(self.task_cfg, "head_pooling", "cls")),
         )
         if self.is_master:
-            input_dim = (
-                int(self.model_cfg.embsize) * 2
-                if head.pooling == "mean_cls"
-                else int(self.model_cfg.embsize)
-            )
             log.info(
-                "Survival head pooling: %s | head dims: %d -> %d -> %d -> 1",
-                head.pooling,
-                input_dim,
+                "Survival representation: CLS token | head dims: %d -> %d -> %d -> 1",
+                int(self.model_cfg.embsize),
                 int(getattr(self.task_cfg, "head_hidden_dim", 512)),
                 int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
             )

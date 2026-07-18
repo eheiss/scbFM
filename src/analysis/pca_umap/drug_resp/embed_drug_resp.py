@@ -88,7 +88,7 @@ for name, ckpt_path in CHECKPOINTS.items():
         ckpt_path,
         adata,
         hvg_indices,
-        pooling="mean_cls",
+        pooling="cls",
     )
     all_pair_embeddings[name] = build_pair_embeddings(cell_embeddings)
 

@@ -56,17 +56,10 @@ class DeconvPredHead(nn.Module):
         output_dim: int,
         hidden_dim: int = 256,
         bottleneck_dim: int = 128,
-        pooling: str = "mean",
     ) -> None:
         super().__init__()
-        valid_pooling = {"mean", "cls", "mean_cls"}
-        if pooling not in valid_pooling:
-            raise ValueError(
-                f"Unsupported deconvolution head pooling '{pooling}'. "
-                f"Expected one of {sorted(valid_pooling)}."
-            )
-        self.pooling = pooling
-        input_dim = embedding_dim * 2 if pooling == "mean_cls" else embedding_dim
+        self.pooling = "cls"
+        input_dim = embedding_dim
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SELU(),
@@ -76,17 +69,7 @@ class DeconvPredHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Position zero is the <cls> token. The default keeps the previous
-        # mean-pooling behavior; mean_cls concatenates the global CLS summary
-        # with the pooled gene-token signal.
-        mean_gene_embedding = x[:, 1:, :].mean(dim=1)
-        if self.pooling == "mean":
-            sample_embedding = mean_gene_embedding
-        elif self.pooling == "cls":
-            sample_embedding = x[:, 0, :]
-        else:
-            sample_embedding = torch.cat((x[:, 0, :], mean_gene_embedding), dim=-1)
-        return self.mlp(sample_embedding)
+        return self.mlp(x[:, 0, :])
 
 
 class CancerFoundationDeconvModel(nn.Module):
@@ -319,7 +302,7 @@ class DeconvRunner:
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
                 "output_suffix": self._output_suffix(),
-                "head_pooling": str(getattr(self.task_cfg, "head_pooling", "mean")),
+                "representation": "cls",
                 "head_hidden_dim": int(getattr(self.task_cfg, "head_hidden_dim", 256)),
                 "head_bottleneck_dim": int(
                     getattr(self.task_cfg, "head_bottleneck_dim", 128)
@@ -822,18 +805,11 @@ class DeconvRunner:
             output_dim=len(self.cell_types),
             hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
             bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
-            pooling=str(getattr(self.task_cfg, "head_pooling", "mean")),
         )
         if self.is_master:
-            input_dim = (
-                int(self.model_cfg.embsize) * 2
-                if head.pooling == "mean_cls"
-                else int(self.model_cfg.embsize)
-            )
             log.info(
-                "Deconvolution head pooling: %s | head dims: %d -> %d -> %d -> %d",
-                head.pooling,
-                input_dim,
+                "Deconvolution representation: CLS token | head dims: %d -> %d -> %d -> %d",
+                int(self.model_cfg.embsize),
                 int(getattr(self.task_cfg, "head_hidden_dim", 256)),
                 int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
                 len(self.cell_types),

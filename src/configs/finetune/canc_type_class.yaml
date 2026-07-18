@@ -18,12 +18,8 @@ min_genes: 200
 hvg_selection_method: mad  # mad | scanpy
 hvg_flavor: cell_ranger
 hvg_batch_key:
-# false preserves mean pooling over the 1,199 gene tokens; true uses only the
-# CancerFoundation CLS embedding as input to the classification MLP.
-use_cls: false
-# Optional explicit pooling mode for the classification head. Leave empty to
-# preserve the legacy use_cls switch. Valid values: mean, cls, mean_cls.
-head_pooling:
+# Classification heads use the CancerFoundation CLS embedding as the sample
+# representation.
 cv_folds: 5
 random_seed: 42
 
@@ -86,7 +82,6 @@ raw_pca_rf_n_jobs: -1
 # Backbone-embedding PCA + random-forest baseline. Launched with
 # task=finetune.canc_type_class_pca_rf.
 pca_rf_variant:
-pca_rf_pooling: mean_cls
 pca_rf_components: 256
 pca_rf_standardize: true
 pca_rf_whiten: false

@@ -47,10 +47,8 @@ min_genes: 200
 # evaluation. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger
 hvg_batch_key:
-# Use the CancerFoundation CLS embedding plus mean-pooled gene embeddings as
-# input to the classification MLP.
-use_cls: true
-head_pooling: mean_cls
+# Classification heads use the CancerFoundation CLS embedding as the sample
+# representation.
 # Slightly larger classification head for the harder 33-class task:
 # 2 * embsize -> 512 -> 256 -> n_classes.
 head_hidden_dim: 512
@@ -96,7 +94,6 @@ raw_mlp_learning_rate: 1e-4
 # Backbone-embedding PCA + random-forest baseline. Launched with
 # task=finetune.canc_type_class_33_pca_rf.
 pca_rf_variant:
-pca_rf_pooling: mean_cls
 pca_rf_components: 256
 pca_rf_standardize: true
 pca_rf_whiten: false

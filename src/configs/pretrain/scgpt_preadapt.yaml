@@ -15,13 +15,20 @@ gene_info_path: ../data/bulkformer_gene_info.csv
 epochs: 5
 batch_size: 16
 num_workers: 2
-prefetch_factor: 2
+prefetch_factor: 1
+persistent_workers: false
 valid_every: 1
 grad_acc: 4
 max_grad_norm: 1e2
 log_every_batches: 500
 io_block_size: 1024
 io_cache_blocks: 2
+use_pretokenized_cache: true
+pretokenized_cache_dir:
+build_pretokenized_cache: false
+pretokenize_only: false
+pretokenize_epochs:
+cache_log_every_blocks: 100
 
 seed: 2021
 validation_split: 0.05
@@ -33,9 +40,14 @@ min_mapped_genes: 200
 # Keep this false unless the scGPT container has flash-attn installed.
 use_fast_transformer: false
 
-# Standard scGPT masked value objective. MVC can be enabled later as an
-# ablation, but the conservative default is masked expression reconstruction.
-do_mvc: false
+# Add scGPT's masked value prediction for cell embeddings (MVC/GEPC) so the
+# CLS/cell embedding receives a direct masked-expression reconstruction signal.
+do_mvc: true
+freeze_unused_cls_decoder: true
+ddp_find_unused_parameters: false
+
+amp: true
+amp_dtype: float16
 
 learning_rate: 1e-4
 first_cycle_steps: 5

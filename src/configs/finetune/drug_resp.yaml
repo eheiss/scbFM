@@ -34,9 +34,8 @@ adapter_learning_rate: 1.0e-4
 adapter_after_attention: true
 adapter_after_ff: true
 
-# Fusion head: CancerFoundation CLS + mean-pooled gene sample embedding
-# concatenated with the KPGT drug embedding, then an MLP predicts IC50.
-cell_pooling: mean_cls
+# Fusion head: CancerFoundation CLS sample embedding concatenated with the KPGT
+# drug embedding, then an MLP predicts IC50.
 head_hidden_dim: 512
 head_bottleneck_dim: 256
 

@@ -91,27 +91,13 @@ class DrugRespModel(nn.Module):
         self,
         backbone: CancerFoundationBackbone,
         head: DrugRespPredHead,
-        cell_pooling: str = "cls",
     ) -> None:
         super().__init__()
-        valid_pooling = {"cls", "mean", "max", "mean_cls"}
-        if cell_pooling not in valid_pooling:
-            raise ValueError(
-                f"Unsupported drug-response cell pooling '{cell_pooling}'. "
-                f"Expected one of {sorted(valid_pooling)}."
-            )
         self.backbone = backbone
         self.head = head
-        self.cell_pooling = cell_pooling
 
     def pool_cell_embeddings(self, hidden: torch.Tensor) -> torch.Tensor:
-        if self.cell_pooling == "cls":
-            return hidden[:, 0, :]
-        if self.cell_pooling == "mean":
-            return hidden[:, 1:, :].mean(dim=1)
-        if self.cell_pooling == "mean_cls":
-            return torch.cat((hidden[:, 0, :], hidden[:, 1:, :].mean(dim=1)), dim=-1)
-        return hidden[:, 1:, :].amax(dim=1)
+        return hidden[:, 0, :]
 
     def forward(
         self,
@@ -815,8 +801,7 @@ class DrugRespRunner:
         else:
             log.info("Using randomly initialized backbone")
 
-        cell_pooling = str(getattr(self.task_cfg, "cell_pooling", "cls"))
-        cell_emb_dim = int(self.model_cfg.embsize) * (2 if cell_pooling == "mean_cls" else 1)
+        cell_emb_dim = int(self.model_cfg.embsize)
         head = DrugRespPredHead(
             cell_emb_dim=cell_emb_dim,
             drug_emb_dim=drug_emb_dim,
@@ -835,12 +820,10 @@ class DrugRespRunner:
         model = DrugRespModel(
             backbone,
             head,
-            cell_pooling=cell_pooling,
         )
         if self.is_master:
             log.info(
-                "Drug response cell pooling: %s | fusion head dims: %d -> %d -> %d -> 1",
-                model.cell_pooling,
+                "Drug response cell representation: CLS token | fusion head dims: %d -> %d -> %d -> 1",
                 cell_emb_dim + drug_emb_dim,
                 int(getattr(self.task_cfg, "head_hidden_dim", 512)),
                 int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
@@ -965,8 +948,7 @@ class DrugRespRunner:
         self.cell_emb_cache = torch.cat(all_embs, dim=0).to(self.device)  # (n_cells, dim)
         if self.is_master:
             log.info(
-                "Precomputed cell embeddings: pooling=%s, shape=%s",
-                raw.cell_pooling,
+                "Precomputed cell embeddings: representation=CLS token, shape=%s",
                 tuple(self.cell_emb_cache.shape),
             )
 

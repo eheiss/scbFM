@@ -101,21 +101,10 @@ class CancTypePredHead(nn.Module):
         output_dim: int,
         hidden_dim: int = 256,
         bottleneck_dim: int = 128,
-        use_cls: bool = False,
-        pooling: str | None = None,
     ) -> None:
         super().__init__()
-        if pooling is None:
-            pooling = "cls" if use_cls else "mean"
-        pooling = str(pooling).lower()
-        if pooling not in {"mean", "cls", "mean_cls"}:
-            raise ValueError(
-                f"Unsupported classification head pooling '{pooling}'. "
-                "Expected one of: mean, cls, mean_cls."
-            )
-        self.pooling = pooling
-        self.use_cls = pooling == "cls"
-        input_dim = embedding_dim * 2 if pooling == "mean_cls" else embedding_dim
+        self.pooling = "cls"
+        input_dim = embedding_dim
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SELU(),
@@ -125,18 +114,7 @@ class CancTypePredHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Position zero is the <cls> token. "mean" retains the existing
-        # BulkRNABert-style mean pooling over gene tokens only.
-        if self.pooling == "cls":
-            sample_embedding = x[:, 0, :]
-        elif self.pooling == "mean":
-            sample_embedding = x[:, 1:, :].mean(dim=1)
-        else:
-            sample_embedding = torch.cat(
-                (x[:, 0, :], x[:, 1:, :].mean(dim=1)),
-                dim=-1,
-            )
-        return self.mlp(sample_embedding)
+        return self.mlp(x[:, 0, :])
 
 
 class CancerFoundationCancTypeClassifier(nn.Module):
@@ -1012,19 +990,12 @@ class CancTypeClassRunner:
             output_dim=len(self.label_dict),
             hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
             bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
-            use_cls=bool(getattr(self.task_cfg, "use_cls", False)),
-            pooling=getattr(self.task_cfg, "head_pooling", None),
         )
         if self.is_master:
-            representation = {
-                "cls": "CLS token",
-                "mean": "mean-pooled gene tokens",
-                "mean_cls": "CLS token + mean-pooled gene tokens",
-            }[head.pooling]
             log.info(
                 "Classification representation: %s | head dims: %d -> %d -> %d -> %d",
-                representation,
-                int(self.model_cfg.embsize) * (2 if head.pooling == "mean_cls" else 1),
+                "CLS token",
+                int(self.model_cfg.embsize),
                 int(getattr(self.task_cfg, "head_hidden_dim", 256)),
                 int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
                 len(self.label_dict),

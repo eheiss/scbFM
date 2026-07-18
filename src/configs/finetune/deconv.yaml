@@ -12,9 +12,7 @@ min_genes: 200
 hvg_flavor: cell_ranger
 hvg_batch_key:
 output_suffix: ""
-# Deconvolution head input. Standard fine-tuning uses the concatenation of
-# the CLS embedding and mean-pooled gene-token embeddings.
-head_pooling: mean_cls
+# Deconvolution head input uses the CancerFoundation CLS embedding.
 head_hidden_dim: 1024
 head_bottleneck_dim: 1024
 
