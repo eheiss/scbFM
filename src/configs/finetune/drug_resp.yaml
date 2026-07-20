@@ -41,10 +41,10 @@ head_bottleneck_dim: 256
 # Training
 cv_folds: 5
 epochs: 20
-batch_size: 8
+batch_size: 4
 num_workers: 2
 prefetch_factor: 2
-grad_accumulation_steps: 2
+grad_accumulation_steps: 4
 head_learning_rate: 1.0e-4
 backbone_learning_rate: 1.0e-4
 max_grad_norm: 1.0e6
