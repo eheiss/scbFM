@@ -66,7 +66,7 @@ adapter_after_ff: true
 
 cv_folds: 5
 random_seed: 42
-epochs: 30
+epochs: 20
 batch_size: 4
 num_workers: 2
 prefetch_factor: 2
