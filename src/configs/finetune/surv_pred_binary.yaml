@@ -44,7 +44,6 @@ cohorts:
   - UVM
 merge_gbm_lgg: false
 preprocess: true
-min_genes: 200
 hvg_flavor: cell_ranger
 hvg_batch_key:
 

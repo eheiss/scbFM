@@ -33,7 +33,6 @@ from finetune.canc_type_class.runner import (
     _quantile_bin_expression,
 )
 from preprocess import (
-    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -484,10 +483,6 @@ class DrugRespRunner:
             gene_list_path=gene_list_path,
         )
         if should_preprocess:
-            adata = filter_min_genes(
-                adata,
-                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-            )
             log.info(
                 "Aligned raw expression for on-the-fly sequence binning: "
                 "%d target genes missing, shape %s",

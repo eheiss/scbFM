@@ -22,7 +22,7 @@ from finetune.surv_pred_survboard.runner import (
     harrell_c_index,
     ipcw_weighted_c_index,
 )
-from preprocess import filter_min_genes, reindex_adata_genes, validate_token_matrix
+from preprocess import reindex_adata_genes, validate_token_matrix
 
 log = logging.getLogger(__name__)
 
@@ -143,15 +143,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
 
         gene_list_path = self._resolve_gene_list_path()
         adata, missing_genes = reindex_adata_genes(adata, gene_list_path=gene_list_path)
-        if bool(getattr(self.task_cfg, "preprocess", True)):
-            before = adata.n_obs
-            adata = filter_min_genes(adata, min_genes=int(getattr(self.task_cfg, "min_genes", 200)))
-            if adata.n_obs != before:
-                # filter_min_genes preserves obs rows, so re-read aligned labels from obs.
-                times = adata.obs["survival_time"].to_numpy(dtype=np.float32)
-                events = adata.obs["survival_event"].to_numpy(dtype=np.float32)
-                projects = adata.obs["survival_cohort"].astype(str).to_numpy()
-        else:
+        if not bool(getattr(self.task_cfg, "preprocess", True)):
             validate_token_matrix(adata.X, bin_num=int(self.model_cfg.bin_num), name="surv_pred input")
 
         self._missing_genes_note = (

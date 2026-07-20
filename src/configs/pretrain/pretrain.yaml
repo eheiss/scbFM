@@ -46,7 +46,8 @@ gene_sampling: uniform_full_vocab
 # MSE over masked binned expression values, matching scGPT/CancerFoundation.
 loss_type: mse
 # Additional CancerFoundation-style objective:
-# MLP(h_cls || emb_gene(masked_gene)) predicts the same masked binned value.
+# MVC-style inner-product decoder predicts masked binned values from the
+# <cls>/cell embedding and the masked gene identity embedding.
 # Technology embeddings are intentionally omitted because this dataset has no
 # stable technology/domain label in the pretraining runner.
 cls_loss_weight: 1.0

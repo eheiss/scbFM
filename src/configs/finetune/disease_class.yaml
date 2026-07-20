@@ -16,7 +16,6 @@ binary_label_col: binary_label
 # deterministically inside each DataLoader worker.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
-min_genes: 200
 # Fold-level HVGs are fitted on training data and reused for training and
 # evaluation. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger

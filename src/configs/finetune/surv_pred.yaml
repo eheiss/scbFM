@@ -48,7 +48,6 @@ patient_col: patient_id
 survival_event_col: OS
 survival_time_col: OS.time
 preprocess: true
-min_genes: 200
 hvg_flavor: cell_ranger
 hvg_batch_key:
 

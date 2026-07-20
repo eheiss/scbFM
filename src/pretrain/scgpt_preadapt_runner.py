@@ -574,6 +574,14 @@ class ScGPTPreadaptRunner:
         start_time = time.perf_counter()
         blocks_done = 0
         cache_log_every_blocks = int(getattr(self.pretrain_cfg, "cache_log_every_blocks", 100))
+        log.info(
+            "scGPT preadapt | cache split=%s epoch=%d starting: samples=%d seq_len=%d io_block_size=%d",
+            split,
+            epoch,
+            n_samples,
+            seq_len,
+            int(io_block_size),
+        )
         if n_samples == 0:
             genes_mm.flush()
             expr_mm.flush()
@@ -601,9 +609,32 @@ class ScGPTPreadaptRunner:
                         in_block = np.flatnonzero(block_starts == block_start)
                         positions = sample_positions[in_block]
                         rows = rows_for_path[in_block]
-                        block = ScGPTBulkMaskedDataset._to_dense_block(
-                            backed.X[block_start_int:block_stop, source_indices]
-                        ).astype(np.float32, copy=False)
+                        should_log_block = cache_log_every_blocks > 0 and (
+                            blocks_done == 0
+                            or (blocks_done + 1) % cache_log_every_blocks == 0
+                            or blocks_done + 1 == total_blocks
+                        )
+                        if should_log_block:
+                            log.info(
+                                "scGPT preadapt | cache split=%s epoch=%d block=%d/%d reading rows=%d:%d path=%d samples_in_block=%d elapsed=%.1fs",
+                                split,
+                                epoch,
+                                blocks_done + 1,
+                                total_blocks,
+                                block_start_int,
+                                block_stop,
+                                path_idx_int,
+                                len(positions),
+                                time.perf_counter() - start_time,
+                            )
+
+                        read_start = time.perf_counter()
+                        raw_block = backed.X[block_start_int:block_stop, :]
+                        if sparse.issparse(raw_block):
+                            block = raw_block[:, source_indices].toarray().astype(np.float32, copy=False)
+                        else:
+                            block = np.asarray(raw_block)[:, source_indices].astype(np.float32, copy=False)
+                        read_elapsed = time.perf_counter() - read_start
 
                         for pos, row_idx in zip(positions, rows, strict=False):
                             if selected_gene_count < n_genes:
@@ -624,11 +655,12 @@ class ScGPTPreadaptRunner:
                             or blocks_done == total_blocks
                         ):
                             log.info(
-                                "scGPT preadapt | cache split=%s epoch=%d block=%d/%d elapsed=%.1fs",
+                                "scGPT preadapt | cache split=%s epoch=%d block=%d/%d done read=%.1fs elapsed=%.1fs",
                                 split,
                                 epoch,
                                 blocks_done,
                                 total_blocks,
+                                read_elapsed,
                                 time.perf_counter() - start_time,
                             )
                 finally:

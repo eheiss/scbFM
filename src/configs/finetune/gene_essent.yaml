@@ -14,7 +14,6 @@ depmap_data_path: /cluster/work/boeva/eheiss/datasets/DepMap/depmap.h5ad
 # quantile-binned deterministically inside each DataLoader worker.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
-min_genes: 200
 # HVGs are fitted on each training fold and reused for held-out samples and
 # every compared checkpoint.
 hvg_flavor: cell_ranger

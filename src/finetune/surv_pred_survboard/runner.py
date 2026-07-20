@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import _quantile_bin_expression
-from preprocess import filter_min_genes, reindex_adata_genes, validate_token_matrix
+from preprocess import reindex_adata_genes, validate_token_matrix
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -867,10 +867,6 @@ class SurvPredSurvBoardRunner:
                 adata,
                 gene_list_path=gene_list_path,
             )
-            adata = filter_min_genes(
-                adata,
-                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-            )
             if self.is_master:
                 log.info(
                     "SurvBoard GEX aligned for on-the-fly sequence binning: "
@@ -917,7 +913,7 @@ class SurvPredSurvBoardRunner:
             else:
                 raise ValueError(
                     f"Sample count mismatch after preprocessing ({adata.n_obs} vs {len(times)}). "
-                    "Set min_genes=0 to avoid dropping samples."
+                    "Check SurvBoard sample identifiers and expression/clinical row alignment."
                 )
 
         return adata, times, events

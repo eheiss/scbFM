@@ -22,7 +22,6 @@ gene_list_path: ../data/gene_list.txt
 # Maps HUGO symbols in SurvBoard gex columns to ENSG IDs used by the backbone
 gene_info_path: ../data/bulkformer_gene_info.csv
 preprocess: true
-min_genes: 200
 # Fold-level HVGs are fitted on training samples only and reused for the held-out
 # split. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger

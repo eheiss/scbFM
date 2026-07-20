@@ -9,7 +9,7 @@ import numpy as np
 from omegaconf import DictConfig
 
 from finetune.canc_type_class.runner import CancTypeClassRunner
-from preprocess import filter_min_genes, reindex_adata_genes, validate_token_matrix
+from preprocess import reindex_adata_genes, validate_token_matrix
 
 log = logging.getLogger(__name__)
 
@@ -78,10 +78,6 @@ class DiseaseClassRunner(CancTypeClassRunner):
             gene_list_path=gene_list_path,
         )
         if self._should_preprocess_input():
-            adata = filter_min_genes(
-                adata,
-                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-            )
             log.info(
                 "Aligned raw DiSignAtlas input for on-the-fly sequence binning: "
                 "%d target genes missing, output shape %s",

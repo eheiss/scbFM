@@ -42,7 +42,6 @@ cohorts:
   - UVM
 merge_gbm_lgg: false
 preprocess: true
-min_genes: 200
 # Fold-level HVGs are fitted on training data and reused for training and
 # evaluation. Their count comes from pretrain.selected_gene_count (1199).
 hvg_flavor: cell_ranger

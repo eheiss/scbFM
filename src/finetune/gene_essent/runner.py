@@ -30,7 +30,6 @@ from torch.utils.data.distributed import DistributedSampler
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import _quantile_bin_expression
 from preprocess import (
-    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -573,7 +572,7 @@ class GeneEssentRunner:
         if "essen_array" not in combined.layers:
             raise KeyError("depmap.h5ad must contain an 'essen_array' layer for CRISPR scores.")
 
-        # Extract CRISPR targets before obs may be filtered by min_genes
+        # Extract CRISPR targets before expression rows are aligned to the model gene list.
         essen_X = combined.layers["essen_array"]
         if sparse.issparse(essen_X):
             essen_X = essen_X.toarray()
@@ -600,10 +599,6 @@ class GeneEssentRunner:
             gene_list_path=gene_list_path,
         )
         if should_preprocess:
-            expr_adata = filter_min_genes(
-                expr_adata,
-                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
-            )
             log.info(
                 "Aligned raw expression for worker-side sequence binning: "
                 "%d target genes missing, shape %s",
@@ -634,11 +629,8 @@ class GeneEssentRunner:
                 name="gene essentiality expression input",
             )
 
-        # Align CRISPR rows to the (possibly filtered) expr_adata obs order
+        # Align CRISPR rows to the expression AnnData obs order.
         remaining_obs = list(expr_adata.obs_names.astype(str))
-        n_dropped = combined.n_obs - len(remaining_obs)
-        if n_dropped > 0:
-            log.info("min_genes filter removed %d cell lines; %d remain.", n_dropped, len(remaining_obs))
         essen_row_order = [combined_obs_to_idx[obs] for obs in remaining_obs]
         essen_X = essen_X[essen_row_order]
 

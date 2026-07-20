@@ -10,7 +10,6 @@ gene_list_path: ../data/gene_list.txt
 cohorts: [BRCA, BLCA, GBM, LGG, LUAD, UCEC]
 merge_gbm_lgg: true
 preprocess: true
-min_genes: 200
 # Fold-level gene selection is fitted on training data and reused for training
 # and evaluation. Their count comes from pretrain.selected_gene_count (1199).
 # For bulk log1p data, MAD is the default practical alternative to Scanpy's

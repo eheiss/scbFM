@@ -409,9 +409,9 @@ class PreTrainRunner:
             if "cls_decoder_state_dict" in checkpoint:
                 self.cls_decoder.load_state_dict(checkpoint["cls_decoder_state_dict"])
             elif self.cls_loss_weight > 0:
-                log.warning(
-                    "Checkpoint %s has no cls_decoder_state_dict; initializing CLS decoder from scratch.",
-                    checkpoint_path,
+                raise KeyError(
+                    f"Checkpoint {checkpoint_path} has no cls_decoder_state_dict, "
+                    "but cls_loss_weight > 0."
                 )
             log.info("Loaded checkpoint from %s", checkpoint_path)
 

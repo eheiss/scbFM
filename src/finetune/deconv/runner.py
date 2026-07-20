@@ -32,7 +32,7 @@ from finetune.canc_type_class.runner import (
     GroupedCosineAnnealingWarmupRestarts,
     _quantile_bin_expression,
 )
-from preprocess import filter_min_genes, reindex_adata_genes, validate_token_matrix
+from preprocess import reindex_adata_genes, validate_token_matrix
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -524,10 +524,6 @@ class DeconvRunner:
         if self._should_preprocess_input():
             adata, missing_genes = reindex_adata_genes(
                 adata, gene_list_path=self._resolve_gene_list_path()
-            )
-            adata = filter_min_genes(
-                adata,
-                min_genes=int(getattr(self.task_cfg, "min_genes", 200)),
             )
             log.info(
                 "Aligned raw input for on-the-fly sequence binning: "

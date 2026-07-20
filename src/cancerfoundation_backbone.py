@@ -308,7 +308,15 @@ class CancerFoundationBackbone(nn.Module):
 
 
 class ExpressionBinDecoder(nn.Module):
-    """Predict a scalar binned expression value, trained with masked MSE."""
+    """CancerFoundation-style token-level expression decoder.
+
+    This mirrors the ExprDecoder used in CancerFoundationFusion without
+    decoder-side technology/condition embeddings:
+
+        Linear(d_model, d_model) -> ReLU
+        Linear(d_model, d_model) -> ReLU
+        Linear(d_model, 1)
+    """
 
     def __init__(
         self,
@@ -318,9 +326,9 @@ class ExpressionBinDecoder(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_model),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),
             nn.Linear(d_model, d_model),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),
             nn.Linear(d_model, 1),
         )
 
@@ -329,7 +337,13 @@ class ExpressionBinDecoder(nn.Module):
 
 
 class ExpressionClsDecoder(nn.Module):
-    """Predict masked expression from <cls> hidden state and masked gene identity."""
+    """CancerFoundation-style MVC decoder for the <cls>/cell embedding.
+
+    This implements the default CancerFoundationFusion MVCDecoder architecture
+    ("inner product") without technology/condition embeddings. For each gene, a
+    query vector is derived from the gene identity embedding and scored against
+    the global <cls> representation.
+    """
 
     def __init__(
         self,
@@ -337,14 +351,11 @@ class ExpressionClsDecoder(nn.Module):
         d_model: int,
     ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.LeakyReLU(0.1),
-            nn.Linear(d_model, d_model),
-            nn.LeakyReLU(0.1),
-            nn.Linear(d_model, 1),
-        )
+        self.gene2query = nn.Linear(d_model, d_model)
+        self.query_activation = nn.Sigmoid()
+        self.W = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, cls_hidden: Tensor, gene_embeddings: Tensor) -> Tensor:
-        cls_hidden = cls_hidden.unsqueeze(1).expand(-1, gene_embeddings.shape[1], -1)
-        return self.net(torch.cat((cls_hidden, gene_embeddings), dim=-1)).squeeze(-1)
+        query_vecs = self.query_activation(self.gene2query(gene_embeddings))
+        cls_hidden = cls_hidden.unsqueeze(2)
+        return torch.bmm(self.W(query_vecs), cls_hidden).squeeze(2)

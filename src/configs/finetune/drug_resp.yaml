@@ -21,7 +21,6 @@ dataset_col: Dataset Version
 # deterministically for each cell line.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
-min_genes: 200
 # Fold-level HVGs are fitted on training cell lines and reused for all models.
 hvg_flavor: cell_ranger
 

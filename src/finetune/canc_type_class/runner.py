@@ -39,7 +39,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from preprocess import (
-    filter_min_genes,
     reindex_adata_genes,
     validate_token_matrix,
 )
@@ -588,9 +587,7 @@ class CancTypeClassRunner:
     def _preprocess_adata(self, adata: ad.AnnData) -> ad.AnnData:
         gene_list_path = self._resolve_gene_list_path()
         if self._should_preprocess_input():
-            min_genes = int(getattr(self.task_cfg, "min_genes", 200))
             adata, missing_genes = reindex_adata_genes(adata, gene_list_path=gene_list_path)
-            adata = filter_min_genes(adata, min_genes=min_genes)
             log.info(
                 "Aligned raw input for on-the-fly sequence binning: "
                 "%d target genes missing, output shape %s",
