@@ -1010,7 +1010,7 @@ class SurvPredSurvBoardRunner:
     ) -> None:
         if self.fold_gene_indices is None:
             raise RuntimeError("Training-split HVGs have not been selected.")
-        batch_size = int(getattr(self.task_cfg, "batch_size", 16))
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
         num_workers = int(getattr(self.task_cfg, "num_workers", 0))
         if num_workers < 0:
             raise ValueError("finetune.surv_pred_survboard.num_workers must be non-negative.")
@@ -1199,7 +1199,7 @@ class SurvPredSurvBoardRunner:
             for param in model.parameters():
                 param.requires_grad = True
             self.backbone_optimizer_enabled = (
-                int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
+                int(getattr(self.task_cfg, "burn_in_epochs", 3)) <= 0
             )
 
         if finetune_mode in ("adapters", "full_ft"):
@@ -1223,7 +1223,7 @@ class SurvPredSurvBoardRunner:
             getattr(self.task_cfg, "head_learning_rate", 1e-4)
         )
         backbone_learning_rate = float(
-            getattr(self.task_cfg, "backbone_learning_rate", 1e-6)
+            getattr(self.task_cfg, "backbone_learning_rate", 1e-4)
         )
         adapter_learning_rate = float(
             getattr(self.task_cfg, "adapter_learning_rate", head_learning_rate)
@@ -1281,7 +1281,7 @@ class SurvPredSurvBoardRunner:
             log.info("Optimizer parameter groups: %s", "; ".join(summaries))
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
-        burn_in = int(getattr(self.task_cfg, "burn_in_epochs", 0))
+        burn_in = int(getattr(self.task_cfg, "burn_in_epochs", 3))
         if (
             self._finetune_mode() != "full_ft"
             or burn_in <= 0
@@ -1311,7 +1311,7 @@ class SurvPredSurvBoardRunner:
         self.model.train()
         self.model.zero_grad(set_to_none=True)
 
-        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
+        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
         running_loss = 0.0
         n_batches = 0
@@ -1467,7 +1467,7 @@ class SurvPredSurvBoardRunner:
 
             cancer = str(getattr(self.task_cfg, "cancer", ""))
             project = str(getattr(self.task_cfg, "project", "TCGA"))
-            epochs = int(getattr(self.task_cfg, "epochs", 30))
+            epochs = int(getattr(self.task_cfg, "epochs", 20))
 
             if self.is_master:
                 log.info("Loading and preprocessing SurvBoard data (%s / %s)...", project, cancer)

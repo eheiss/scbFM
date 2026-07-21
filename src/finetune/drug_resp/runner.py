@@ -694,7 +694,7 @@ class DrugRespRunner:
         drug_idxs_test: np.ndarray,
         ic50_test: np.ndarray,
     ) -> None:
-        batch_size = int(getattr(self.task_cfg, "batch_size", 32))
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
         num_workers = int(getattr(self.task_cfg, "num_workers", 0))
         if num_workers < 0:
             raise ValueError("finetune.drug_resp.num_workers must be non-negative.")
@@ -842,7 +842,7 @@ class DrugRespRunner:
             for param in model.parameters():
                 param.requires_grad = True
             self.backbone_optimizer_enabled = (
-                int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
+                int(getattr(self.task_cfg, "burn_in_epochs", 3)) <= 0
             )
 
         if finetune_mode in ("adapters", "full_ft"):
@@ -897,12 +897,12 @@ class DrugRespRunner:
             cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
+            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
             gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
         )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
-        burn_in = int(getattr(self.task_cfg, "burn_in_epochs", 0))
+        burn_in = int(getattr(self.task_cfg, "burn_in_epochs", 3))
         if (
             self._finetune_mode() != "full_ft"
             or burn_in <= 0
@@ -923,8 +923,8 @@ class DrugRespRunner:
         raw = self.model.module if isinstance(self.model, DDP) else self.model
         raw.backbone.eval()
         n_cells = X_cell.shape[0]
-        infer_batch = int(getattr(self.task_cfg, "batch_size", 8)) * int(
-            getattr(self.task_cfg, "grad_accumulation_steps", 1)
+        infer_batch = int(getattr(self.task_cfg, "batch_size", 4)) * int(
+            getattr(self.task_cfg, "grad_accumulation_steps", 4)
         )
         infer_batch = max(1, infer_batch)
         all_embs: list[torch.Tensor] = []

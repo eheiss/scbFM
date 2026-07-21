@@ -43,7 +43,7 @@ prefetch_factor: 2
 grad_accumulation_steps: 4
 head_learning_rate: 1e-4
 backbone_learning_rate: 1e-4
-max_grad_norm: 1.0
+max_grad_norm: 1e6
 random_seed: 42
 
 # Scheduler
@@ -51,7 +51,7 @@ first_cycle_steps: 20
 cycle_mult: 1
 min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 5
+warmup_steps: 2
 gamma: 1.0
 
 # Raw-expression MLP baseline. Launched with task=finetune.gene_essent_raw_mlp.

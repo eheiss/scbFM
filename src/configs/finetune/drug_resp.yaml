@@ -29,7 +29,7 @@ finetune_mode: head_only       # head_only | adapters | full_ft
 burn_in_epochs: 3
 adapter_bottleneck_dim: 32
 adapter_dropout: 0.0
-adapter_learning_rate: 1.0e-4
+adapter_learning_rate: 1e-4
 adapter_after_attention: true
 adapter_after_ff: true
 
@@ -45,17 +45,17 @@ batch_size: 4
 num_workers: 2
 prefetch_factor: 2
 grad_accumulation_steps: 4
-head_learning_rate: 1.0e-4
-backbone_learning_rate: 1.0e-4
-max_grad_norm: 1.0e6
+head_learning_rate: 1e-4
+backbone_learning_rate: 1e-4
+max_grad_norm: 1e6
 random_seed: 42
 
 # Scheduler
 first_cycle_steps: 20
 cycle_mult: 1
-min_lr: 1.0e-6
+min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 5
+warmup_steps: 2
 gamma: 1.0
 
 # Raw-expression MLP baseline. Launched with task=finetune.drug_resp_raw_mlp.

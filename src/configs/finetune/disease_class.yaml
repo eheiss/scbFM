@@ -55,7 +55,7 @@ first_cycle_steps: 20
 cycle_mult: 1
 min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 5
+warmup_steps: 2
 gamma: 1.0
 
 # Raw-expression MLP baseline. Launched with task=finetune.disease_class_raw_mlp.

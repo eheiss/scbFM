@@ -839,7 +839,7 @@ class CancTypeClassRunner:
                     float(self.train_class_weights.max()),
                 )
 
-        batch_size = int(getattr(self.task_cfg, "batch_size", 2))
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
         num_workers = int(getattr(self.task_cfg, "num_workers", 0))
         if num_workers < 0:
             raise ValueError("finetune.canc_type_class.num_workers must be non-negative.")
@@ -1025,7 +1025,7 @@ class CancTypeClassRunner:
             for param in model.parameters():
                 param.requires_grad = True
             self.backbone_optimizer_enabled = (
-                int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
+                int(getattr(self.task_cfg, "burn_in_epochs", 3)) <= 0
             )
 
         if finetune_mode in ("adapters", "full_ft"):
@@ -1114,7 +1114,7 @@ class CancTypeClassRunner:
             cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 2)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
+            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
             gamma=float(getattr(self.task_cfg, "gamma", 0.9)),
         )
         loss_weights = (
@@ -1134,7 +1134,7 @@ class CancTypeClassRunner:
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
         finetune_mode = self._finetune_mode()
-        burn_in_epochs = int(getattr(self.task_cfg, "burn_in_epochs", 0))
+        burn_in_epochs = int(getattr(self.task_cfg, "burn_in_epochs", 3))
         if (
             finetune_mode != "full_ft"
             or burn_in_epochs <= 0
@@ -1176,7 +1176,7 @@ class CancTypeClassRunner:
         self.model.train()
         self.model.zero_grad(set_to_none=True)
 
-        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
+        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
         running_loss = 0.0
         running_acc = 0.0
@@ -1464,7 +1464,7 @@ class CancTypeClassRunner:
                     len(splits),
                 )
 
-            epochs = int(getattr(self.task_cfg, "epochs", 10))
+            epochs = int(getattr(self.task_cfg, "epochs", 20))
             aggregate_rows: list[dict[str, object]] = []
 
             for model_key, checkpoint_path in checkpoint_paths.items():

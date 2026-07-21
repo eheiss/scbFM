@@ -243,7 +243,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
 
-            epochs = int(getattr(self.task_cfg, "epochs", 30))
+            epochs = int(getattr(self.task_cfg, "epochs", 20))
             aggregate_rows: list[dict[str, object]] = []
 
             if self.is_master:

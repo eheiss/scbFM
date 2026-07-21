@@ -756,7 +756,7 @@ class GeneEssentRunner:
     ) -> None:
         if self.fold_gene_indices is None:
             raise RuntimeError("Training-fold HVGs have not been selected.")
-        batch_size = int(getattr(self.task_cfg, "batch_size", 8))
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
         num_workers = int(getattr(self.task_cfg, "num_workers", 0))
         if num_workers < 0:
             raise ValueError("finetune.gene_essent.num_workers must be non-negative.")
@@ -940,7 +940,7 @@ class GeneEssentRunner:
             for param in model.parameters():
                 param.requires_grad = True
             self.backbone_optimizer_enabled = (
-                int(getattr(self.task_cfg, "burn_in_epochs", 0)) <= 0
+                int(getattr(self.task_cfg, "burn_in_epochs", 3)) <= 0
             )
 
         if finetune_mode in ("adapters", "full_ft"):
@@ -1007,7 +1007,7 @@ class GeneEssentRunner:
             cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
+            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
             gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
         )
 
@@ -1020,7 +1020,7 @@ class GeneEssentRunner:
             log.info("Optimizer parameter groups: %s", "; ".join(group_summaries))
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
-        burn_in_epochs = int(getattr(self.task_cfg, "burn_in_epochs", 0))
+        burn_in_epochs = int(getattr(self.task_cfg, "burn_in_epochs", 3))
         if (
             self._finetune_mode() != "full_ft"
             or burn_in_epochs <= 0
@@ -1068,7 +1068,7 @@ class GeneEssentRunner:
         self.model.train()
         self.model.zero_grad(set_to_none=True)
 
-        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
+        grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
         running_loss = 0.0
         if self.fold_valid_gene_mask is None:
