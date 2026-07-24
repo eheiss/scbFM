@@ -54,8 +54,8 @@ class DeconvPredHead(nn.Module):
         self,
         embedding_dim: int,
         output_dim: int,
-        hidden_dim: int = 256,
-        bottleneck_dim: int = 128,
+        hidden_dim: int = 512,
+        bottleneck_dim: int = 256,
     ) -> None:
         super().__init__()
         self.pooling = "cls"
@@ -303,9 +303,9 @@ class DeconvRunner:
                 "finetune_mode": self._finetune_mode(),
                 "output_suffix": self._output_suffix(),
                 "representation": "cls",
-                "head_hidden_dim": int(getattr(self.task_cfg, "head_hidden_dim", 256)),
+                "head_hidden_dim": int(getattr(self.task_cfg, "head_hidden_dim", 512)),
                 "head_bottleneck_dim": int(
-                    getattr(self.task_cfg, "head_bottleneck_dim", 128)
+                    getattr(self.task_cfg, "head_bottleneck_dim", 256)
                 ),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "git_commit": self._get_git_commit(),
@@ -799,15 +799,15 @@ class DeconvRunner:
         head = DeconvPredHead(
             embedding_dim=int(self.model_cfg.embsize),
             output_dim=len(self.cell_types),
-            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 256)),
-            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+            hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+            bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
         )
         if self.is_master:
             log.info(
                 "Deconvolution representation: CLS token | head dims: %d -> %d -> %d -> %d",
                 int(self.model_cfg.embsize),
-                int(getattr(self.task_cfg, "head_hidden_dim", 256)),
-                int(getattr(self.task_cfg, "head_bottleneck_dim", 128)),
+                int(getattr(self.task_cfg, "head_hidden_dim", 512)),
+                int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
                 len(self.cell_types),
             )
         model = CancerFoundationDeconvModel(backbone=backbone, head=head)

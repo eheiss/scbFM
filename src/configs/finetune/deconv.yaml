@@ -12,8 +12,8 @@ hvg_flavor: cell_ranger
 hvg_batch_key:
 output_suffix: ""
 # Deconvolution head input uses the CancerFoundation CLS embedding.
-head_hidden_dim: 1024
-head_bottleneck_dim: 1024
+head_hidden_dim: 512
+head_bottleneck_dim: 256
 
 finetune_mode: head_only
 burn_in_epochs: 3
