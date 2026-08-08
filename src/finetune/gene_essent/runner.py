@@ -28,11 +28,21 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
-from finetune.canc_type_class.runner import _quantile_bin_expression
+from finetune.canc_type_class.runner import (
+    _quantile_bin_expression,
+    _set_finetune_training_mode,
+)
+from finetune.training_correctness import (
+    add_optimizer_parameter_group,
+    is_accumulation_boundary,
+    normalize_accumulated_gradients,
+    validate_backbone_checkpoint,
+)
 from preprocess import (
     reindex_adata_genes,
     validate_token_matrix,
 )
+from run_provenance import complete_run_metadata, start_run_metadata
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -479,16 +489,18 @@ class GeneEssentRunner:
         (out_dir / f"{prefix}_config.yaml").write_text(
             OmegaConf.to_yaml(self.cfg, resolve=True), encoding="utf-8"
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
                 "n_valid_genes": self.n_valid_genes,
-                "git_commit": self._get_git_commit(),
-                "checkpoint_paths": checkpoint_paths,
             },
+            checkpoint_paths=checkpoint_paths,
+            repo_dir=ROOT / "scbFM",
         )
 
     @staticmethod
@@ -886,6 +898,14 @@ class GeneEssentRunner:
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
+            validate_backbone_checkpoint(
+                checkpoint,
+                resolved_path,
+                gene_num=int(self.model_cfg.gene_num),
+                selected_gene_count=self.selected_gene_count,
+                max_seq_len=self.max_seq_len,
+                bin_num=int(self.model_cfg.bin_num),
+            )
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
             backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
@@ -1028,8 +1048,15 @@ class GeneEssentRunner:
             or epoch <= burn_in_epochs
         ):
             return
+        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        add_optimizer_parameter_group(
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            parameters=raw_model.backbone.parameters(),
+            max_lr=float(self.task_cfg.backbone_learning_rate),
+            name="backbone",
+        )
         self.backbone_optimizer_enabled = True
-        self._build_optimization()
         if self.is_master:
             log.info(
                 "Finished %d burn-in epochs; enabled backbone optimization.", burn_in_epochs
@@ -1054,10 +1081,26 @@ class GeneEssentRunner:
     @staticmethod
     def _masked_mse(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """MSE over finite target values only — handles NaN CRISPR scores for unscreened entries."""
+        loss_sum, normalizer = GeneEssentRunner._masked_mse_sum_and_normalizer(
+            preds,
+            targets,
+        )
+        if normalizer == 0:
+            return loss_sum
+        return loss_sum / normalizer
+
+    @staticmethod
+    def _masked_mse_sum_and_normalizer(
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
         finite = torch.isfinite(targets)
         if not finite.any():
-            return torch.zeros(1, device=preds.device, requires_grad=True).squeeze()
-        return F.mse_loss(preds[finite], targets[finite])
+            return preds.sum() * 0.0, 0.0
+        return (
+            F.mse_loss(preds[finite], targets[finite], reduction="sum"),
+            float(finite.sum().item()),
+        )
 
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_enable_backbone_optimizer(epoch)
@@ -1065,12 +1108,15 @@ class GeneEssentRunner:
             self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
-        self.model.train()
+        _set_finetune_training_mode(self.model, self._finetune_mode())
         self.model.zero_grad(set_to_none=True)
 
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
-        running_loss = 0.0
+        running_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        accumulated_normalizer = 0.0
+        total_steps = len(self.train_loader)
         if self.fold_valid_gene_mask is None:
             raise RuntimeError("Fold-level valid-gene mask is unavailable.")
         valid_mask = torch.as_tensor(
@@ -1082,34 +1128,57 @@ class GeneEssentRunner:
             batch = self._move_batch_to_device(batch)
             targets = targets.to(self.device, non_blocking=True)
 
+            should_step = is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
             use_no_sync = (
                 self.is_distributed
                 and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
+                and not should_step
             )
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
 
             with sync_context:
                 preds = self.model(batch)
-                loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
-                (loss / grad_acc_steps).backward()
+                loss_sum, loss_normalizer = self._masked_mse_sum_and_normalizer(
+                    preds[:, valid_mask],
+                    targets[:, valid_mask],
+                )
+                loss_sum.backward()
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
+            accumulated_normalizer += loss_normalizer
+
+            if should_step:
+                normalize_accumulated_gradients(
+                    self._optimizer_parameters(),
+                    accumulated_normalizer,
+                    device=self.device,
+                    is_distributed=self.is_distributed,
+                    world_size=self.world_size,
+                )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
+                accumulated_normalizer = 0.0
 
-            running_loss += loss.item()
+            running_loss_numerator += float(loss_sum.detach().item())
+            running_loss_normalizer += loss_normalizer
 
-        epoch_loss = running_loss / len(self.train_loader)
+        loss_totals = torch.tensor(
+            [running_loss_numerator, running_loss_normalizer],
+            dtype=torch.float64,
+            device=self.device,
+        )
         if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
+            dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
+        epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
         self.scheduler.step()
         return {"loss": epoch_loss}
 
     def _evaluate(self) -> dict:
         self.model.eval()
-        running_loss = 0.0
         all_preds: list[torch.Tensor] = []
         all_targets: list[torch.Tensor] = []
         if self.fold_valid_gene_mask is None:
@@ -1127,8 +1196,6 @@ class GeneEssentRunner:
                 batch = self._move_batch_to_device(batch)
                 targets = targets.to(self.device, non_blocking=True)
                 preds = self.model(batch)
-                loss = self._masked_mse(preds[:, valid_mask], targets[:, valid_mask])
-                running_loss += loss.item()
                 all_preds.append(preds[:, valid_mask])
                 all_targets.append(targets[:, valid_mask])
 
@@ -1154,9 +1221,7 @@ class GeneEssentRunner:
             pccs.append(float(pcc) if np.isfinite(pcc) else float("nan"))
             sccs.append(float(scc) if np.isfinite(scc) else float("nan"))
 
-        test_loss = running_loss / max(1, len(self.test_loader))
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.local_rank, 0, self.world_size)
+        test_loss = self._masked_mse(all_preds_t, all_targets_t).item()
 
         return {
             "loss": float(test_loss),
@@ -1285,6 +1350,7 @@ class GeneEssentRunner:
             for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict[str, object]] = []
                 cell_line_rows: list[dict[str, object]] = []
+                curve_rows: list[dict[str, object]] = []
 
                 for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                     seed_all(
@@ -1320,15 +1386,45 @@ class GeneEssentRunner:
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan")}
+                    last_validation_metrics: dict[str, object] | None = None
                     for epoch in range(1, epochs + 1):
                         last_train_metrics = self._train_one_epoch(epoch)
+                        last_validation_metrics = self._evaluate()
                         if self.is_master:
+                            curve_rows.append(
+                                {
+                                    "model": model_key,
+                                    "fold": fold_idx,
+                                    "epoch": epoch,
+                                    "finetune_mode": self._finetune_mode(),
+                                    "train_loss": last_train_metrics["loss"],
+                                    "validation_loss": last_validation_metrics["loss"],
+                                    "validation_pcc": last_validation_metrics["pcc"],
+                                    "validation_scc": last_validation_metrics["scc"],
+                                    "learning_rates": ";".join(
+                                        f"{float(group['lr']):.6g}"
+                                        for group in self.optimizer.param_groups
+                                    ),
+                                }
+                            )
+                            self._write_csv(
+                                self._task_output_dir()
+                                / f"{self._output_prefix()}_{model_key}_training_curves.csv",
+                                curve_rows,
+                            )
                             log.info(
-                                "Model %s | Fold %d/%d | Epoch %d | Train Loss: %.6f",
-                                model_key, fold_idx, len(splits), epoch, last_train_metrics["loss"],
+                                "Model %s | Fold %d/%d | Epoch %d | "
+                                "Train Loss: %.6f | Validation Loss: %.6f",
+                                model_key, fold_idx, len(splits), epoch,
+                                last_train_metrics["loss"],
+                                last_validation_metrics["loss"],
                             )
 
-                    test_metrics = self._evaluate()
+                    test_metrics = (
+                        last_validation_metrics
+                        if last_validation_metrics is not None
+                        else self._evaluate()
+                    )
                     if self.is_master:
                         log.info(
                             "Model %s | Fold %d/%d | Test Loss: %.6f | PCC: %.4f | SCC: %.4f",
@@ -1367,6 +1463,7 @@ class GeneEssentRunner:
                 out_dir = self._task_output_dir()
                 output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {
                     "results_path": str(output_path),
                     "results": aggregate_rows,

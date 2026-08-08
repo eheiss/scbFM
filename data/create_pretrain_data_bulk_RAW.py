@@ -55,6 +55,10 @@ MIN_GENES = int(os.getenv("SCBFM_BULK_MIN_GENES", "200"))
 ROW_CHUNK_SIZE = int(os.getenv("SCBFM_BULK_ROW_CHUNK_SIZE", "1000"))
 RANDOM_SEED = int(os.getenv("SCBFM_BULK_RANDOM_SEED", "42"))
 PRETRAIN_FRACTION = float(os.getenv("SCBFM_BULK_PRETRAIN_FRACTION", "0.9"))
+EXPECTED_PRETRAIN_SAMPLES = int(os.getenv(
+    "SCBFM_BULK_EXPECTED_PRETRAIN_SAMPLES",
+    "642406",
+))
 COMPRESSION = os.getenv("SCBFM_BULK_H5AD_COMPRESSION", "lzf") or None
 
 GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
@@ -788,12 +792,21 @@ def write_bulk_h5ad(
 def main() -> None:
     if ROW_CHUNK_SIZE <= 0:
         raise ValueError("SCBFM_BULK_ROW_CHUNK_SIZE must be positive.")
+    if EXPECTED_PRETRAIN_SAMPLES <= 0:
+        raise ValueError("SCBFM_BULK_EXPECTED_PRETRAIN_SAMPLES must be positive.")
 
     gene_list = read_gene_list(GENE_LIST_PATH)
     print(f"Gene list length: {len(gene_list):,}")
 
     records, summary = build_filtered_records(gene_list)
     pretrain_records, preadapt_records = split_pretrain_preadapt_records(records)
+    if len(pretrain_records) != EXPECTED_PRETRAIN_SAMPLES:
+        raise ValueError(
+            "The controlled benchmark requires exactly "
+            f"{EXPECTED_PRETRAIN_SAMPLES:,} bulk pretraining profiles, but the "
+            f"current filtering and split produced {len(pretrain_records):,}. "
+            "Resolve the source-data or filtering discrepancy before pretraining."
+        )
     print(
         "Writing post-filter bulk datasets: "
         f"pretraining={len(pretrain_records):,} samples, "
@@ -803,6 +816,7 @@ def main() -> None:
 
     summary["pretrain_fraction"] = PRETRAIN_FRACTION
     summary["preadapt_fraction"] = 1 - PRETRAIN_FRACTION
+    summary["expected_pretraining_samples"] = EXPECTED_PRETRAIN_SAMPLES
 
     summary["pretraining_dataset"] = write_bulk_h5ad(
         pretrain_records,

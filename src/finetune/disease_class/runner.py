@@ -18,6 +18,7 @@ class DiseaseClassRunner(CancTypeClassRunner):
     """DiSignAtlas classification using the shared CancerFoundation fine-tuning stack."""
 
     task_name = "disease_class"
+    config_node = "disease_class"
 
     @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
@@ -28,11 +29,7 @@ class DiseaseClassRunner(CancTypeClassRunner):
             "Expected cfg.finetune.disease_class."
         )
 
-    def _load_disignatlas(self) -> ad.AnnData:
-        configured_path = getattr(self.task_cfg, "disignatlas_data_path", None)
-        if not configured_path:
-            raise ValueError("finetune.disease_class.disignatlas_data_path must be set.")
-        data_path = Path(hydra.utils.to_absolute_path(str(configured_path)))
+    def _read_disignatlas(self, data_path: Path) -> ad.AnnData:
         if not data_path.exists():
             raise FileNotFoundError(f"DiSignAtlas h5ad file not found: {data_path}")
 
@@ -59,13 +56,44 @@ class DiseaseClassRunner(CancTypeClassRunner):
             )
 
         adata.obs["disease_label"] = adata.obs[disease_label_col].astype(str)
-        # The shared classification runner consistently consumes this internal
-        # label column; output files still use the original disease names.
         adata.obs["cancer_type"] = adata.obs["disease_label"]
-        adata.obs_names_make_unique()
+
+        sample_id_col = str(getattr(self.task_cfg, "disease_sample_id_col", "GSM_ID"))
+        if sample_id_col not in adata.obs:
+            raise ValueError(
+                f"obs column '{sample_id_col}' not found in DiSignAtlas h5ad. "
+                f"Available columns: {list(adata.obs.columns)}"
+            )
+        sample_ids = adata.obs[sample_id_col].astype(str).str.strip()
+        invalid_sample_ids = sample_ids.isin({"", "nan", "None"})
+        if invalid_sample_ids.any():
+            raise ValueError(
+                f"DiSignAtlas contains {int(invalid_sample_ids.sum())} invalid "
+                f"sample IDs in obs['{sample_id_col}']."
+            )
+        if sample_ids.duplicated().any():
+            duplicates = sorted(
+                sample_ids[sample_ids.duplicated(keep=False)].unique().tolist()
+            )
+            raise ValueError(
+                f"DiSignAtlas obs['{sample_id_col}'] must be unique. "
+                f"Duplicates include: {duplicates[:10]}"
+            )
+        adata.obs["sample_id"] = sample_ids.to_numpy()
+        # Compatibility metadata used by shared classification and external-model runners.
+        adata.obs["patient_id"] = sample_ids.to_numpy()
+        adata.obs["project"] = adata.obs["disease_label"].astype(str).to_numpy()
+        adata.obs_names = sample_ids.to_numpy()
         adata.var_names_make_unique()
         log.info("Filtered DiSignAtlas to cases: %d -> %d samples", n_before, adata.n_obs)
         return adata
+
+    def _load_disignatlas(self) -> ad.AnnData:
+        configured_path = getattr(self.task_cfg, "disignatlas_data_path", None)
+        if not configured_path:
+            raise ValueError("finetune.disease_class.disignatlas_data_path must be set.")
+        data_path = Path(hydra.utils.to_absolute_path(str(configured_path)))
+        return self._read_disignatlas(data_path)
 
     def _load_input_adata(self) -> ad.AnnData:
         log.info("Loading DiSignAtlas cases for disease classification")
@@ -119,6 +147,12 @@ class DiseaseClassRunner(CancTypeClassRunner):
         labels = adata.obs["disease_label"].astype(str).to_numpy()
         adata.obs["cancer_type"] = labels
         self.label_dict = np.unique(labels)
+        expected_classes = int(getattr(self.task_cfg, "expected_disease_classes", 23))
+        if len(self.label_dict) != expected_classes:
+            raise ValueError(
+                f"DiSignAtlas case filtering produced {len(self.label_dict)} disease classes; "
+                f"expected {expected_classes}. Observed labels: {self.label_dict.tolist()}"
+            )
         log.info(
             "Prepared DiSignAtlas data: samples=%d, genes=%d, diseases=%d",
             adata.n_obs,
@@ -138,9 +172,13 @@ class DiseaseClassRunner(CancTypeClassRunner):
         truth_indices = np.asarray(test_metrics["truth_indices"], dtype=int)
         prediction_indices = np.asarray(test_metrics["prediction_indices"], dtype=int)
         labels = self.label_dict.tolist()
+        dataset_col = next(
+            (column for column in ("dataset", "annot") if column in test_adata.obs),
+            None,
+        )
         dataset_ids = (
-            test_adata.obs["dataset"].astype(str).to_numpy()
-            if "dataset" in test_adata.obs
+            test_adata.obs[dataset_col].astype(str).to_numpy()
+            if dataset_col is not None
             else np.asarray([""] * test_adata.n_obs)
         )
 
@@ -154,7 +192,7 @@ class DiseaseClassRunner(CancTypeClassRunner):
                     "fold": fold,
                     "finetune_mode": self._finetune_mode(),
                     "checkpoint_path": checkpoint_path,
-                    "sample_id": str(test_adata.obs_names[idx]),
+                    "sample_id": str(test_adata.obs["sample_id"].iloc[idx]),
                     "dataset_id": dataset_ids[idx],
                     "true_idx": int(truth_idx),
                     "pred_idx": int(pred_idx),

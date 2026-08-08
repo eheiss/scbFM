@@ -1,31 +1,31 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
-import hydra
 import numpy as np
-import scanpy as sc
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from scipy import sparse
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.raw_mlp_runner import solve_hidden_dim
 from finetune.drug_resp.runner import (
     ROOT,
     DrugRespRunner,
-    GroupedCosineAnnealingWarmupRestarts,
+    GroupedCosineWarmupUpdateScheduler,
 )
 
 log = logging.getLogger(__name__)
 
 
 class RawDrugRespDataset(Dataset):
-    """Each item is one (raw cell expression, drug feature) pair."""
+    """Each item is one optional raw-expression vector and drug-feature pair."""
 
     def __init__(
         self,
@@ -52,11 +52,14 @@ class RawDrugRespDataset(Dataset):
 
     def __getitem__(self, idx: int):
         cell_idx = int(self.cell_idxs[idx])
-        row = self.X_cell[cell_idx, self.feature_indices]
-        values = row.toarray().ravel() if sparse.issparse(row) else np.asarray(row).ravel()
-        values = values.astype(np.float32, copy=False)
-        if self.mean is not None and self.std is not None:
-            values = (values - self.mean) / self.std
+        if self.feature_indices.size:
+            row = self.X_cell[cell_idx, self.feature_indices]
+            values = row.toarray().ravel() if sparse.issparse(row) else np.asarray(row).ravel()
+            values = values.astype(np.float32, copy=False)
+            if self.mean is not None and self.std is not None:
+                values = (values - self.mean) / self.std
+        else:
+            values = np.empty(0, dtype=np.float32)
         return (
             torch.tensor(cell_idx, dtype=torch.long),
             {"raw_expr": torch.from_numpy(values)},
@@ -66,16 +69,18 @@ class RawDrugRespDataset(Dataset):
 
 
 class RawDrugRespMLP(nn.Module):
-    """[raw expression ‖ drug features] → MLP → IC50 scalar."""
+    """Optional raw expression plus drug features -> MLP -> IC50 scalar."""
 
-    def __init__(self, expression_dim: int, drug_emb_dim: int, hidden_dim: int, hidden_layers: int) -> None:
+    def __init__(self, expression_dim: int, drug_emb_dim: int, hidden_dim: int) -> None:
         super().__init__()
         input_dim = int(expression_dim) + int(drug_emb_dim)
-        layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim), nn.SELU()]
-        for _ in range(hidden_layers - 1):
-            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SELU()])
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def forward(
         self,
@@ -95,7 +100,7 @@ class RawDrugRespMLP(nn.Module):
 
 
 class DrugRespRawMLPRunner(DrugRespRunner):
-    """Parameter-matched raw-expression + drug-feature MLP baseline."""
+    """Parameter-matched drug-response MLP baselines."""
 
     @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
@@ -120,35 +125,19 @@ class DrugRespRawMLPRunner(DrugRespRunner):
         return {"raw_mlp": ""}
 
     def _save_run_metadata(self, checkpoint_paths: dict | None = None) -> None:
-        if not self.is_master:
-            return
-        out_dir = self._task_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self._output_prefix()
-        (out_dir / f"{prefix}_config.yaml").write_text(
-            OmegaConf.to_yaml(self.cfg, resolve=True),
-            encoding="utf-8",
-        )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
-            {
-                "task": "finetune.drug_resp_raw_mlp",
-                "baseline": "raw_expression_plus_drug_feature_mlp",
-                "variant": self._finetune_mode(),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-            },
-        )
+        super()._save_run_metadata(checkpoint_paths or {"raw_mlp": ""})
 
     def _select_training_hvg_indices(self, X_cell, training_cell_idxs: np.ndarray) -> np.ndarray:
         feature_mode = str(getattr(self.task_cfg, "raw_mlp_feature_mode", "all_genes"))
-        if feature_mode == "drug_only":
-            return np.asarray([], dtype=np.int64)
         if feature_mode == "all_genes":
             return np.arange(X_cell.shape[1], dtype=np.int64)
         if feature_mode == "hvg1199":
             return super()._select_training_hvg_indices(X_cell, training_cell_idxs)
-        raise ValueError("raw_mlp_feature_mode must be one of: drug_only, all_genes, hvg1199.")
+        if feature_mode == "drug_only":
+            return np.empty(0, dtype=np.int64)
+        raise ValueError(
+            "raw_mlp_feature_mode must be one of: all_genes, hvg1199, drug_only."
+        )
 
     @staticmethod
     def _feature_mean_std(X_cell, cell_idxs: np.ndarray, feature_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -165,7 +154,7 @@ class DrugRespRawMLPRunner(DrugRespRunner):
         std[std < 1e-6] = 1.0
         return mean, std
 
-    def _build_cell_centric_train(
+    def _build_train_loader(
         self,
         X_cell,
         drug_emb_matrix: np.ndarray,
@@ -173,13 +162,6 @@ class DrugRespRawMLPRunner(DrugRespRunner):
         drug_idxs_train: np.ndarray,
         ic50_train: np.ndarray,
     ) -> None:
-        super()._build_cell_centric_train(
-            X_cell,
-            drug_emb_matrix,
-            cell_idxs_train,
-            drug_idxs_train,
-            ic50_train,
-        )
         if self.fold_gene_indices is None:
             raise RuntimeError("Raw MLP feature indices have not been selected.")
         if bool(getattr(self.task_cfg, "raw_mlp_standardize", True)):
@@ -193,6 +175,52 @@ class DrugRespRawMLPRunner(DrugRespRunner):
                 )
         else:
             self.raw_feature_mean, self.raw_feature_std = None, None
+
+        train_dataset = RawDrugRespDataset(
+            X_cell,
+            drug_emb_matrix,
+            cell_idxs_train,
+            drug_idxs_train,
+            ic50_train,
+            self.fold_gene_indices,
+            self.raw_feature_mean,
+            self.raw_feature_std,
+        )
+        self.train_dataset_size = len(train_dataset)
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
+        if self.is_distributed:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                seed=int(getattr(self.task_cfg, "random_seed", 42)),
+                drop_last=False,
+            )
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                sampler=train_sampler,
+                shuffle=False,
+                **self._loader_kwargs(),
+            )
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(int(getattr(self.task_cfg, "random_seed", 42)))
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                generator=generator,
+                **self._loader_kwargs(),
+            )
+        if self.is_master:
+            log.info(
+                "Raw MLP training loader: pairs=%d | expression_features=%d | batch_size=%d",
+                self.train_dataset_size,
+                self.fold_gene_indices.size,
+                batch_size,
+            )
 
     def _cell_backbone_batch(self, X_cell, cell_indices: np.ndarray) -> dict[str, torch.Tensor]:
         if self.fold_gene_indices is None:
@@ -217,19 +245,8 @@ class DrugRespRawMLPRunner(DrugRespRunner):
     ) -> None:
         if self.fold_gene_indices is None:
             raise RuntimeError("Raw MLP feature indices have not been selected.")
-        batch_size = int(getattr(self.task_cfg, "batch_size", 32))
-        num_workers = int(getattr(self.task_cfg, "num_workers", 0))
-        loader_kwargs: dict[str, object] = {
-            "num_workers": num_workers,
-            "pin_memory": self.device.type == "cuda",
-        }
-        if num_workers > 0:
-            loader_kwargs.update(
-                {
-                    "prefetch_factor": int(getattr(self.task_cfg, "prefetch_factor", 2)),
-                    "persistent_workers": False,
-                }
-            )
+        batch_size = int(getattr(self.task_cfg, "batch_size", 4))
+        loader_kwargs = self._loader_kwargs()
         test_dataset = RawDrugRespDataset(
             X_cell,
             drug_emb_matrix,
@@ -267,14 +284,13 @@ class DrugRespRawMLPRunner(DrugRespRunner):
 
     def _build_model(self, checkpoint_path: str, drug_emb_dim: int) -> None:
         expression_dim = int(len(self.fold_gene_indices))
-        hidden_layers = int(getattr(self.task_cfg, "raw_mlp_hidden_layers", 2))
         hidden_dim_cfg = getattr(self.task_cfg, "raw_mlp_hidden_dim", None)
         hidden_dim = (
             solve_hidden_dim(
                 input_dim=expression_dim + int(drug_emb_dim),
                 output_dim=1,
                 target_params=int(getattr(self.task_cfg, "raw_mlp_target_params", 6_560_000)),
-                hidden_layers=hidden_layers,
+                hidden_layers=2,
             )
             if hidden_dim_cfg is None
             else int(hidden_dim_cfg)
@@ -283,7 +299,6 @@ class DrugRespRawMLPRunner(DrugRespRunner):
             expression_dim=expression_dim,
             drug_emb_dim=int(drug_emb_dim),
             hidden_dim=hidden_dim,
-            hidden_layers=hidden_layers,
         ).to(self.device)
         if self.is_distributed:
             self.model = (
@@ -294,11 +309,11 @@ class DrugRespRawMLPRunner(DrugRespRunner):
         if self.is_master:
             param_count = sum(p.numel() for p in self.model.parameters())
             log.info(
-                "Raw drug-response MLP: input=%d raw genes + %d drug features | hidden=%d x %d | params=%d",
+                "Raw drug-response MLP: input=%d expression features + %d drug features | "
+                "hidden=%d x 2 | params=%d",
                 expression_dim,
                 int(drug_emb_dim),
                 hidden_dim,
-                hidden_layers,
                 param_count,
             )
 
@@ -306,14 +321,17 @@ class DrugRespRawMLPRunner(DrugRespRunner):
         lr = float(getattr(self.task_cfg, "raw_mlp_learning_rate", 1e-4))
         self.optimizer = Adam([{"params": self.model.parameters(), "lr": lr, "name": "raw_mlp"}])
         min_lr = float(getattr(self.task_cfg, "min_lr", 1e-6))
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 20)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=[lr],
             min_lr_ratio=min_lr / max(lr, 1e-12),
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 5)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=math.ceil(len(self.train_loader) / grad_acc_steps),
+            epochs=int(getattr(self.task_cfg, "epochs", 20)),
+            warmup_epochs=int(getattr(self.task_cfg, "warmup_epochs", 2)),
         )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:

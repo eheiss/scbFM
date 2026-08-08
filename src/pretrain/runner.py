@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import os
+from contextlib import ExitStack
 from pathlib import Path
 
 import anndata as ad
@@ -12,7 +14,6 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from scipy import sparse
-from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -24,12 +25,12 @@ from cancerfoundation_backbone import (
     ExpressionBinDecoder,
     ExpressionClsDecoder,
 )
+from finetune.training_correctness import validate_backbone_checkpoint
 from preprocess import read_gene_list
 from utils import (
     CosineAnnealingWarmupRestarts,
     SequentialDistributedSampler,
     distributed_concat,
-    get_reduced,
     seed_all,
 )
 
@@ -186,6 +187,20 @@ class PreTrainRunner:
                 "Fixed expressed/zero ratio sampling has been removed."
             )
 
+        configured_sample_limit = getattr(self.pretrain_cfg, "sample_limit", None)
+        self.sample_limit = (
+            None if configured_sample_limit is None else int(configured_sample_limit)
+        )
+        if self.sample_limit is not None and self.sample_limit <= 0:
+            raise ValueError("pretrain.sample_limit must be a positive integer or null.")
+        self.source_sample_count = 0
+        self.effective_sample_count = 0
+        self.train_sample_count = 0
+        self.validation_sample_count = 0
+        self.selected_sample_fingerprint = ""
+        self.train_sample_fingerprint = ""
+        self.validation_sample_fingerprint = ""
+
         self.cls_gene_id = 0
         self.pad_gene_id = 1
         self.gene_token_offset = 2
@@ -233,6 +248,56 @@ class PreTrainRunner:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
         return ROOT / "data" / "gene_list.txt"
 
+    @staticmethod
+    def _select_sample_indices(
+        n_obs: int,
+        sample_limit: int | None,
+        seed: int,
+    ) -> np.ndarray:
+        if n_obs < 0:
+            raise ValueError("n_obs must be non-negative.")
+        if sample_limit is not None and sample_limit <= 0:
+            raise ValueError("sample_limit must be positive.")
+        if sample_limit is not None and sample_limit > n_obs:
+            raise ValueError(
+                f"Requested sample_limit={sample_limit}, but the dataset has only "
+                f"{n_obs} samples."
+            )
+
+        rng = np.random.default_rng(seed)
+        permutation = rng.permutation(n_obs).astype(np.int64, copy=False)
+        return permutation if sample_limit is None else permutation[:sample_limit]
+
+    @staticmethod
+    def _split_sample_indices(
+        indices: np.ndarray,
+        validation_fraction: float,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Create train/validation prefixes that stay nested across sample limits."""
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size < 2 or validation_fraction <= 0:
+            return indices, None
+        if validation_fraction >= 1:
+            raise ValueError("validation_split must be smaller than 1.")
+
+        positions = np.arange(indices.size, dtype=np.float64)
+        validation_mask = (
+            np.ceil((positions + 1.0) * validation_fraction)
+            > np.ceil(positions * validation_fraction)
+        )
+        train_indices = indices[~validation_mask]
+        validation_indices = indices[validation_mask]
+        if train_indices.size == 0 or validation_indices.size == 0:
+            raise ValueError(
+                "validation_split produced an empty train or validation partition."
+            )
+        return train_indices, validation_indices
+
+    @staticmethod
+    def _indices_fingerprint(indices: np.ndarray) -> str:
+        values = np.asarray(indices, dtype="<i8")
+        return hashlib.sha256(values.tobytes()).hexdigest()
+
     def _load_data(self) -> tuple[np.ndarray, np.ndarray | None, str]:
         if bool(getattr(self.pretrain_cfg, "preprocess", False)):
             raise ValueError(
@@ -276,16 +341,37 @@ class PreTrainRunner:
             )
             raise ValueError(f"{data_path} is not aligned to gene_list.txt ({detail}).")
 
-        indices = np.arange(n_obs, dtype=np.int64)
+        self.source_sample_count = n_obs
+        indices = self._select_sample_indices(
+            n_obs,
+            self.sample_limit,
+            int(self.pretrain_cfg.seed),
+        )
+        self.effective_sample_count = int(indices.size)
+        self.selected_sample_fingerprint = self._indices_fingerprint(indices)
+        if self.sample_limit is not None:
+            log.info(
+                "Selected deterministic nested subset: %d/%d samples (seed=%d).",
+                self.effective_sample_count,
+                self.source_sample_count,
+                int(self.pretrain_cfg.seed),
+            )
+
         val_fraction = float(self.pretrain_cfg.validation_split)
-        if n_obs < 2 or val_fraction <= 0:
+        if self.effective_sample_count < 2 or val_fraction <= 0:
+            self.train_sample_count = self.effective_sample_count
+            self.validation_sample_count = 0
+            self.train_sample_fingerprint = self.selected_sample_fingerprint
+            self.validation_sample_fingerprint = ""
             return indices, None, data_path
 
-        train_idx, val_idx = train_test_split(
-            indices,
-            test_size=val_fraction,
-            random_state=int(self.pretrain_cfg.seed),
-        )
+        train_idx, val_idx = self._split_sample_indices(indices, val_fraction)
+        if val_idx is None:
+            raise RuntimeError("Expected a validation partition for a positive split.")
+        self.train_sample_count = int(len(train_idx))
+        self.validation_sample_count = int(len(val_idx))
+        self.train_sample_fingerprint = self._indices_fingerprint(train_idx)
+        self.validation_sample_fingerprint = self._indices_fingerprint(val_idx)
         return (
             np.asarray(train_idx, dtype=np.int64),
             np.asarray(val_idx, dtype=np.int64),
@@ -299,7 +385,7 @@ class PreTrainRunner:
             gene_num=self.gene_num,
             selected_gene_count=self.selected_gene_count,
             bin_num=self.bin_num,
-            seed=int(self.pretrain_cfg.seed) + self.rank,
+            seed=int(self.pretrain_cfg.seed),
             cls_gene_id=self.cls_gene_id,
             gene_token_offset=self.gene_token_offset,
             cls_value=self.pad_value,
@@ -403,6 +489,39 @@ class PreTrainRunner:
         if self.pretrain_cfg.resume_checkpoint:
             checkpoint_path = hydra.utils.to_absolute_path(str(self.pretrain_cfg.resume_checkpoint))
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            validate_backbone_checkpoint(
+                checkpoint,
+                checkpoint_path,
+                gene_num=self.gene_num,
+                selected_gene_count=self.selected_gene_count,
+                max_seq_len=self.max_seq_len,
+                bin_num=self.bin_num,
+                minimum_epoch=1,
+            )
+            if bool(getattr(self.pretrain_cfg, "resume_optimizer_state", True)):
+                checkpoint_sample_limit = checkpoint.get("sample_limit")
+                if checkpoint_sample_limit != self.sample_limit:
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_path} uses sample_limit="
+                        f"{checkpoint_sample_limit}, but the current run uses "
+                        f"sample_limit={self.sample_limit}."
+                    )
+                expected_split = {
+                    "split_strategy": "nested_prefix",
+                    "selected_sample_fingerprint": self.selected_sample_fingerprint,
+                    "train_sample_fingerprint": self.train_sample_fingerprint,
+                    "validation_sample_fingerprint": self.validation_sample_fingerprint,
+                }
+                split_mismatches = {
+                    key: {"expected": value, "observed": checkpoint.get(key)}
+                    for key, value in expected_split.items()
+                    if checkpoint.get(key) != value
+                }
+                if split_mismatches:
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_path} does not match the current "
+                        f"sample partition: {split_mismatches}"
+                    )
             self.resume_checkpoint_data = checkpoint
             model.load_state_dict(checkpoint["model_state_dict"])
             self.expr_decoder.load_state_dict(checkpoint["expr_decoder_state_dict"])
@@ -481,9 +600,46 @@ class PreTrainRunner:
             return []
         return [float(group["lr"]) for group in self.optimizer.param_groups]
 
+    def _optimizer_parameters(self) -> list[torch.nn.Parameter]:
+        return [
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        ]
+
+    @staticmethod
+    def _is_accumulation_boundary(
+        step_idx: int,
+        total_steps: int,
+        grad_acc_steps: int,
+    ) -> bool:
+        return step_idx % grad_acc_steps == 0 or step_idx == total_steps
+
+    def _normalize_accumulated_gradients(self, local_normalizer: float) -> bool:
+        normalizer = torch.tensor(
+            local_normalizer,
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.is_distributed:
+            dist.all_reduce(normalizer, op=dist.ReduceOp.SUM)
+            normalizer /= self.world_size
+
+        divisor = float(normalizer.item())
+        if divisor <= 0.0:
+            return False
+        if not np.isfinite(divisor):
+            raise ValueError(f"Accumulated loss normalizer must be finite, got {divisor}.")
+        for parameter in self._optimizer_parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(divisor)
+        return True
+
     def _mask_batch(
         self,
         batch: dict[str, torch.Tensor],
+        *,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         gene_ids = batch["gene_ids"].to(self.device, non_blocking=True)
         expr = batch["expr"].to(self.device, non_blocking=True)
@@ -494,7 +650,7 @@ class PreTrainRunner:
         for value in self.mask_ignore_values:
             probability[expr.eq(float(value))] = 0.0
 
-        mask = torch.bernoulli(probability).bool()
+        mask = torch.bernoulli(probability, generator=generator).bool()
         labels = torch.full(
             expr.shape,
             self.label_ignore_id,
@@ -546,40 +702,39 @@ class PreTrainRunner:
         labels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         masked_positions = labels != float(self.label_ignore_id)
-        if not masked_positions.any():
-            zero_loss = predicted_values.sum() * 0.0
-            if cls_predicted_values is not None:
-                zero_loss = zero_loss + cls_predicted_values.sum() * 0.0
-            return {
-                "total": zero_loss,
-                "gene": zero_loss,
-                "cls": zero_loss,
-            }
         mask = masked_positions.float()
-        gene_loss = nn.functional.mse_loss(
-            predicted_values * mask,
-            labels * mask,
-            reduction="sum",
-        )
-        gene_loss = gene_loss / mask.sum()
+        normalizers = mask.sum(dim=1)
+        normalizer = normalizers.sum()
+        gene_sums = ((predicted_values - labels) * mask).square().sum(dim=1)
+        gene_sum = gene_sums.sum()
+        if normalizer.item() > 0:
+            gene_loss = gene_sum / normalizer
+        else:
+            gene_loss = predicted_values.sum() * 0.0
 
         if self.cls_loss_weight > 0:
             if cls_predicted_values is None:
                 raise RuntimeError("CLS loss is enabled but CLS predictions were not computed.")
-            cls_loss = nn.functional.mse_loss(
-                cls_predicted_values * mask,
-                labels * mask,
-                reduction="sum",
-            )
-            cls_loss = cls_loss / mask.sum()
+            cls_sums = ((cls_predicted_values - labels) * mask).square().sum(dim=1)
+            cls_sum = cls_sums.sum()
+            if normalizer.item() > 0:
+                cls_loss = cls_sum / normalizer
+            else:
+                cls_loss = cls_predicted_values.sum() * 0.0
         else:
             cls_loss = gene_loss.detach() * 0.0
+            cls_sums = torch.zeros_like(gene_sums)
 
         total_loss = gene_loss + self.cls_loss_weight * cls_loss
+        total_sums = gene_sums + self.cls_loss_weight * cls_sums
         return {
             "total": total_loss,
             "gene": gene_loss,
             "cls": cls_loss,
+            "total_sums": total_sums,
+            "gene_sums": gene_sums,
+            "cls_sums": cls_sums,
+            "normalizers": normalizers,
         }
 
     def _output_dir(self) -> Path:
@@ -810,7 +965,14 @@ class PreTrainRunner:
         self._write_csv(out_dir / f"{prefix}_pretrain_epoch_metrics.csv", epoch_rows)
         self._write_csv(out_dir / f"{prefix}_pretrain_bin_metrics.csv", bin_rows)
 
-    def _save_checkpoint(self, epoch: int, train_loss: float) -> Path | None:
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        train_loss: float,
+        history: list[dict[str, object]],
+        epoch_metric_rows: list[dict[str, object]],
+        bin_metric_rows: list[dict[str, object]],
+    ) -> Path | None:
         if not self.is_master:
             return None
 
@@ -818,6 +980,7 @@ class PreTrainRunner:
         output_dir = self._output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = output_dir / f"{model_name}.pth"
+        temporary_path = checkpoint_path.with_suffix(f"{checkpoint_path.suffix}.tmp")
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
         raw_decoder = self.expr_decoder.module if isinstance(self.expr_decoder, DDP) else self.expr_decoder
@@ -838,8 +1001,34 @@ class PreTrainRunner:
             "bin_num": self.bin_num,
             "cls_loss_weight": self.cls_loss_weight,
             "loaded_optimizer_state": self.loaded_optimizer_state,
+            "sample_limit": self.sample_limit,
+            "source_sample_count": self.source_sample_count,
+            "effective_sample_count": self.effective_sample_count,
+            "train_sample_count": self.train_sample_count,
+            "validation_sample_count": self.validation_sample_count,
+            "selected_sample_fingerprint": getattr(
+                self,
+                "selected_sample_fingerprint",
+                "",
+            ),
+            "train_sample_fingerprint": getattr(
+                self,
+                "train_sample_fingerprint",
+                "",
+            ),
+            "validation_sample_fingerprint": getattr(
+                self,
+                "validation_sample_fingerprint",
+                "",
+            ),
+            "split_strategy": "nested_prefix",
+            "fixed_validation_masks": True,
+            "history": history,
+            "epoch_metric_rows": epoch_metric_rows,
+            "bin_metric_rows": bin_metric_rows,
         }
-        torch.save(checkpoint, checkpoint_path)
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
         return checkpoint_path
 
     def _train_one_epoch(self, epoch: int) -> tuple[dict, dict[str, object], list[dict[str, object]]]:
@@ -855,72 +1044,88 @@ class PreTrainRunner:
         grad_acc_steps = int(self.pretrain_cfg.grad_acc)
         max_grad_norm = float(self.pretrain_cfg.max_grad_norm)
 
-        running_loss = 0.0
-        running_gene_loss = 0.0
-        running_cls_loss = 0.0
-        num_batches = 0
+        running_loss_numerator = 0.0
+        running_gene_loss_numerator = 0.0
+        running_cls_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        accumulated_loss_normalizer = 0.0
         mask_stats = self._new_mask_stats()
         self.optimizer.zero_grad(set_to_none=True)
+        total_steps = len(self.train_loader)
 
         for step_idx, batch in enumerate(self.train_loader, start=1):
             gene_ids, masked_expr, labels, attention_key_padding_mask = self._mask_batch(batch)
 
+            should_step = self._is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
             use_no_sync = (
                 self.is_distributed
                 and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
+                and not should_step
             )
 
-            if use_no_sync:
-                from contextlib import ExitStack
-                with ExitStack() as stack:
+            with ExitStack() as stack:
+                if use_no_sync:
                     stack.enter_context(self.model.no_sync())
                     if isinstance(self.expr_decoder, DDP):
                         stack.enter_context(self.expr_decoder.no_sync())
                     if isinstance(self.cls_decoder, DDP):
                         stack.enter_context(self.cls_decoder.no_sync())
-                    predicted_values, cls_predicted_values, predictions = self._forward_batch(
-                        gene_ids,
-                        masked_expr,
-                        attention_key_padding_mask,
-                    )
-                    loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
-                    loss = loss_dict["total"]
-                    (loss / grad_acc_steps).backward()
-            else:
                 predicted_values, cls_predicted_values, predictions = self._forward_batch(
                     gene_ids,
                     masked_expr,
                     attention_key_padding_mask,
                 )
                 loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
-                loss = loss_dict["total"]
-                (loss / grad_acc_steps).backward()
+                loss_dict["total_sums"].sum().backward()
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
-                all_params = list(self.model.parameters()) + list(self.expr_decoder.parameters())
-                if self.cls_loss_weight > 0:
-                    all_params += list(self.cls_decoder.parameters())
-                torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
-                self.optimizer.step()
+            loss_normalizer = float(loss_dict["normalizers"].sum().detach().item())
+            accumulated_loss_normalizer += loss_normalizer
+
+            if should_step:
+                has_targets = self._normalize_accumulated_gradients(
+                    accumulated_loss_normalizer
+                )
+                if has_targets:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._optimizer_parameters(),
+                        max_grad_norm,
+                    )
+                    self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+                accumulated_loss_normalizer = 0.0
 
             with torch.no_grad():
                 self._update_mask_stats(mask_stats, labels, predictions)
 
-            running_loss += loss.item()
-            running_gene_loss += loss_dict["gene"].item()
-            running_cls_loss += loss_dict["cls"].item()
-            num_batches += 1
+            running_loss_numerator += float(loss_dict["total_sums"].sum().detach().item())
+            running_gene_loss_numerator += float(
+                loss_dict["gene_sums"].sum().detach().item()
+            )
+            running_cls_loss_numerator += float(
+                loss_dict["cls_sums"].sum().detach().item()
+            )
+            running_loss_normalizer += loss_normalizer
 
-        epoch_loss = running_loss / max(num_batches, 1)
-        epoch_gene_loss = running_gene_loss / max(num_batches, 1)
-        epoch_cls_loss = running_cls_loss / max(num_batches, 1)
-
+        loss_totals = torch.tensor(
+            [
+                running_loss_numerator,
+                running_gene_loss_numerator,
+                running_cls_loss_numerator,
+                running_loss_normalizer,
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
         if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.device, 0, self.world_size)
-            epoch_gene_loss = get_reduced(epoch_gene_loss, self.device, 0, self.world_size)
-            epoch_cls_loss = get_reduced(epoch_cls_loss, self.device, 0, self.world_size)
+            dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
+        total_loss, total_gene_loss, total_cls_loss, total_normalizer = loss_totals.tolist()
+        epoch_loss = self._safe_divide(total_loss, total_normalizer)
+        epoch_gene_loss = self._safe_divide(total_gene_loss, total_normalizer)
+        epoch_cls_loss = self._safe_divide(total_cls_loss, total_normalizer)
 
         self.scheduler.step()
         summary_row, bin_rows = self._format_mask_stats(
@@ -958,38 +1163,66 @@ class PreTrainRunner:
         if self.is_distributed:
             dist.barrier()
 
-        running_loss = 0.0
-        running_gene_loss = 0.0
-        running_cls_loss = 0.0
+        loss_numerators = []
+        gene_loss_numerators = []
+        cls_loss_numerators = []
+        loss_normalizers = []
         predictions = []
         truths = []
-        num_batches = 0
+
+        validation_generator = torch.Generator(device=self.device)
+        validation_generator.manual_seed(
+            int(self.pretrain_cfg.seed) + 10_000_019 + self.rank
+        )
 
         with torch.no_grad():
             for batch in self.val_loader:
-                gene_ids, masked_expr, labels, attention_key_padding_mask = self._mask_batch(batch)
+                gene_ids, masked_expr, labels, attention_key_padding_mask = self._mask_batch(
+                    batch,
+                    generator=validation_generator,
+                )
                 predicted_values, cls_predicted_values, prediction = self._forward_batch(
                     gene_ids,
                     masked_expr,
                     attention_key_padding_mask,
                 )
                 loss_dict = self._compute_losses(predicted_values, cls_predicted_values, labels)
-                loss = loss_dict["total"]
 
-                running_loss += loss.item()
-                running_gene_loss += loss_dict["gene"].item()
-                running_cls_loss += loss_dict["cls"].item()
+                loss_numerators.append(loss_dict["total_sums"])
+                gene_loss_numerators.append(loss_dict["gene_sums"])
+                cls_loss_numerators.append(loss_dict["cls_sums"])
+                loss_normalizers.append(loss_dict["normalizers"])
                 predictions.append(prediction)
                 truths.append(labels)
-                num_batches += 1
 
+        loss_numerator_tensor = torch.cat(loss_numerators, dim=0)
+        gene_loss_numerator_tensor = torch.cat(gene_loss_numerators, dim=0)
+        cls_loss_numerator_tensor = torch.cat(cls_loss_numerators, dim=0)
+        loss_normalizer_tensor = torch.cat(loss_normalizers, dim=0)
         prediction_tensor = torch.cat(predictions, dim=0)
         truth_tensor = torch.cat(truths, dim=0)
-        val_loss = running_loss / max(num_batches, 1)
-        val_gene_loss = running_gene_loss / max(num_batches, 1)
-        val_cls_loss = running_cls_loss / max(num_batches, 1)
 
         if self.is_distributed:
+            loss_numerator_tensor = distributed_concat(
+                loss_numerator_tensor,
+                self.val_dataset_size,
+                self.world_size,
+            )
+            gene_loss_numerator_tensor = distributed_concat(
+                gene_loss_numerator_tensor,
+                self.val_dataset_size,
+                self.world_size,
+            )
+            cls_loss_numerator_tensor = distributed_concat(
+                cls_loss_numerator_tensor,
+                self.val_dataset_size,
+                self.world_size,
+            )
+            loss_normalizer_tensor = distributed_concat(
+                loss_normalizer_tensor,
+                self.val_dataset_size,
+                self.world_size,
+            )
             prediction_tensor = distributed_concat(
                 prediction_tensor,
                 self.val_dataset_size,
@@ -1000,9 +1233,20 @@ class PreTrainRunner:
                 self.val_dataset_size,
                 self.world_size,
             )
-            val_loss = get_reduced(val_loss, self.device, 0, self.world_size)
-            val_gene_loss = get_reduced(val_gene_loss, self.device, 0, self.world_size)
-            val_cls_loss = get_reduced(val_cls_loss, self.device, 0, self.world_size)
+
+        total_normalizer = float(loss_normalizer_tensor.sum().detach().cpu().item())
+        val_loss = self._safe_divide(
+            float(loss_numerator_tensor.sum().detach().cpu().item()),
+            total_normalizer,
+        )
+        val_gene_loss = self._safe_divide(
+            float(gene_loss_numerator_tensor.sum().detach().cpu().item()),
+            total_normalizer,
+        )
+        val_cls_loss = self._safe_divide(
+            float(cls_loss_numerator_tensor.sum().detach().cpu().item()),
+            total_normalizer,
+        )
 
         mask_stats = self._new_mask_stats()
         self._update_mask_stats(mask_stats, truth_tensor, prediction_tensor)
@@ -1039,14 +1283,30 @@ class PreTrainRunner:
 
         epochs = int(self.pretrain_cfg.epochs)
         validate_every = int(self.pretrain_cfg.valid_every)
-        history = []
-        epoch_metric_rows = []
-        bin_metric_rows = []
+        start_epoch = 1
+        if self.resume_checkpoint_data is not None and self.loaded_optimizer_state:
+            completed_epoch = int(self.resume_checkpoint_data.get("epoch", 0))
+            if completed_epoch < 0:
+                raise ValueError("Checkpoint epoch must be non-negative.")
+            start_epoch = completed_epoch + 1
+        resume_data = self.resume_checkpoint_data if self.loaded_optimizer_state else None
+        history = list((resume_data or {}).get("history", []))
+        epoch_metric_rows = list((resume_data or {}).get("epoch_metric_rows", []))
+        bin_metric_rows = list((resume_data or {}).get("bin_metric_rows", []))
         final_checkpoint = None
         last_train_loss = float("nan")
 
         if self.is_master:
-            if self.pretrain_cfg.resume_checkpoint:
+            if self.pretrain_cfg.resume_checkpoint and self.loaded_optimizer_state:
+                log.info(
+                    "Resuming CancerFoundation-style pretraining of %s from checkpoint %s "
+                    "through epoch %d on device %s",
+                    self._model_name(),
+                    self.pretrain_cfg.resume_checkpoint,
+                    epochs,
+                    self.device,
+                )
+            elif self.pretrain_cfg.resume_checkpoint:
                 log.info(
                     "Starting CancerFoundation-style pre-adaptation of %s from checkpoint %s "
                     "for up to %d epochs on device %s",
@@ -1069,6 +1329,14 @@ class PreTrainRunner:
                 self.selected_gene_count,
                 self.max_seq_len,
                 self.bin_num,
+            )
+            log.info(
+                "Samples: source=%d | selected=%d | train=%d | validation=%d | limit=%s",
+                self.source_sample_count,
+                self.effective_sample_count,
+                self.train_sample_count,
+                self.validation_sample_count,
+                self.sample_limit,
             )
             log.info(
                 "Gene sampling: %s | exclude_masked_from_attention=%s | "
@@ -1101,9 +1369,15 @@ class PreTrainRunner:
                 self.loaded_optimizer_state,
                 ", ".join(f"{lr:.6g}" for lr in self._current_learning_rates()),
             )
+            if start_epoch > 1:
+                log.info(
+                    "Continuing from completed epoch %d; target total epochs=%d.",
+                    start_epoch - 1,
+                    epochs,
+                )
 
         try:
-            for epoch in range(1, epochs + 1):
+            for epoch in range(start_epoch, epochs + 1):
                 train_metrics, train_epoch_row, train_bin_rows = self._train_one_epoch(epoch)
                 last_train_loss = train_metrics["train_loss"]
 
@@ -1162,10 +1436,30 @@ class PreTrainRunner:
                     }
                 )
 
-            checkpoint_path = self._save_checkpoint(epochs, last_train_loss)
-            if checkpoint_path is not None:
-                final_checkpoint = str(checkpoint_path)
-                log.info("Saved final checkpoint to %s", checkpoint_path)
+                checkpoint_path = self._save_checkpoint(
+                    epoch,
+                    last_train_loss,
+                    history,
+                    epoch_metric_rows,
+                    bin_metric_rows,
+                )
+                if checkpoint_path is not None:
+                    final_checkpoint = str(checkpoint_path)
+                    log.info("Saved epoch %d checkpoint to %s", epoch, checkpoint_path)
+
+                if self.is_distributed:
+                    dist.barrier()
+
+            if start_epoch > epochs and self.is_master:
+                final_checkpoint = hydra.utils.to_absolute_path(
+                    str(self.pretrain_cfg.resume_checkpoint)
+                )
+                log.info(
+                    "Checkpoint already completed epoch %d, meeting target total epochs=%d; "
+                    "no training was run.",
+                    start_epoch - 1,
+                    epochs,
+                )
 
             return {
                 "history": history,

@@ -1,6 +1,9 @@
 # paths
 model_name:
 data_path:
+# Optional deterministic cap on total samples before the train/validation split.
+# The same seed produces nested subsets across increasing limits.
+sample_limit: null
 resume_checkpoint: null
 resume_optimizer_state: true
 
@@ -33,7 +36,6 @@ mask_value: -1.0
 preprocess: false
 reindex_genes: true
 gene_list_path: ../data/gene_list.txt
-min_genes: 200
 validation_split: 0.05
 mask_prob: 0.15
 mask_ignore_values: []

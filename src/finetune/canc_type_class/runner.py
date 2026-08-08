@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -13,6 +15,7 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import torch
 import torch.distributed as dist
@@ -38,14 +41,18 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
+from finetune.training_correctness import (
+    add_optimizer_parameter_group,
+    validate_backbone_checkpoint,
+)
 from preprocess import (
     reindex_adata_genes,
     validate_token_matrix,
 )
+from run_provenance import complete_run_metadata, start_run_metadata
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
-    get_reduced,
     seed_all,
 )
 
@@ -57,6 +64,13 @@ TASK_NAME = "canc_type_class"
 CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 RANDOM_INIT_MODEL_KEY = "random_init"
 MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
+
+
+def _set_finetune_training_mode(model: nn.Module, finetune_mode: str) -> None:
+    model.train()
+    if finetune_mode == "head_only":
+        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model.backbone.eval()
 
 
 def _digitize_expression(
@@ -250,6 +264,99 @@ class GroupedCosineAnnealingWarmupRestarts:
         }
 
 
+class GroupedCosineWarmupUpdateScheduler:
+    """Linear warm-up and cosine decay stepped once per optimizer update."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        max_lrs: list[float],
+        min_lr_ratio: float,
+        *,
+        updates_per_epoch: int,
+        epochs: int,
+        warmup_epochs: int,
+    ) -> None:
+        if len(max_lrs) != len(optimizer.param_groups):
+            raise ValueError("max_lrs must match optimizer.param_groups.")
+        if updates_per_epoch <= 0:
+            raise ValueError("updates_per_epoch must be positive.")
+        if epochs <= 0:
+            raise ValueError("epochs must be positive.")
+        if warmup_epochs < 0 or warmup_epochs >= epochs:
+            raise ValueError("warmup_epochs must be non-negative and smaller than epochs.")
+        if not 0.0 <= min_lr_ratio <= 1.0:
+            raise ValueError("min_lr_ratio must be between zero and one.")
+
+        self.optimizer = optimizer
+        self.base_max_lrs = [float(lr) for lr in max_lrs]
+        self.max_lrs = list(self.base_max_lrs)
+        self.min_lrs = [float(lr) * float(min_lr_ratio) for lr in self.base_max_lrs]
+        self.updates_per_epoch = int(updates_per_epoch)
+        self.epochs = int(epochs)
+        self.warmup_epochs = int(warmup_epochs)
+        self.total_updates = self.updates_per_epoch * self.epochs
+        self.warmup_updates = self.updates_per_epoch * self.warmup_epochs
+        self.completed_updates = 0
+
+        # Compatibility fields used when the full-FT backbone parameter group
+        # is added after burn-in.
+        self.gamma = 1.0
+        self.cycle = 0
+        self._set_lrs(self.min_lrs)
+
+    def _set_lrs(self, lrs: list[float]) -> None:
+        if len(lrs) != len(self.optimizer.param_groups):
+            raise ValueError("Learning rates must match optimizer.param_groups.")
+        for param_group, lr in zip(self.optimizer.param_groups, lrs):
+            param_group["lr"] = float(lr)
+
+    def get_lr(self) -> list[float]:
+        update = min(max(self.completed_updates, 0), self.total_updates)
+        if update == 0:
+            return list(self.min_lrs)
+
+        if self.warmup_updates > 0 and update <= self.warmup_updates:
+            progress = update / self.warmup_updates
+            return [
+                min_lr + (max_lr - min_lr) * progress
+                for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
+            ]
+
+        if self.warmup_updates == 0:
+            decay_progress = (update - 1) / max(self.total_updates - 1, 1)
+        else:
+            decay_progress = (update - self.warmup_updates) / (
+                self.total_updates - self.warmup_updates
+            )
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return [
+            min_lr + (max_lr - min_lr) * cosine_factor
+            for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
+        ]
+
+    def step(self) -> None:
+        if self.completed_updates >= self.total_updates:
+            raise RuntimeError(
+                "Learning-rate scheduler received more optimizer updates than configured."
+            )
+        self.completed_updates += 1
+        self._set_lrs(self.get_lr())
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "base_max_lrs": self.base_max_lrs,
+            "max_lrs": self.max_lrs,
+            "min_lrs": self.min_lrs,
+            "updates_per_epoch": self.updates_per_epoch,
+            "epochs": self.epochs,
+            "warmup_epochs": self.warmup_epochs,
+            "total_updates": self.total_updates,
+            "warmup_updates": self.warmup_updates,
+            "completed_updates": self.completed_updates,
+        }
+
+
 class CancTypeClassDataset(Dataset):
     def __init__(
         self,
@@ -345,6 +452,7 @@ class CancTypeClassDataset(Dataset):
 
 class CancTypeClassRunner:
     task_name = TASK_NAME
+    config_node = TASK_NAME
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
@@ -484,16 +592,24 @@ class CancTypeClassRunner:
             OmegaConf.to_yaml(self.cfg, resolve=True),
             encoding="utf-8",
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "output_suffix": self._output_suffix(),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-                "checkpoint_paths": checkpoint_paths,
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
             },
+            checkpoint_paths=checkpoint_paths,
+            repo_dir=ROOT / "scbFM",
         )
 
     @staticmethod
@@ -523,9 +639,31 @@ class CancTypeClassRunner:
                 f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
 
+        configured_model_keys = getattr(self.task_cfg, "model_keys", None)
+        if configured_model_keys is None:
+            selected_model_keys = list(MODEL_KEYS)
+        else:
+            selected_model_keys = [str(key) for key in configured_model_keys]
+            if not selected_model_keys:
+                raise ValueError("finetune.canc_type_class.model_keys may not be empty.")
+            duplicates = sorted(
+                key for key in set(selected_model_keys)
+                if selected_model_keys.count(key) > 1
+            )
+            invalid = sorted(set(selected_model_keys).difference(MODEL_KEYS))
+            if duplicates or invalid:
+                raise ValueError(
+                    "Invalid finetune.canc_type_class.model_keys: "
+                    f"duplicates={duplicates}, unsupported={invalid}; "
+                    f"supported={list(MODEL_KEYS)}."
+                )
+
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
+        for key in selected_model_keys:
+            if key == RANDOM_INIT_MODEL_KEY:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -536,7 +674,6 @@ class CancTypeClassRunner:
                 "Missing checkpoint paths in finetune.canc_type_class.pretrained_model_paths: "
                 f"{missing}"
             )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     def _load_tcga(self) -> ad.AnnData:
@@ -783,6 +920,236 @@ class CancTypeClassRunner:
         )
         return list(splitter.split(np.zeros(labels.shape[0]), labels))
 
+    def _cv_manifest_source_rows(
+        self,
+        adata: ad.AnnData,
+        labels: np.ndarray,
+        groups: np.ndarray | None,
+    ) -> list[dict[str, str]]:
+        if adata.n_obs != len(labels):
+            raise ValueError(
+                f"CV labels contain {len(labels)} rows, but AnnData contains {adata.n_obs}."
+            )
+
+        if "sample_id" in adata.obs:
+            sample_ids = adata.obs["sample_id"].astype(str).to_numpy()
+        else:
+            sample_ids = adata.obs_names.astype(str).to_numpy()
+        if len(np.unique(sample_ids)) != len(sample_ids):
+            duplicates = sorted(
+                pd.Series(sample_ids)[pd.Series(sample_ids).duplicated(keep=False)]
+                .unique()
+                .tolist()
+            )
+            raise ValueError(
+                "CV fold manifests require unique sample IDs. Duplicate IDs include: "
+                f"{duplicates[:10]}"
+            )
+
+        patient_ids = (
+            adata.obs["patient_id"].astype(str).to_numpy()
+            if "patient_id" in adata.obs
+            else np.asarray([""] * adata.n_obs)
+        )
+        group_ids = (
+            np.asarray(groups).astype(str)
+            if groups is not None
+            else np.asarray([""] * adata.n_obs)
+        )
+        if group_ids.shape[0] != adata.n_obs:
+            raise ValueError(
+                f"CV groups contain {group_ids.shape[0]} rows, but AnnData contains {adata.n_obs}."
+            )
+
+        return [
+            {
+                "sample_id": str(sample_id),
+                "patient_id": str(patient_id),
+                "label": str(label),
+                "group_id": str(group_id),
+            }
+            for sample_id, patient_id, label, group_id in zip(
+                sample_ids,
+                patient_ids,
+                np.asarray(labels).astype(str),
+                group_ids,
+            )
+        ]
+
+    def _resolve_cv_fold_manifest_path(
+        self,
+        source_rows: list[dict[str, str]],
+    ) -> Path | None:
+        configured = getattr(self.task_cfg, "cv_fold_manifest_path", None)
+        if configured is None or not str(configured).strip():
+            return None
+
+        configured_str = str(configured).strip()
+        if configured_str.lower() != "auto":
+            return Path(hydra.utils.to_absolute_path(configured_str))
+
+        data_path_cfg = getattr(self.task_cfg, "tcga_data_dir", None)
+        if not data_path_cfg:
+            data_path_cfg = getattr(self.task_cfg, "disignatlas_data_path", None)
+        if not data_path_cfg:
+            raise ValueError(
+                f"cv_fold_manifest_path=auto requires a canonical data path for "
+                f"finetune.{self.config_node}."
+            )
+        data_path = Path(hydra.utils.to_absolute_path(str(data_path_cfg)))
+        signature_payload = {
+            "task": self.task_name,
+            "config_node": self.config_node,
+            "cohorts": [str(value) for value in getattr(self.task_cfg, "cohorts", [])],
+            "merge_gbm_lgg": bool(getattr(self.task_cfg, "merge_gbm_lgg", True)),
+            "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+            "random_seed": int(getattr(self.task_cfg, "random_seed", 42)),
+            "samples": source_rows,
+        }
+        source_fingerprint = hashlib.sha256(
+            json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self._cv_source_fingerprint = source_fingerprint
+        return data_path.with_name(
+            f"{data_path.stem}_{self.task_name}_{source_fingerprint[:16]}_cv_folds.csv"
+        )
+
+    @staticmethod
+    def _fold_assignments_from_splits(
+        n_samples: int,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        assignments = np.full(n_samples, -1, dtype=np.int64)
+        all_indices = np.arange(n_samples, dtype=np.int64)
+        for fold, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_idx = np.asarray(train_idx, dtype=np.int64)
+            test_idx = np.asarray(test_idx, dtype=np.int64)
+            if np.intersect1d(train_idx, test_idx).size:
+                raise ValueError(f"CV fold {fold} contains overlapping train and test samples.")
+            if not np.array_equal(
+                np.sort(np.concatenate((train_idx, test_idx))),
+                all_indices,
+            ):
+                raise ValueError(f"CV fold {fold} does not partition every sample exactly once.")
+            if np.any(assignments[test_idx] != -1):
+                raise ValueError("A sample appears in the test partition of multiple CV folds.")
+            assignments[test_idx] = fold
+        if np.any(assignments < 1):
+            raise ValueError("Every sample must appear in exactly one CV test fold.")
+        return assignments
+
+    def _load_cv_fold_manifest(
+        self,
+        manifest_path: Path,
+        source_rows: list[dict[str, str]],
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        required_fields = {"sample_id", "patient_id", "label", "group_id", "fold"}
+        observed_fields = set(rows[0]) if rows else set()
+        if not required_fields.issubset(observed_fields):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} is missing columns "
+                f"{sorted(required_fields - observed_fields)}."
+            )
+        if len(rows) != len(source_rows):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} contains {len(rows)} samples; "
+                f"expected {len(source_rows)}."
+            )
+
+        assignments = np.empty(len(rows), dtype=np.int64)
+        for index, (observed, expected) in enumerate(zip(rows, source_rows)):
+            observed_source = {key: observed[key] for key in expected}
+            if observed_source != expected:
+                raise ValueError(
+                    f"CV fold manifest {manifest_path} differs from canonical sample row "
+                    f"{index}: expected {expected}, observed {observed_source}."
+                )
+            try:
+                assignments[index] = int(observed["fold"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"CV fold manifest {manifest_path} has an invalid fold at row {index}."
+                ) from exc
+
+        n_folds = int(getattr(self.task_cfg, "cv_folds", 5))
+        if set(assignments.tolist()) != set(range(1, n_folds + 1)):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} must contain folds 1..{n_folds}; "
+                f"found {sorted(set(assignments.tolist()))}."
+            )
+        indices = np.arange(len(rows), dtype=np.int64)
+        return [
+            (indices[assignments != fold], indices[assignments == fold])
+            for fold in range(1, n_folds + 1)
+        ]
+
+    def _build_or_load_cv_splits(
+        self,
+        adata: ad.AnnData,
+        labels: np.ndarray,
+        groups: np.ndarray | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        source_rows = self._cv_manifest_source_rows(adata, labels, groups)
+        manifest_path = self._resolve_cv_fold_manifest_path(source_rows)
+        if manifest_path is None:
+            return self._build_cv_splits(labels, groups)
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            if manifest_path.exists():
+                splits = self._load_cv_fold_manifest(manifest_path, source_rows)
+            else:
+                splits = self._build_cv_splits(labels, groups)
+                assignments = self._fold_assignments_from_splits(adata.n_obs, splits)
+                temporary_path = manifest_path.with_name(
+                    f"{manifest_path.name}.tmp.{os.getpid()}.{getattr(self, 'rank', 0)}"
+                )
+                try:
+                    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=["sample_id", "patient_id", "label", "group_id", "fold"],
+                        )
+                        writer.writeheader()
+                        for row, fold in zip(source_rows, assignments):
+                            writer.writerow({**row, "fold": int(fold)})
+                    os.replace(temporary_path, manifest_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        assignments = self._fold_assignments_from_splits(adata.n_obs, splits)
+        if groups is not None:
+            groups_array = np.asarray(groups).astype(str)
+            split_groups = [
+                group
+                for group in np.unique(groups_array)
+                if np.unique(assignments[groups_array == group]).size != 1
+            ]
+            if split_groups:
+                raise ValueError(
+                    "CV fold manifest splits patient groups across test folds. "
+                    f"Affected groups include: {split_groups[:10]}"
+                )
+        fold_fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{row['sample_id']}\t{row['label']}\t{int(fold)}"
+                for row, fold in zip(source_rows, assignments)
+            ).encode("utf-8")
+        ).hexdigest()
+        self._cv_fold_manifest_path = manifest_path
+        self._cv_fold_fingerprint = fold_fingerprint
+        log.info(
+            "Using shared CV fold manifest %s | fingerprint=%s",
+            manifest_path,
+            fold_fingerprint,
+        )
+        return splits
+
     def _build_loaders(self, train_adata: ad.AnnData, test_adata: ad.AnnData) -> None:
         if self.label_dict is None:
             self.label_dict = np.unique(np.asarray(train_adata.obs["cancer_type"]).astype(str))
@@ -954,6 +1321,16 @@ class CancTypeClassRunner:
             return state_dict
         return {key.removeprefix("module."): value for key, value in state_dict.items()}
 
+    def _validate_backbone_checkpoint(self, checkpoint: dict, checkpoint_path: str) -> None:
+        validate_backbone_checkpoint(
+            checkpoint,
+            checkpoint_path,
+            gene_num=int(self.model_cfg.gene_num),
+            selected_gene_count=self.selected_gene_count,
+            max_seq_len=self.max_seq_len,
+            bin_num=int(self.model_cfg.bin_num),
+        )
+
     def _build_model(self, checkpoint_path: str) -> None:
         finetune_mode = self._finetune_mode()
         valid_modes = {"head_only", "full_ft", "adapters"}
@@ -976,6 +1353,7 @@ class CancTypeClassRunner:
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
+            self._validate_backbone_checkpoint(checkpoint, resolved_path)
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
             backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
@@ -1107,15 +1485,22 @@ class CancTypeClassRunner:
             else min_lr / max(head_learning_rate, 1e-12)
         )
 
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        epochs = int(getattr(self.task_cfg, "epochs", 20))
+        warmup_epochs = int(getattr(self.task_cfg, "warmup_epochs", 2))
+
         self.optimizer = Adam(param_groups)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 15)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 2)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 0.9)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
         )
         loss_weights = (
             None
@@ -1131,6 +1516,14 @@ class CancTypeClassRunner:
                 for idx, (group, max_lr) in enumerate(zip(param_groups, max_lrs))
             ]
             log.info("Optimizer parameter groups: %s", "; ".join(group_summaries))
+            log.info(
+                "Update-based LR schedule: updates_per_epoch=%d | total_updates=%d | "
+                "warmup_epochs=%d | warmup_updates=%d",
+                updates_per_epoch,
+                self.scheduler.total_updates,
+                warmup_epochs,
+                self.scheduler.warmup_updates,
+            )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
         finetune_mode = self._finetune_mode()
@@ -1143,8 +1536,15 @@ class CancTypeClassRunner:
         ):
             return
 
+        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        add_optimizer_parameter_group(
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            parameters=raw_model.backbone.parameters(),
+            max_lr=float(self.task_cfg.backbone_learning_rate),
+            name="backbone",
+        )
         self.backbone_optimizer_enabled = True
-        self._build_optimization()
         if self.is_master:
             log.info(
                 "Finished %d burn-in epochs; enabled backbone optimization for full fine-tuning.",
@@ -1157,6 +1557,93 @@ class CancTypeClassRunner:
             for group in self.optimizer.param_groups
             for param in group["params"]
         ]
+
+    @staticmethod
+    def _is_accumulation_boundary(
+        step_idx: int,
+        total_steps: int,
+        grad_acc_steps: int,
+    ) -> bool:
+        return step_idx % grad_acc_steps == 0 or step_idx == total_steps
+
+    def _mean_loss_normalizer(self, labels: torch.Tensor) -> float:
+        if not isinstance(self.loss_fn, nn.CrossEntropyLoss):
+            raise TypeError("Gradient accumulation expects CrossEntropyLoss.")
+
+        valid_labels = labels[labels != self.loss_fn.ignore_index]
+        if self.loss_fn.weight is None:
+            normalizer = float(valid_labels.numel())
+        else:
+            normalizer = float(self.loss_fn.weight[valid_labels].sum().detach().item())
+        if not math.isfinite(normalizer) or normalizer <= 0.0:
+            raise ValueError(f"Loss normalizer must be positive and finite, got {normalizer}.")
+        return normalizer
+
+    def _per_sample_loss_components(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(self.loss_fn, nn.CrossEntropyLoss):
+            raise TypeError("Evaluation expects CrossEntropyLoss.")
+
+        valid = labels != self.loss_fn.ignore_index
+        valid_labels = labels[valid]
+        losses = nn.functional.cross_entropy(
+            logits,
+            labels,
+            weight=self.loss_fn.weight,
+            ignore_index=self.loss_fn.ignore_index,
+            reduction="none",
+        )[valid]
+        if self.loss_fn.weight is None:
+            normalizers = torch.ones_like(losses)
+        else:
+            normalizers = self.loss_fn.weight[valid_labels]
+        return losses, normalizers
+
+    def _normalize_accumulated_gradients(self, local_normalizer: float) -> None:
+        normalizer = torch.tensor(
+            local_normalizer,
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.is_distributed:
+            dist.all_reduce(normalizer, op=dist.ReduceOp.SUM)
+            # DDP has already averaged gradients across ranks. Divide by the
+            # corresponding mean normalizer to recover the global mean loss.
+            normalizer /= self.world_size
+
+        divisor = float(normalizer.item())
+        if not math.isfinite(divisor) or divisor <= 0.0:
+            raise ValueError(
+                f"Accumulated loss normalizer must be positive and finite, got {divisor}."
+            )
+        for parameter in self._optimizer_parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(divisor)
+
+    def _training_epoch_metrics(
+        self,
+        loss_numerator: float,
+        loss_normalizer: float,
+        correct: int,
+        sample_count: int,
+    ) -> dict[str, float]:
+        totals = torch.tensor(
+            [loss_numerator, loss_normalizer, correct, sample_count],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.is_distributed:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss_numerator, total_loss_normalizer, total_correct, total_samples = (
+            totals.tolist()
+        )
+        return {
+            "loss": total_loss_numerator / total_loss_normalizer,
+            "accuracy": 100.0 * total_correct / total_samples,
+        }
 
     def _move_batch_to_device(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
@@ -1173,52 +1660,67 @@ class CancTypeClassRunner:
             self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
-        self.model.train()
+        _set_finetune_training_mode(self.model, self._finetune_mode())
         self.model.zero_grad(set_to_none=True)
 
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
-        running_loss = 0.0
-        running_acc = 0.0
+        running_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        running_correct = 0
+        running_samples = 0
+        accumulated_loss_normalizer = 0.0
+        total_steps = len(self.train_loader)
 
         for step_idx, (data, labels) in enumerate(self.train_loader, start=1):
             data = self._move_batch_to_device(data)
             labels = labels.to(self.device, non_blocking=True)
 
+            should_step = self._is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
             use_no_sync = (
                 self.is_distributed
                 and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
+                and not should_step
             )
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
 
             with sync_context:
                 logits = self.model(data)
                 loss = self.loss_fn(logits, labels)
-                (loss / grad_acc_steps).backward()
+                loss_normalizer = self._mean_loss_normalizer(labels)
+                (loss * loss_normalizer).backward()
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
+            accumulated_loss_normalizer += loss_normalizer
+
+            if should_step:
+                self._normalize_accumulated_gradients(accumulated_loss_normalizer)
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
+                self.scheduler.step()
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
+                accumulated_loss_normalizer = 0.0
 
-            running_loss += loss.item()
+            running_loss_numerator += loss.item() * loss_normalizer
+            running_loss_normalizer += loss_normalizer
             predictions = logits.argmax(dim=-1)
-            running_acc += (predictions == labels).float().mean().item()
+            running_correct += int((predictions == labels).sum().item())
+            running_samples += int(labels.numel())
 
-        epoch_loss = running_loss / len(self.train_loader)
-        epoch_acc = 100.0 * running_acc / len(self.train_loader)
-
-        if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.device, 0, self.world_size)
-            epoch_acc = get_reduced(epoch_acc, self.device, 0, self.world_size)
-
-        self.scheduler.step()
-        return {"loss": epoch_loss, "accuracy": epoch_acc}
+        return self._training_epoch_metrics(
+            running_loss_numerator,
+            running_loss_normalizer,
+            running_correct,
+            running_samples,
+        )
 
     def _evaluate(self) -> dict:
         self.model.eval()
-        running_loss = 0.0
+        loss_numerators = []
+        loss_normalizers = []
         predictions = []
         truths = []
 
@@ -1230,15 +1732,30 @@ class CancTypeClassRunner:
                 data = self._move_batch_to_device(data)
                 labels = labels.to(self.device, non_blocking=True)
                 logits = self.model(data)
-                loss = self.loss_fn(logits, labels)
-                running_loss += loss.item()
+                batch_loss_numerators, batch_loss_normalizers = (
+                    self._per_sample_loss_components(logits, labels)
+                )
+                loss_numerators.append(batch_loss_numerators)
+                loss_normalizers.append(batch_loss_normalizers)
                 predictions.append(logits.argmax(dim=-1))
                 truths.append(labels)
 
+        loss_numerators = torch.cat(loss_numerators, dim=0)
+        loss_normalizers = torch.cat(loss_normalizers, dim=0)
         predictions = torch.cat(predictions, dim=0)
         truths = torch.cat(truths, dim=0)
 
         if self.is_distributed:
+            loss_numerators = distributed_concat(
+                loss_numerators,
+                self.test_dataset_size,
+                self.world_size,
+            )
+            loss_normalizers = distributed_concat(
+                loss_normalizers,
+                self.test_dataset_size,
+                self.world_size,
+            )
             predictions = distributed_concat(predictions, self.test_dataset_size, self.world_size)
             truths = distributed_concat(truths, self.test_dataset_size, self.world_size)
 
@@ -1251,12 +1768,12 @@ class CancTypeClassRunner:
             zero_division=0,
         )
 
-        test_loss = running_loss / len(self.test_loader)
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.device, 0, self.world_size)
+        test_loss = float(
+            (loss_numerators.sum() / loss_normalizers.sum()).detach().cpu().item()
+        )
 
         return {
-            "loss": float(test_loss),
+            "loss": test_loss,
             "accuracy": float(accuracy_score(truths_np, predictions_np)),
             "f1_macro": float(
                 f1_score(
@@ -1453,7 +1970,7 @@ class CancTypeClassRunner:
         try:
             self._setup_runtime()
             adata, labels, groups = self._prepare_cv_data()
-            splits = self._build_cv_splits(labels, groups)
+            splits = self._build_or_load_cv_splits(adata, labels, groups)
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
             if self.is_master:
@@ -1471,6 +1988,7 @@ class CancTypeClassRunner:
                 fold_rows: list[dict[str, object]] = []
                 prediction_rows: list[dict[str, object]] = []
                 confusion_matrices: list[np.ndarray] = []
+                curve_rows: list[dict[str, object]] = []
                 for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
@@ -1494,20 +2012,63 @@ class CancTypeClassRunner:
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan"), "accuracy": float("nan")}
+                    last_validation_metrics: dict[str, object] | None = None
                     for epoch in range(1, epochs + 1):
                         last_train_metrics = self._train_one_epoch(epoch)
+                        last_validation_metrics = self._evaluate()
                         if self.is_master:
+                            curve_rows.append(
+                                {
+                                    "model": model_key,
+                                    "fold": fold_idx,
+                                    "epoch": epoch,
+                                    "finetune_mode": self._finetune_mode(),
+                                    "train_loss": last_train_metrics["loss"],
+                                    "train_accuracy": last_train_metrics["accuracy"],
+                                    "validation_loss": float(
+                                        last_validation_metrics["loss"]
+                                    ),
+                                    "validation_accuracy": 100.0
+                                    * float(last_validation_metrics["accuracy"]),
+                                    "validation_f1_macro": float(
+                                        last_validation_metrics["f1_macro"]
+                                    ),
+                                    "validation_f1_weighted": float(
+                                        last_validation_metrics["f1_weighted"]
+                                    ),
+                                    "optimizer_updates": self.scheduler.completed_updates,
+                                    "warmup_updates": self.scheduler.warmup_updates,
+                                    "total_updates": self.scheduler.total_updates,
+                                    "learning_rates": ";".join(
+                                        f"{float(group['lr']):.6g}"
+                                        for group in self.optimizer.param_groups
+                                    ),
+                                }
+                            )
+                            self._write_csv(
+                                self._task_output_dir()
+                                / f"{self._output_prefix()}_{model_key}_training_curves.csv",
+                                curve_rows,
+                            )
                             log.info(
-                                "Model %s | Fold %d/%d | Epoch %d | Training Loss: %.6f | Accuracy: %.4f%%",
+                                "Model %s | Fold %d/%d | Epoch %d | "
+                                "Training Loss: %.6f | Accuracy: %.4f%% | "
+                                "Validation Loss: %.6f | Accuracy: %.4f%%",
                                 model_key,
                                 fold_idx,
                                 len(splits),
                                 epoch,
                                 last_train_metrics["loss"],
                                 last_train_metrics["accuracy"],
+                                last_validation_metrics["loss"],
+                                100.0 * float(last_validation_metrics["accuracy"]),
                             )
 
-                    test_metrics = self._evaluate()
+                    test_metrics = (
+                        last_validation_metrics
+                        if last_validation_metrics is not None
+                        else self._evaluate()
+                    )
                     if self.is_master:
                         fold_rows.append(
                             self._flatten_fold_metrics(
@@ -1547,6 +2108,7 @@ class CancTypeClassRunner:
                 combined_dir = self._task_output_dir()
                 output_path = combined_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {
                     "results_path": str(output_path),
                     "results": aggregate_rows,

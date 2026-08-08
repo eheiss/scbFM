@@ -6,6 +6,7 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
+import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from sklearn.model_selection import GroupKFold, StratifiedKFold
@@ -19,10 +20,12 @@ from finetune.surv_pred_survboard.runner import (
     CHECKPOINT_MODEL_KEYS,
     RANDOM_INIT_MODEL_KEY,
     SurvPredSurvBoardRunner,
+    cox_partial_log_likelihood,
     harrell_c_index,
     ipcw_weighted_c_index,
 )
 from preprocess import reindex_adata_genes, validate_token_matrix
+from run_provenance import complete_run_metadata
 
 log = logging.getLogger(__name__)
 
@@ -271,17 +274,37 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan")}
+                    last_test_lh: np.ndarray | None = None
                     for epoch in range(1, epochs + 1):
                         last_train_metrics = self._train_one_epoch(epoch)
+                        last_test_lh = self._predict_log_hazard(
+                            self.test_loader,
+                            len(test_ix),
+                        )
                         if self.is_master:
+                            validation_loss = float(
+                                cox_partial_log_likelihood(
+                                    torch.as_tensor(last_test_lh),
+                                    torch.as_tensor(times[test_ix]),
+                                    torch.as_tensor(events[test_ix]),
+                                ).item()
+                            )
+                            validation_c_index = harrell_c_index(
+                                last_test_lh,
+                                times[test_ix],
+                                events[test_ix],
+                            )
                             log.info(
-                                "Model %s | Fold %d/%d | Epoch %d/%d | Loss: %.6f",
+                                "Model %s | Fold %d/%d | Epoch %d/%d | "
+                                "Loss: %.6f | Validation Loss: %.6f | C-index: %.4f",
                                 model_key,
                                 split_idx,
                                 len(splits),
                                 epoch,
                                 epochs,
                                 last_train_metrics["loss"],
+                                validation_loss,
+                                validation_c_index,
                             )
                             curves_rows.append(
                                 {
@@ -289,10 +312,25 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
                                     "split": split_idx,
                                     "epoch": epoch,
                                     "train_loss": last_train_metrics["loss"],
+                                    "validation_loss": validation_loss,
+                                    "validation_c_index": validation_c_index,
+                                    "learning_rates": ";".join(
+                                        f"{float(group['lr']):.6g}"
+                                        for group in self.optimizer.param_groups
+                                    ),
                                 }
                             )
+                            self._write_csv(
+                                self._task_output_dir()
+                                / f"{self._output_prefix()}_{model_key}_curves.csv",
+                                curves_rows,
+                            )
 
-                    test_lh = self._predict_log_hazard(self.test_loader, len(test_ix))
+                    test_lh = (
+                        last_test_lh
+                        if last_test_lh is not None
+                        else self._predict_log_hazard(self.test_loader, len(test_ix))
+                    )
 
                     if self.is_master:
                         risk = np.asarray(test_lh, dtype=float)
@@ -349,6 +387,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
                 out_dir = self._task_output_dir()
                 output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {"results_path": str(output_path), "results": aggregate_rows}
             return {}
         finally:

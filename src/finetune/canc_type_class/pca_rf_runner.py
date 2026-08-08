@@ -58,28 +58,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
         return f"{self.task_name}_{self._finetune_mode()}"
 
     def _save_run_metadata(self, checkpoint_paths: dict[str, str] | None = None) -> None:
-        if not self.is_master:
-            return
-        out_dir = self._task_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self._output_prefix()
-        (out_dir / f"{prefix}_config.yaml").write_text(
-            OmegaConf.to_yaml(self.cfg, resolve=True),
-            encoding="utf-8",
-        )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
-            {
-                "task": f"finetune.{self.task_name}_pca_rf",
-                "baseline": "backbone_embedding_pca_random_forest",
-                "variant": self._finetune_mode(),
-                "pca_components": int(getattr(self.task_cfg, "pca_rf_components", 256)),
-                "rf_n_estimators": int(getattr(self.task_cfg, "pca_rf_n_estimators", 500)),
-                "checkpoint_paths": checkpoint_paths or {},
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-            },
-        )
+        super()._save_run_metadata(checkpoint_paths or {})
 
     def _get_checkpoint_paths(self) -> dict[str, str]:
         paths_cfg = getattr(self.task_cfg, "pretrained_model_paths", None)
@@ -119,6 +98,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
+            self._validate_backbone_checkpoint(checkpoint, resolved_path)
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
             backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
@@ -257,7 +237,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
                 raise ValueError("Backbone embedding PCA+RF baseline should be launched with one process.")
 
             adata, labels, groups = self._prepare_cv_data()
-            splits = self._build_cv_splits(labels, groups)
+            splits = self._build_or_load_cv_splits(adata, labels, groups)
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
 
@@ -338,6 +318,9 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
             out_dir = self._task_output_dir()
             output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
             self._write_csv(output_path, aggregate_rows)
+            from run_provenance import complete_run_metadata
+
+            complete_run_metadata(self._run_metadata_path, output_path)
             return {"results_path": str(output_path), "results": aggregate_rows}
         finally:
             if self.is_distributed and dist.is_initialized():

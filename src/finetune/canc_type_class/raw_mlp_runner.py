@@ -27,12 +27,11 @@ from torch.utils.data.distributed import DistributedSampler
 from finetune.canc_type_class.runner import (
     ROOT,
     CancTypeClassRunner,
-    GroupedCosineAnnealingWarmupRestarts,
+    GroupedCosineWarmupUpdateScheduler,
 )
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
-    get_reduced,
     seed_all,
 )
 
@@ -159,25 +158,7 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
         return f"{self.task_name}_{self._finetune_mode()}"
 
     def _save_run_metadata(self, checkpoint_paths: dict[str, str] | None = None) -> None:
-        if not self.is_master:
-            return
-        out_dir = self._task_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self._output_prefix()
-        (out_dir / f"{prefix}_config.yaml").write_text(
-            OmegaConf.to_yaml(self.cfg, resolve=True),
-            encoding="utf-8",
-        )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
-            {
-                "task": "finetune.canc_type_class_raw_mlp",
-                "baseline": "raw_expression_mlp",
-                "variant": self._finetune_mode(),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-            },
-        )
+        super()._save_run_metadata(checkpoint_paths or {})
 
     def _select_feature_indices(self, train_adata: ad.AnnData) -> np.ndarray:
         feature_mode = str(getattr(self.task_cfg, "raw_mlp_feature_mode", "all_genes"))
@@ -385,15 +366,30 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
             if configured_min_lr_ratio is not None
             else min_lr / max(learning_rate, 1e-12)
         )
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        epochs = int(getattr(self.task_cfg, "epochs", 20))
+        warmup_epochs = int(getattr(self.task_cfg, "warmup_epochs", 2))
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 20)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=[learning_rate],
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
         )
+        if self.is_master:
+            log.info(
+                "Raw MLP update-based LR schedule: updates_per_epoch=%d | "
+                "total_updates=%d | warmup_epochs=%d | warmup_updates=%d",
+                updates_per_epoch,
+                self.scheduler.total_updates,
+                warmup_epochs,
+                self.scheduler.warmup_updates,
+            )
         loss_weights = (
             None
             if self.train_class_weights is None
@@ -417,45 +413,62 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
 
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
-        running_loss = 0.0
-        running_acc = 0.0
+        running_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        running_correct = 0
+        running_samples = 0
+        accumulated_loss_normalizer = 0.0
+        total_steps = len(self.train_loader)
 
         for step_idx, (data, labels) in enumerate(self.train_loader, start=1):
             data = self._move_batch_to_device(data)
             labels = labels.to(self.device, non_blocking=True)
 
+            should_step = self._is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
             use_no_sync = (
                 self.is_distributed
                 and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
+                and not should_step
             )
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
 
             with sync_context:
                 logits = self.model(data)
                 loss = self.loss_fn(logits, labels)
-                (loss / grad_acc_steps).backward()
+                loss_normalizer = self._mean_loss_normalizer(labels)
+                (loss * loss_normalizer).backward()
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
+            accumulated_loss_normalizer += loss_normalizer
+
+            if should_step:
+                self._normalize_accumulated_gradients(accumulated_loss_normalizer)
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
+                self.scheduler.step()
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
+                accumulated_loss_normalizer = 0.0
 
-            running_loss += loss.item()
+            running_loss_numerator += loss.item() * loss_normalizer
+            running_loss_normalizer += loss_normalizer
             predictions = logits.argmax(dim=-1)
-            running_acc += (predictions == labels).float().mean().item()
+            running_correct += int((predictions == labels).sum().item())
+            running_samples += int(labels.numel())
 
-        epoch_loss = running_loss / len(self.train_loader)
-        epoch_acc = 100.0 * running_acc / len(self.train_loader)
-        if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
-            epoch_acc = get_reduced(epoch_acc, self.local_rank, 0, self.world_size)
-        self.scheduler.step()
-        return {"loss": epoch_loss, "accuracy": epoch_acc}
+        return self._training_epoch_metrics(
+            running_loss_numerator,
+            running_loss_normalizer,
+            running_correct,
+            running_samples,
+        )
 
     def _evaluate(self) -> dict:
         self.model.eval()
-        running_loss = 0.0
+        loss_numerators = []
+        loss_normalizers = []
         predictions = []
         truths = []
 
@@ -467,14 +480,29 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
                 data = self._move_batch_to_device(data)
                 labels = labels.to(self.device, non_blocking=True)
                 logits = self.model(data)
-                loss = self.loss_fn(logits, labels)
-                running_loss += loss.item()
+                batch_loss_numerators, batch_loss_normalizers = (
+                    self._per_sample_loss_components(logits, labels)
+                )
+                loss_numerators.append(batch_loss_numerators)
+                loss_normalizers.append(batch_loss_normalizers)
                 predictions.append(logits.argmax(dim=-1))
                 truths.append(labels)
 
+        loss_numerators = torch.cat(loss_numerators, dim=0)
+        loss_normalizers = torch.cat(loss_normalizers, dim=0)
         predictions = torch.cat(predictions, dim=0)
         truths = torch.cat(truths, dim=0)
         if self.is_distributed:
+            loss_numerators = distributed_concat(
+                loss_numerators,
+                self.test_dataset_size,
+                self.world_size,
+            )
+            loss_normalizers = distributed_concat(
+                loss_normalizers,
+                self.test_dataset_size,
+                self.world_size,
+            )
             predictions = distributed_concat(predictions, self.test_dataset_size, self.world_size)
             truths = distributed_concat(truths, self.test_dataset_size, self.world_size)
 
@@ -487,12 +515,12 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
             zero_division=0,
         )
 
-        test_loss = running_loss / len(self.test_loader)
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.local_rank, 0, self.world_size)
+        test_loss = float(
+            (loss_numerators.sum() / loss_normalizers.sum()).detach().cpu().item()
+        )
 
         return {
-            "loss": float(test_loss),
+            "loss": test_loss,
             "accuracy": float(accuracy_score(truths_np, predictions_np)),
             "f1_macro": float(
                 f1_score(
@@ -539,13 +567,13 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
         try:
             self._setup_runtime()
             adata, labels, groups = self._prepare_cv_data()
-            splits = self._build_cv_splits(labels, groups)
+            splits = self._build_or_load_cv_splits(adata, labels, groups)
             self._save_run_metadata({})
 
             if self.is_master:
                 log.info(
-                    "Prepared raw MLP TCGA 5-type classification data: "
-                    "samples=%d, genes=%d, folds=%d",
+                    "Prepared raw MLP %s data: samples=%d, genes=%d, folds=%d",
+                    self.task_name,
                     adata.n_obs,
                     adata.n_vars,
                     len(splits),
@@ -556,6 +584,7 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
             fold_rows: list[dict[str, object]] = []
             prediction_rows: list[dict[str, object]] = []
             confusion_matrices: list[np.ndarray] = []
+            curve_rows: list[dict[str, object]] = []
 
             for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                 seed_all(int(getattr(self.task_cfg, "random_seed", 42)) + self.rank + fold_idx)
@@ -575,19 +604,54 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
                 self._build_raw_optimization()
 
                 last_train_metrics = {"loss": float("nan"), "accuracy": float("nan")}
+                last_validation_metrics: dict[str, object] | None = None
                 for epoch in range(1, epochs + 1):
                     last_train_metrics = self._train_one_epoch(epoch)
+                    last_validation_metrics = self._evaluate()
                     if self.is_master:
+                        curve_rows.append(
+                            {
+                                "model": model_key,
+                                "fold": fold_idx,
+                                "epoch": epoch,
+                                "finetune_mode": "raw_mlp",
+                                "train_loss": last_train_metrics["loss"],
+                                "train_accuracy": last_train_metrics["accuracy"],
+                                "validation_loss": last_validation_metrics["loss"],
+                                "validation_accuracy": 100.0
+                                * float(last_validation_metrics["accuracy"]),
+                                "validation_f1_macro": last_validation_metrics["f1_macro"],
+                                "validation_f1_weighted": last_validation_metrics["f1_weighted"],
+                                "optimizer_updates": self.scheduler.completed_updates,
+                                "warmup_updates": self.scheduler.warmup_updates,
+                                "total_updates": self.scheduler.total_updates,
+                                "learning_rates": ";".join(
+                                    f"{float(group['lr']):.6g}"
+                                    for group in self.optimizer.param_groups
+                                ),
+                            }
+                        )
+                        self._write_csv(
+                            self._task_output_dir()
+                            / f"{self._output_prefix()}_{model_key}_training_curves.csv",
+                            curve_rows,
+                        )
                         log.info(
-                            "Raw MLP | Fold %d/%d | Epoch %d | Loss: %.6f | Accuracy: %.4f%%",
+                            "Raw MLP | Fold %d/%d | Epoch %d | Loss: %.6f | "
+                            "Accuracy: %.4f%% | Validation Loss: %.6f",
                             fold_idx,
                             len(splits),
                             epoch,
                             last_train_metrics["loss"],
                             last_train_metrics["accuracy"],
+                            last_validation_metrics["loss"],
                         )
 
-                test_metrics = self._evaluate()
+                test_metrics = (
+                    last_validation_metrics
+                    if last_validation_metrics is not None
+                    else self._evaluate()
+                )
                 if self.is_master:
                     fold_rows.append(
                         self._flatten_fold_metrics(
@@ -627,6 +691,9 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
                     output_path,
                     [aggregate],
                 )
+                from run_provenance import complete_run_metadata
+
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {"results_path": str(output_path), "results": [aggregate]}
             return {}
         finally:

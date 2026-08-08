@@ -28,8 +28,9 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from finetune.canc_type_class.runner import DEFAULT_COHORTS, ROOT, CancTypeClassRunner
-from utils import seed_all
+from finetune.canc_type_class.runner import ROOT, CancTypeClassRunner
+from run_provenance import complete_run_metadata, start_run_metadata
+from utils import SequentialDistributedSampler, distributed_concat, seed_all
 
 log = logging.getLogger(__name__)
 
@@ -69,20 +70,63 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             OmegaConf.to_yaml(self.cfg, resolve=True),
             encoding="utf-8",
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
-                "task": "finetune.canc_type_class_bulkformer_pca_rf",
+                "task": f"finetune.{self.task_name}_bulkformer_pca_rf",
                 "baseline": "bulkformer_147m_embedding_pca_random_forest",
                 "variant": self._finetune_mode(),
-                "bulkformer_checkpoint_path": str(getattr(self.task_cfg, "bulkformer_checkpoint_path", "")),
+                "bulkformer_checkpoint_path": str(
+                    getattr(self.task_cfg, "bulkformer_checkpoint_path", "")
+                ),
                 "bulkformer_repo_dir": str(getattr(self.task_cfg, "bulkformer_repo_dir", "")),
-                "bulkformer_tcga_data_path": str(getattr(self.task_cfg, "bulkformer_tcga_data_path", "")),
+                "canonical_tcga_data_path": str(getattr(self.task_cfg, "tcga_data_dir", "")),
+                "canonical_data_path": str(
+                    getattr(self.task_cfg, "tcga_data_dir", "")
+                    or getattr(self.task_cfg, "disignatlas_data_path", "")
+                ),
+                "bulkformer_tcga_data_path": str(
+                    getattr(self.task_cfg, "bulkformer_tcga_data_path", "")
+                ),
+                "bulkformer_expression_data_path": str(
+                    getattr(self.task_cfg, "bulkformer_expression_data_path", "")
+                    or getattr(self.task_cfg, "bulkformer_tcga_data_path", "")
+                ),
+                "input_gene_count": int(getattr(self, "_bulkformer_input_gene_count", 0)),
+                "matched_gene_count": int(getattr(self, "_bulkformer_matched_gene_count", 0)),
+                "missing_gene_count": int(getattr(self, "_bulkformer_missing_gene_count", 0)),
+                "missing_vocab_fraction": float(
+                    getattr(self, "_bulkformer_missing_fraction", float("nan"))
+                ),
+                "input_expression_min": float(
+                    getattr(self, "_bulkformer_expression_min", float("nan"))
+                ),
+                "input_expression_max": float(
+                    getattr(self, "_bulkformer_expression_max", float("nan"))
+                ),
+                "world_size": int(self.world_size),
+                "per_device_batch_size": int(
+                    getattr(self.task_cfg, "bulkformer_batch_size", 4)
+                ),
+                "global_inference_batch_size": int(
+                    getattr(self.task_cfg, "bulkformer_batch_size", 4)
+                )
+                * int(self.world_size),
                 "pca_components": int(getattr(self.task_cfg, "bulkformer_pca_components", 256)),
                 "rf_n_estimators": int(getattr(self.task_cfg, "bulkformer_rf_n_estimators", 500)),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
             },
+            checkpoint_paths={
+                "bulkformer": str(self._bulkformer_paths()["checkpoint"])
+            },
+            repo_dir=ROOT / "scbFM",
         )
 
     def _required_path(self, attr: str) -> Path:
@@ -96,10 +140,15 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
 
     def _bulkformer_paths(self) -> dict[str, Path]:
         repo_dir = self._required_path("bulkformer_repo_dir")
+        expression_path_attr = (
+            "bulkformer_expression_data_path"
+            if getattr(self.task_cfg, "bulkformer_expression_data_path", None)
+            else "bulkformer_tcga_data_path"
+        )
         paths = {
             "repo_dir": repo_dir,
             "checkpoint": self._required_path("bulkformer_checkpoint_path"),
-            "tcga_data": self._required_path("bulkformer_tcga_data_path"),
+            "tcga_data": self._required_path(expression_path_attr),
             "gene_info": self._required_path("bulkformer_gene_info_path"),
             "graph": self._required_path("bulkformer_graph_path"),
             "graph_weight": self._required_path("bulkformer_graph_weight_path"),
@@ -116,7 +165,25 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             paths["interested_gene_list"] = path
         return paths
 
+    def _load_canonical_tcga(self) -> ad.AnnData:
+        adata = self._load_input_adata()
+        adata.obs["cancer_type"] = adata.obs["cancer_type"].astype(str)
+        if bool(getattr(self.task_cfg, "merge_gbm_lgg", True)):
+            adata.obs["cancer_type"] = adata.obs["cancer_type"].replace(
+                {"GBM": "GBMLGG", "LGG": "GBMLGG"}
+            )
+        sample_ids = adata.obs["sample_id"].astype(str)
+        if sample_ids.duplicated().any():
+            duplicates = sorted(sample_ids[sample_ids.duplicated(keep=False)].unique().tolist())
+            raise ValueError(
+                "Canonical TCGA data must have unique obs['sample_id'] values. "
+                f"Duplicates include: {duplicates[:10]}"
+            )
+        adata.obs_names = sample_ids
+        return adata
+
     def _load_bulkformer_tcga(self, paths: dict[str, Path]) -> ad.AnnData:
+        canonical = self._load_canonical_tcga()
         adata = ad.read_h5ad(paths["tcga_data"])
         required_obs = {"sample_id", "patient_id", "project"}
         missing_obs = sorted(required_obs.difference(adata.obs.columns))
@@ -125,31 +192,75 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
                 f"BulkFormer TCGA AnnData is missing required obs columns: {missing_obs}."
             )
 
-        adata.obs["project"] = adata.obs["project"].astype(str).str.strip().str.upper()
-        cohorts = list(getattr(self.task_cfg, "cohorts", DEFAULT_COHORTS))
-        selected_cancer_types = {str(cohort).upper() for cohort in cohorts}
-        keep_mask = adata.obs["project"].isin(selected_cancer_types).to_numpy()
-        adata = adata[keep_mask].copy()
-        if adata.n_obs == 0:
+        adata.obs["sample_id"] = adata.obs["sample_id"].astype(str)
+        if adata.obs["sample_id"].duplicated().any():
+            duplicates = sorted(
+                adata.obs.loc[
+                    adata.obs["sample_id"].duplicated(keep=False), "sample_id"
+                ].unique().tolist()
+            )
             raise ValueError(
-                f"No BulkFormer TCGA samples matched cohorts {cohorts} in obs['project']."
+                "BulkFormer TCGA data must have unique obs['sample_id'] values. "
+                f"Duplicates include: {duplicates[:10]}"
             )
+        adata.obs_names = adata.obs["sample_id"].to_numpy()
 
-        adata.obs["cancer_type"] = adata.obs["project"].astype(str)
-        if bool(getattr(self.task_cfg, "merge_gbm_lgg", True)):
-            adata.obs["cancer_type"] = adata.obs["cancer_type"].replace(
-                {"GBM": "GBMLGG", "LGG": "GBMLGG"}
+        canonical_ids = canonical.obs["sample_id"].astype(str).tolist()
+        missing_samples = [
+            sample_id for sample_id in canonical_ids if sample_id not in adata.obs_names
+        ]
+        if missing_samples:
+            raise ValueError(
+                f"BulkFormer TCGA data is missing {len(missing_samples)} canonical samples. "
+                f"First missing IDs: {missing_samples[:10]}"
             )
-        adata.obs_names = adata.obs["sample_id"].astype(str)
-        adata.obs_names_make_unique()
+        extra_samples = int(adata.n_obs - len(canonical_ids))
+        adata = adata[canonical_ids].copy()
+
+        for column in ("project", "patient_id"):
+            observed = adata.obs[column].astype(str)
+            expected = canonical.obs[column].astype(str)
+            if column == "project":
+                observed = observed.str.strip().str.upper()
+                expected = expected.str.strip().str.upper()
+            mismatch = observed.to_numpy() != expected.to_numpy()
+            if np.any(mismatch):
+                mismatch_indices = np.flatnonzero(mismatch)[:10]
+                details = [
+                    {
+                        "sample_id": canonical_ids[index],
+                        "canonical": str(expected.iloc[index]),
+                        "bulkformer": str(observed.iloc[index]),
+                    }
+                    for index in mismatch_indices
+                ]
+                raise ValueError(
+                    f"BulkFormer and canonical TCGA metadata disagree for '{column}': {details}"
+                )
+
+        adata.obs = canonical.obs.copy()
+        adata.obs_names = canonical.obs_names.copy()
         adata.var_names_make_unique()
+        log.info(
+            "Aligned BulkFormer TCGA expression to canonical samples: samples=%d, "
+            "raw_extra_samples_dropped=%d",
+            adata.n_obs,
+            max(0, extra_samples),
+        )
         return adata
+
+    @staticmethod
+    def _strip_ensembl_version(values) -> pd.Index:
+        return pd.Index(
+            pd.Series(values, dtype="string").str.replace(r"\.\d+$", "", regex=True)
+        )
 
     @staticmethod
     def _adata_to_gene_frame(adata: ad.AnnData) -> pd.DataFrame:
         var_names = adata.var_names.astype(str)
         if "ensg_id" in adata.var:
             var_names = adata.var["ensg_id"].astype(str).to_numpy()
+        var_names = CancTypeClassBulkFormerPCARFRunner._strip_ensembl_version(var_names)
         x = adata.X
         if sparse.issparse(x):
             x = x.toarray()
@@ -173,7 +284,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
     def _prepare_bulkformer_data(
         self,
         paths: dict[str, Path],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, ad.AnnData]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, ad.AnnData, float]:
         adata = self._load_bulkformer_tcga(paths)
         labels_str = np.asarray(adata.obs["cancer_type"]).astype(str)
         self.label_dict = np.unique(labels_str)
@@ -182,22 +293,69 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
 
         gene_info = pd.read_csv(paths["gene_info"])
         if "ensg_id" not in gene_info.columns:
-            raise ValueError(f"BulkFormer gene info must contain an 'ensg_id' column: {paths['gene_info']}")
-        gene_list = gene_info["ensg_id"].astype(str).tolist()
+            raise ValueError(
+                "BulkFormer gene info must contain an 'ensg_id' column: "
+                f"{paths['gene_info']}"
+            )
+        gene_list = self._strip_ensembl_version(gene_info["ensg_id"].astype(str)).tolist()
+        if len(set(gene_list)) != len(gene_list):
+            raise ValueError(
+                f"BulkFormer gene vocabulary contains duplicate Ensembl IDs after version stripping: "
+                f"{paths['gene_info']}"
+            )
+        expected_gene_count = int(
+            getattr(self.task_cfg, "bulkformer_expected_gene_count", 20010)
+        )
+        if len(gene_list) != expected_gene_count:
+            raise ValueError(
+                f"BulkFormer vocabulary contains {len(gene_list)} genes; "
+                f"expected {expected_gene_count}."
+            )
         expr_df = self._adata_to_gene_frame(adata)
+        expression_values = expr_df.to_numpy(dtype=np.float32, copy=False)
+        if not np.all(np.isfinite(expression_values)):
+            raise ValueError("BulkFormer TCGA expression contains non-finite values.")
+        expression_min = float(np.min(expression_values))
+        expression_max = float(np.max(expression_values))
+        max_expected_expression = float(
+            getattr(self.task_cfg, "bulkformer_max_expected_expression", 30.0)
+        )
+        if expression_min < 0:
+            raise ValueError(
+                "BulkFormer TCGA expression contains negative observed values before "
+                f"missing-gene padding (minimum={expression_min:.6g})."
+            )
+        if expression_max > max_expected_expression:
+            raise ValueError(
+                "BulkFormer expects normalized log-TPM-like input, but the observed maximum "
+                f"is {expression_max:.6g} (configured limit={max_expected_expression:.6g}). "
+                "Check that bulkformer_tcga_data_path does not contain raw counts."
+            )
+        self._bulkformer_expression_min = expression_min
+        self._bulkformer_expression_max = expression_max
         expr_array = self._align_to_bulkformer_genes(expr_df, gene_list)
 
         label_to_idx = {label: idx for idx, label in enumerate(self.label_dict.tolist())}
         labels = np.asarray([label_to_idx[label] for label in labels_str], dtype=np.int64)
 
-        missing_fraction = float(np.mean(~np.isin(gene_list, expr_df.columns.astype(str))))
+        missing_gene_mask = ~np.isin(gene_list, expr_df.columns.astype(str))
+        missing_fraction = float(np.mean(missing_gene_mask))
+        matched_gene_count = int((~missing_gene_mask).sum())
+        missing_gene_count = int(missing_gene_mask.sum())
+        self._bulkformer_input_gene_count = len(gene_list)
+        self._bulkformer_matched_gene_count = matched_gene_count
+        self._bulkformer_missing_gene_count = missing_gene_count
+        self._bulkformer_missing_fraction = missing_fraction
         log.info(
-            "Prepared BulkFormer TCGA data: samples=%d, genes=%d, missing_vocab_fraction=%.4f",
+            "Prepared BulkFormer TCGA data: samples=%d, genes=%d, matched_genes=%d, "
+            "missing_genes=%d, missing_vocab_fraction=%.4f",
             expr_array.shape[0],
             expr_array.shape[1],
+            matched_gene_count,
+            missing_gene_count,
             missing_fraction,
         )
-        return expr_array, labels, groups, adata
+        return expr_array, labels, groups, adata, missing_fraction
 
     def _build_bulkformer_model(self, paths: dict[str, Path]):
         repo_dir = paths["repo_dir"]
@@ -231,7 +389,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             from utils.BulkFormer import BulkFormer
         except ImportError as exc:
             raise ImportError(
-                "BulkFormer requires its repo on PYTHONPATH plus torch-geometric/torch-cluster "
+                "BulkFormer requires performer-pytorch, torch-geometric and torch-sparse "
                 "installed in the container."
             ) from exc
 
@@ -266,21 +424,57 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
         model,
         expr_array: np.ndarray,
         paths: dict[str, Path],
-    ) -> np.ndarray:
+        missing_fraction: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
         batch_size = int(getattr(self.task_cfg, "bulkformer_batch_size", 4))
-        mask_prob = float(getattr(self.task_cfg, "bulkformer_mask_prob", 0.1))
-        aggregate_type = str(getattr(self.task_cfg, "bulkformer_aggregate_type", "mean"))
+        mask_prob = float(missing_fraction)
+        aggregate_type = str(getattr(self.task_cfg, "bulkformer_aggregate_type", "max"))
 
         interested_gene_idx = None
         if "interested_gene_list" in paths:
             interested_gene_idx = torch.load(paths["interested_gene_list"], map_location="cpu")
             if isinstance(interested_gene_idx, torch.Tensor):
-                interested_gene_idx = interested_gene_idx.cpu().numpy().tolist()
+                interested_gene_idx = interested_gene_idx.cpu().numpy()
+            interested_gene_idx = np.asarray(interested_gene_idx).reshape(-1)
+            if interested_gene_idx.dtype == np.bool_:
+                if interested_gene_idx.size != expr_array.shape[1]:
+                    raise ValueError(
+                        "Boolean BulkFormer interested-gene mask must contain one entry per gene."
+                    )
+                interested_gene_idx = np.flatnonzero(interested_gene_idx)
+            else:
+                if not np.issubdtype(interested_gene_idx.dtype, np.integer):
+                    raise ValueError(
+                        "BulkFormer interested-gene list must contain integer indices or booleans."
+                    )
+                interested_gene_idx = interested_gene_idx.astype(np.int64, copy=False)
+            if interested_gene_idx.size == 0:
+                raise ValueError("BulkFormer interested-gene list is empty.")
+            if interested_gene_idx.min() < 0 or interested_gene_idx.max() >= expr_array.shape[1]:
+                raise ValueError(
+                    "BulkFormer interested-gene indices fall outside the 20,010-gene vocabulary."
+                )
+            interested_gene_idx = interested_gene_idx.tolist()
 
+        dataset = TensorDataset(
+            torch.as_tensor(expr_array, dtype=torch.float32),
+            torch.arange(expr_array.shape[0], dtype=torch.long),
+        )
+        sampler = (
+            SequentialDistributedSampler(
+                dataset,
+                batch_size=batch_size,
+                world_size=self.world_size,
+                rank=self.rank,
+            )
+            if self.is_distributed
+            else None
+        )
         loader = DataLoader(
-            TensorDataset(torch.as_tensor(expr_array, dtype=torch.float32)),
+            dataset,
             batch_size=batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=0,
             pin_memory=self.device.type == "cuda",
         )
@@ -295,6 +489,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             "all" if interested_gene_idx is None else len(interested_gene_idx),
         )
         embeddings = []
+        sample_indices = []
         with torch.no_grad():
             autocast_ctx = (
                 torch.amp.autocast("cuda", enabled=True)
@@ -302,7 +497,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
                 else nullcontext()
             )
             with autocast_ctx:
-                for (batch,) in tqdm(loader, total=len(loader), disable=True):
+                for batch, batch_indices in tqdm(loader, total=len(loader), disable=True):
                     batch = batch.to(self.device, non_blocking=True)
                     gene_emb = model(batch, mask_prob=mask_prob, output_expr=False)
                     gene_emb = gene_emb.detach().cpu().numpy()
@@ -326,13 +521,49 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
                             "bulkformer_aggregate_type must be one of: mean, max, median, all."
                         )
                     embeddings.append(sample_emb.astype(np.float32, copy=False))
+                    sample_indices.append(batch_indices.numpy())
         embeddings_array = np.vstack(embeddings)
+        sample_indices_array = np.concatenate(sample_indices).astype(np.int64, copy=False)
         log.info(
             "Extracted BulkFormer embeddings: shape=%s | dtype=%s",
             embeddings_array.shape,
             embeddings_array.dtype,
         )
-        return embeddings_array
+        return embeddings_array, sample_indices_array
+
+    def _gather_bulkformer_embeddings(
+        self,
+        embeddings: np.ndarray,
+        sample_indices: np.ndarray,
+        total_examples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.is_distributed:
+            return embeddings, sample_indices
+
+        embedding_tensor = torch.as_tensor(
+            embeddings,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        index_tensor = torch.as_tensor(
+            sample_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        gathered_embeddings = distributed_concat(
+            embedding_tensor,
+            total_examples,
+            self.world_size,
+        )
+        gathered_indices = distributed_concat(
+            index_tensor,
+            total_examples,
+            self.world_size,
+        )
+        return (
+            gathered_embeddings.cpu().numpy().astype(np.float32, copy=False),
+            gathered_indices.cpu().numpy().astype(np.int64, copy=False),
+        )
 
     def _fit_predict_embeddings(
         self,
@@ -432,11 +663,12 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
     def run(self) -> dict:
         try:
             self._setup_runtime()
-            if self.is_distributed and self.world_size != 1:
-                raise ValueError("BulkFormer PCA+RF baseline should be launched with one process.")
             paths = self._bulkformer_paths()
-            expr_array, labels, groups, adata = self._prepare_bulkformer_data(paths)
-            splits = self._build_cv_splits(np.asarray(adata.obs["cancer_type"]).astype(str), groups)
+            expr_array, labels, groups, adata, missing_fraction = self._prepare_bulkformer_data(
+                paths
+            )
+            labels_str = np.asarray(adata.obs["cancer_type"]).astype(str)
+            splits = self._build_or_load_cv_splits(adata, labels_str, groups)
             self._save_run_metadata()
             log.info(
                 "Prepared BulkFormer PCA+RF CV data: samples=%d, genes=%d, folds=%d",
@@ -447,7 +679,21 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
 
             seed_all(int(getattr(self.task_cfg, "random_seed", 42)))
             model = self._build_bulkformer_model(paths)
-            embeddings = self._extract_bulkformer_embeddings(model, expr_array, paths)
+            embeddings, sample_indices = self._extract_bulkformer_embeddings(
+                model,
+                expr_array,
+                paths,
+                missing_fraction,
+            )
+            embeddings, sample_indices = self._gather_bulkformer_embeddings(
+                embeddings,
+                sample_indices,
+                expr_array.shape[0],
+            )
+            if not np.array_equal(sample_indices, np.arange(expr_array.shape[0])):
+                raise RuntimeError(
+                    "Distributed BulkFormer extraction changed canonical sample order."
+                )
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -457,6 +703,11 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             fold_rows: list[dict[str, object]] = []
             prediction_rows: list[dict[str, object]] = []
             confusion_matrices: list[np.ndarray] = []
+
+            out_dir = self._task_output_dir()
+            output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
+            if not self.is_master:
+                return {"results_path": str(output_path), "results": []}
 
             for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                 log.info(
@@ -510,9 +761,8 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
                 prediction_rows,
                 confusion_matrices,
             )
-            out_dir = self._task_output_dir()
-            output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
             self._write_csv(output_path, [aggregate])
+            complete_run_metadata(self._run_metadata_path, output_path)
             log.info("BulkFormer PCA+RF results written to %s", output_path)
             return {"results_path": str(output_path), "results": [aggregate]}
         finally:

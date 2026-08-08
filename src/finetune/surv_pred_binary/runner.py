@@ -26,7 +26,7 @@ from finetune.canc_type_class.runner import (
     RANDOM_INIT_MODEL_KEY as BASE_RANDOM_INIT_MODEL_KEY,
     CancTypeClassRunner,
 )
-from utils import distributed_concat, get_reduced
+from utils import distributed_concat
 
 log = logging.getLogger(__name__)
 
@@ -231,7 +231,8 @@ class SurvPredBinaryRunner:
 
     def _evaluate(self) -> dict:
         self.model.eval()
-        running_loss = 0.0
+        loss_numerators = []
+        loss_normalizers = []
         predictions = []
         truths = []
         probabilities = []
@@ -246,18 +247,33 @@ class SurvPredBinaryRunner:
                 data = self._move_batch_to_device(data)
                 labels = labels.to(self.device, non_blocking=True)
                 logits = self.model(data)
-                loss = self.loss_fn(logits, labels)
-                running_loss += loss.item()
+                batch_loss_numerators, batch_loss_normalizers = (
+                    self._per_sample_loss_components(logits, labels)
+                )
+                loss_numerators.append(batch_loss_numerators)
+                loss_normalizers.append(batch_loss_normalizers)
                 probs = torch.softmax(logits, dim=-1)[:, positive_idx]
                 predictions.append(logits.argmax(dim=-1))
                 probabilities.append(probs)
                 truths.append(labels)
 
+        loss_numerators = torch.cat(loss_numerators, dim=0)
+        loss_normalizers = torch.cat(loss_normalizers, dim=0)
         predictions = torch.cat(predictions, dim=0)
         probabilities = torch.cat(probabilities, dim=0)
         truths = torch.cat(truths, dim=0)
 
         if self.is_distributed:
+            loss_numerators = distributed_concat(
+                loss_numerators,
+                self.test_dataset_size,
+                self.world_size,
+            )
+            loss_normalizers = distributed_concat(
+                loss_normalizers,
+                self.test_dataset_size,
+                self.world_size,
+            )
             predictions = distributed_concat(predictions, self.test_dataset_size, self.world_size)
             probabilities = distributed_concat(probabilities, self.test_dataset_size, self.world_size)
             truths = distributed_concat(truths, self.test_dataset_size, self.world_size)
@@ -272,9 +288,9 @@ class SurvPredBinaryRunner:
             zero_division=0,
         )
 
-        test_loss = running_loss / len(self.test_loader)
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.device, 0, self.world_size)
+        test_loss = float(
+            (loss_numerators.sum() / loss_normalizers.sum()).detach().cpu().item()
+        )
 
         try:
             auroc = float(roc_auc_score(truths_np == positive_idx, probabilities_np))
@@ -286,7 +302,7 @@ class SurvPredBinaryRunner:
             auprc = float("nan")
 
         return {
-            "loss": float(test_loss),
+            "loss": test_loss,
             "auroc": auroc,
             "auprc": auprc,
             "accuracy": float(accuracy_score(truths_np, predictions_np)),
@@ -404,10 +420,16 @@ _GENERIC_METHODS_FROM_CANCER_CLASS_RUNNER = (
     "_build_cv_splits",
     "_build_loaders",
     "_strip_module_prefix",
+    "_validate_backbone_checkpoint",
     "_build_model",
     "_build_optimization",
     "_maybe_enable_backbone_optimizer",
     "_optimizer_parameters",
+    "_is_accumulation_boundary",
+    "_mean_loss_normalizer",
+    "_per_sample_loss_components",
+    "_normalize_accumulated_gradients",
+    "_training_epoch_metrics",
     "_move_batch_to_device",
     "_train_one_epoch",
     "_flatten_fold_metrics",
@@ -427,6 +449,7 @@ _STATIC_METHODS_FROM_CANCER_CLASS_RUNNER = {
     "_get_git_commit",
     "_aggregate_numeric_rows",
     "_strip_module_prefix",
+    "_is_accumulation_boundary",
 }
 for _method_name in _GENERIC_METHODS_FROM_CANCER_CLASS_RUNNER:
     _method = getattr(CancTypeClassRunner, _method_name)

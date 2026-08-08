@@ -4,6 +4,9 @@ pretrained_model_paths:
   pretrain_bulk:
   preadapt_sc:
   preadapt_bulk:
+# Optional subset of pretrain_sc, pretrain_bulk, preadapt_sc, preadapt_bulk,
+# and random_init. Null preserves the standard run over all five models.
+model_keys:
 
 # Data paths
 expression_data_path: /cluster/work/boeva/eheiss/datasets/GDSC/gdsc.h5ad
@@ -21,11 +24,13 @@ dataset_col: Dataset Version
 # deterministically for each cell line.
 gene_list_path: ../data/gene_list.txt
 preprocess: true
-# Fold-level HVGs are fitted on training cell lines and reused for all models.
-hvg_flavor: cell_ranger
+# Fold-level gene selection ranks genes by median absolute deviation across
+# distinct training-fold cell lines and reuses the selected genes for evaluation.
+hvg_selection_method: mad
 
 # Finetuning mode
 finetune_mode: head_only       # head_only | adapters | full_ft
+output_suffix: ""
 burn_in_epochs: 3
 adapter_bottleneck_dim: 32
 adapter_dropout: 0.0
@@ -40,6 +45,9 @@ head_bottleneck_dim: 256
 
 # Training
 cv_folds: 5
+# Persist canonical pair-to-fold assignments beside the IC50 table. Every
+# drug-response runner validates and reuses this manifest.
+cv_fold_manifest_path: auto
 epochs: 20
 batch_size: 4
 num_workers: 2
@@ -50,20 +58,98 @@ backbone_learning_rate: 1e-4
 max_grad_norm: 1e6
 random_seed: 42
 
-# Scheduler
-first_cycle_steps: 20
-cycle_mult: 1
+# Linear warm-up is measured in epochs but applied at every optimizer update.
 min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 2
-gamma: 1.0
+warmup_epochs: 2
 
-# Raw-expression MLP baseline. Launched with task=finetune.drug_resp_raw_mlp.
-# The model concatenates raw expression features with the drug feature vector.
-raw_mlp_feature_mode: all_genes  # drug_only | all_genes | hvg1199
+# MLP baselines launched with task=finetune.drug_resp_raw_mlp. The expression
+# variants concatenate raw expression with the fixed drug vector; drug_only
+# excludes expression while retaining the same parameter target and training setup.
+raw_mlp_feature_mode: all_genes  # all_genes | hvg1199 | drug_only
 raw_mlp_variant:
 raw_mlp_target_params: 6560000
 raw_mlp_hidden_dim:
-raw_mlp_hidden_layers: 2
 raw_mlp_standardize: true
 raw_mlp_learning_rate: 1e-4
+
+# Raw-expression PCA + random-forest regression baselines. PCA is fitted on
+# distinct training-fold cell lines; cell components are concatenated with the
+# fixed KPGT drug representation before fitting the regressor.
+raw_pca_rf_feature_mode: all_genes  # all_genes | hvg1199
+raw_pca_rf_variant:
+raw_pca_rf_components: 256
+raw_pca_rf_standardize: true
+raw_pca_rf_whiten: false
+raw_pca_rf_n_estimators: 500
+raw_pca_rf_max_depth:
+raw_pca_rf_min_samples_leaf: 1
+raw_pca_rf_min_samples_split: 2
+raw_pca_rf_max_features: sqrt
+raw_pca_rf_bootstrap: true
+raw_pca_rf_n_jobs: -1
+
+# Frozen scbFM CLS embedding + PCA + random-forest regression.
+pca_rf_variant:
+pca_rf_components: 256
+pca_rf_standardize: true
+pca_rf_whiten: false
+pca_rf_n_estimators: 500
+pca_rf_max_depth:
+pca_rf_min_samples_leaf: 1
+pca_rf_min_samples_split: 2
+pca_rf_max_features: sqrt
+pca_rf_bootstrap: true
+pca_rf_n_jobs: -1
+
+# External BulkFormer-147M baseline. The full GDSC expression matrix is aligned
+# to BulkFormer's 20,010-gene vocabulary and its max-pooled gene representation
+# is combined with the same fixed KPGT drug vectors.
+bulkformer_variant: bulkformer_pca_rf
+bulkformer_repo_dir:
+bulkformer_checkpoint_path:
+bulkformer_expression_data_path:
+bulkformer_gene_info_path:
+bulkformer_graph_path:
+bulkformer_graph_weight_path:
+bulkformer_gene_emb_path:
+bulkformer_interested_gene_list_path:
+bulkformer_expected_gene_count: 20010
+bulkformer_max_expected_expression: 30.0
+bulkformer_batch_size: 4
+bulkformer_aggregate_type: max  # paper-consistent benchmark setting
+bulkformer_pca_components: 256
+bulkformer_pca_standardize: true
+bulkformer_pca_whiten: false
+bulkformer_rf_n_estimators: 500
+bulkformer_rf_max_depth:
+bulkformer_rf_min_samples_leaf: 1
+bulkformer_rf_min_samples_split: 2
+bulkformer_rf_max_features: sqrt
+bulkformer_rf_bootstrap: true
+bulkformer_rf_n_jobs: -1
+
+# External scGPT baseline. The canonical 13,004-gene GDSC matrix is mapped to
+# the scGPT vocabulary before training-fold selection of 1,199 genes.
+scgpt_variant: scgpt_pca_rf
+scgpt_model_key: scgpt
+scgpt_repo_dir:
+scgpt_model_dir:
+scgpt_args_filename: args.json
+scgpt_vocab_filename: vocab.json
+scgpt_checkpoint_filename: last_model.pt
+scgpt_gene_info_path:
+scgpt_expected_source_gene_count: 13004
+scgpt_batch_size: 4
+scgpt_max_seq_len: 1200
+scgpt_use_fast_transformer: false
+scgpt_pca_components: 256
+scgpt_pca_standardize: true
+scgpt_pca_whiten: false
+scgpt_rf_n_estimators: 500
+scgpt_rf_max_depth:
+scgpt_rf_min_samples_leaf: 1
+scgpt_rf_min_samples_split: 2
+scgpt_rf_max_features: sqrt
+scgpt_rf_bootstrap: true
+scgpt_rf_n_jobs: -1

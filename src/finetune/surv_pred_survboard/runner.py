@@ -27,8 +27,17 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
-from finetune.canc_type_class.runner import _quantile_bin_expression
+from finetune.canc_type_class.runner import (
+    _quantile_bin_expression,
+    _set_finetune_training_mode,
+)
+from finetune.training_correctness import (
+    add_optimizer_parameter_group,
+    is_accumulation_boundary,
+    validate_backbone_checkpoint,
+)
 from preprocess import reindex_adata_genes, validate_token_matrix
+from run_provenance import complete_run_metadata, start_run_metadata
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -297,6 +306,31 @@ def cox_partial_log_likelihood(
     n_events = e.sum().clamp(min=1.0)
     log_cumsum_exp = torch.logcumsumexp(lh, dim=0)
     return -((lh - log_cumsum_exp) * e).sum() / n_events
+
+
+def gather_cox_update_batch(
+    log_hazard: torch.Tensor,
+    time: torch.Tensor,
+    event: torch.Tensor,
+    *,
+    is_distributed: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather one effective Cox batch while preserving hazard gradients."""
+    if not is_distributed:
+        return log_hazard, time, event
+
+    from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+
+    gathered_hazards = torch.cat(differentiable_all_gather(log_hazard.contiguous()))
+    gathered_times = [torch.empty_like(time) for _ in range(dist.get_world_size())]
+    gathered_events = [torch.empty_like(event) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_times, time.contiguous())
+    dist.all_gather(gathered_events, event.contiguous())
+    return (
+        gathered_hazards,
+        torch.cat(gathered_times),
+        torch.cat(gathered_events),
+    )
 
 
 def antolini_concordance(
@@ -723,16 +757,18 @@ class SurvPredSurvBoardRunner:
         (out_dir / f"{prefix}_config.yaml").write_text(
             OmegaConf.to_yaml(self.cfg, resolve=True), encoding="utf-8"
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "cancer": str(getattr(self.task_cfg, "cancer", "")),
                 "project": str(getattr(self.task_cfg, "project", "TCGA")),
-                "git_commit": self._get_git_commit(),
-                "checkpoint_paths": checkpoint_paths,
             },
+            checkpoint_paths=checkpoint_paths,
+            repo_dir=ROOT / "scbFM",
         )
 
     @staticmethod
@@ -1153,6 +1189,14 @@ class SurvPredSurvBoardRunner:
         if checkpoint_path:
             resolved_path = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved_path, map_location="cpu")
+            validate_backbone_checkpoint(
+                checkpoint,
+                resolved_path,
+                gene_num=int(self.model_cfg.gene_num),
+                selected_gene_count=self.selected_gene_count,
+                max_seq_len=self.max_seq_len,
+                bin_num=int(self.model_cfg.bin_num),
+            )
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
             backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved_path)
@@ -1289,8 +1333,15 @@ class SurvPredSurvBoardRunner:
             or epoch <= burn_in
         ):
             return
+        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        add_optimizer_parameter_group(
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            parameters=raw_model.backbone.parameters(),
+            max_lr=float(self.task_cfg.backbone_learning_rate),
+            name="backbone",
+        )
         self.backbone_optimizer_enabled = True
-        self._build_optimization()
         if self.is_master:
             log.info("Finished %d burn-in epochs; enabled backbone optimisation.", burn_in)
 
@@ -1308,13 +1359,17 @@ class SurvPredSurvBoardRunner:
             self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
-        self.model.train()
+        _set_finetune_training_mode(self.model, self._finetune_mode())
         self.model.zero_grad(set_to_none=True)
 
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
-        running_loss = 0.0
-        n_batches = 0
+        running_loss_numerator = 0.0
+        running_event_count = 0.0
+        window_batches: dict[str, list[torch.Tensor]] = {}
+        window_times: list[torch.Tensor] = []
+        window_events: list[torch.Tensor] = []
+        total_steps = len(self.train_loader)
 
         for step_idx, (batch, time, event) in enumerate(self.train_loader, start=1):
             batch = {
@@ -1324,30 +1379,46 @@ class SurvPredSurvBoardRunner:
             time = time.to(self.device, non_blocking=True)
             event = event.to(self.device, non_blocking=True)
 
-            is_update_step = step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader)
-            use_no_sync = (
-                self.is_distributed
-                and isinstance(self.model, DDP)
-                and not is_update_step
+            is_update_step = is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
             )
-            sync_ctx = self.model.no_sync() if use_no_sync else nullcontext()
-
-            with sync_ctx:
-                log_hazard = self.model(batch)
-                loss = cox_partial_log_likelihood(log_hazard, time, event)
-                (loss / grad_acc_steps).backward()
+            for key, value in batch.items():
+                window_batches.setdefault(key, []).append(value)
+            window_times.append(time)
+            window_events.append(event)
 
             if is_update_step:
+                update_batch = {
+                    key: torch.cat(values)
+                    for key, values in window_batches.items()
+                }
+                log_hazard, update_time, update_event = gather_cox_update_batch(
+                    self.model(update_batch),
+                    torch.cat(window_times),
+                    torch.cat(window_events),
+                    is_distributed=self.is_distributed,
+                )
+                loss = cox_partial_log_likelihood(
+                    log_hazard,
+                    update_time,
+                    update_event,
+                )
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
+                event_count = float(update_event.sum().item())
+                running_loss_numerator += float(loss.detach().item()) * event_count
+                running_event_count += event_count
+                window_batches.clear()
+                window_times.clear()
+                window_events.clear()
 
-            running_loss += loss.item()
-            n_batches += 1
-
-        epoch_loss = running_loss / max(n_batches, 1)
-        if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
+        if running_event_count <= 0:
+            raise ValueError("A survival training epoch contained no observed events.")
+        epoch_loss = running_loss_numerator / running_event_count
 
         self.scheduler.step()
         return {"loss": epoch_loss}
@@ -1492,9 +1563,14 @@ class SurvPredSurvBoardRunner:
                 fold_rows: list[dict[str, object]] = []
                 curves_rows: list[dict[str, object]] = []
 
-                for split_pos, (split_idx, train_ix, test_ix) in enumerate(
-                    zip(outer_splits, train_splits, test_splits)
-                ):
+                for split_pos, split_idx in enumerate(outer_splits):
+                    if split_idx < 0 or split_idx >= n_splits:
+                        raise ValueError(
+                            f"outer_splits contains invalid split {split_idx}; "
+                            f"available splits are 0..{n_splits - 1}."
+                        )
+                    train_ix = train_splits[split_idx]
+                    test_ix = test_splits[split_idx]
                     seed_all(
                         int(getattr(self.task_cfg, "random_seed", 42))
                         + self.rank
@@ -1526,13 +1602,33 @@ class SurvPredSurvBoardRunner:
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan")}
+                    last_test_lh: np.ndarray | None = None
                     for epoch in range(1, epochs + 1):
                         last_train_metrics = self._train_one_epoch(epoch)
+                        last_test_lh = self._predict_log_hazard(
+                            self.test_loader,
+                            len(test_ix),
+                        )
                         if self.is_master:
+                            validation_loss = float(
+                                cox_partial_log_likelihood(
+                                    torch.as_tensor(last_test_lh),
+                                    torch.as_tensor(test_times),
+                                    torch.as_tensor(test_events),
+                                ).item()
+                            )
+                            validation_c_index = harrell_c_index(
+                                last_test_lh,
+                                test_times,
+                                test_events,
+                            )
                             log.info(
-                                "Model %s | Split %d | Epoch %d/%d | Loss: %.6f",
+                                "Model %s | Split %d | Epoch %d/%d | "
+                                "Loss: %.6f | Validation Loss: %.6f | C-index: %.4f",
                                 model_key, split_idx, epoch, epochs,
                                 last_train_metrics["loss"],
+                                validation_loss,
+                                validation_c_index,
                             )
                             curves_rows.append(
                                 {
@@ -1540,12 +1636,27 @@ class SurvPredSurvBoardRunner:
                                     "split": split_idx,
                                     "epoch": epoch,
                                     "train_loss": last_train_metrics["loss"],
+                                    "validation_loss": validation_loss,
+                                    "validation_c_index": validation_c_index,
+                                    "learning_rates": ";".join(
+                                        f"{float(group['lr']):.6g}"
+                                        for group in self.optimizer.param_groups
+                                    ),
                                 }
+                            )
+                            self._write_csv(
+                                self._task_output_dir()
+                                / f"{self._output_prefix()}_{model_key}_curves.csv",
+                                curves_rows,
                             )
 
                     # Predict on test and train sets — all ranks must participate
                     # because _predict_log_hazard uses distributed_concat (all_gather).
-                    test_lh = self._predict_log_hazard(self.test_loader, len(test_ix))
+                    test_lh = (
+                        last_test_lh
+                        if last_test_lh is not None
+                        else self._predict_log_hazard(self.test_loader, len(test_ix))
+                    )
                     train_lh = self._predict_log_hazard(self.train_infer_loader, len(train_ix))
 
                     if self.is_master:
@@ -1607,6 +1718,7 @@ class SurvPredSurvBoardRunner:
                 out_dir = self._task_output_dir()
                 output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {"results_path": str(output_path), "results": aggregate_rows}
             return {}
 

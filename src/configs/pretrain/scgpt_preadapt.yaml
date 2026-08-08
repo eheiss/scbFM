@@ -1,8 +1,5 @@
-# scGPT masked-value preadaptation on unsupervised bulk data only.
-model_name: scgpt_preadapt_bulk
-
-# Explicitly pass only the bulk pretrain and bulk preadapt datasets from the
-# job file. Do not include downstream fine-tuning datasets here.
+# Native scGPT continued pretraining on the complete leakage-filtered bulk corpus.
+model_name: scgpt_preadapt
 data_paths: []
 
 scgpt_repo_dir:
@@ -12,46 +9,48 @@ scgpt_vocab_filename: scgpt_vocab.json
 scgpt_checkpoint_filename: scgpt_best_model.pt
 gene_info_path: ../data/bulkformer_gene_info.csv
 
-epochs: 5
-batch_size: 16
-num_workers: 2
-prefetch_factor: 1
-persistent_workers: false
-valid_every: 1
-grad_acc: 4
-max_grad_norm: 1e2
-log_every_batches: 500
-io_block_size: 1024
-io_cache_blocks: 2
-use_pretokenized_cache: true
-pretokenized_cache_dir:
-build_pretokenized_cache: false
-pretokenize_only: false
-pretokenize_epochs:
-cache_log_every_blocks: 100
+# The audit performs all compatibility and data checks without optimization.
+audit_only: false
+audit_sample_rows: 128
 
-seed: 2021
-validation_split: 0.05
-selected_gene_count: 1199
+# Input contract: all mapped genes are available to the native scGPT collator,
+# which samples 1,199 genes and preserves CLS at position zero.
 max_seq_len: 1200
-mask_prob: 0.15
-min_mapped_genes: 200
+expected_source_gene_count: 13004
+n_bins: 51
+mask_ratio: 0.4
+validation_split: 0.05
+seed: 2021
+min_mapped_genes: 1199
 
-# Keep this false unless the scGPT container has flash-attn installed.
+# Continued pretraining objectives. MVC directly supervises the CLS embedding.
+do_mvc: true
+mvc_loss_weight: 1.0
 use_fast_transformer: false
 
-# Add scGPT's masked value prediction for cell embeddings (MVC/GEPC) so the
-# CLS/cell embedding receives a direct masked-expression reconstruction signal.
-do_mvc: true
-freeze_unused_cls_decoder: true
-ddp_find_unused_parameters: false
-
+# Four GPUs x 4 samples x 4 accumulated microbatches = effective batch size 64.
+epochs: 10
+batch_size: 4
+grad_acc: 4
+num_workers: 2
+prefetch_factor: 2
+max_grad_norm: 1.0
 amp: true
-amp_dtype: float16
+amp_dtype: auto
 
-learning_rate: 1e-4
-first_cycle_steps: 5
-cycle_mult: 1
-min_lr: 1e-6
-warmup_steps: 1
-gamma: 1.0
+backbone_learning_rate: 1e-5
+new_module_learning_rate: 5e-5
+weight_decay: 0.01
+adam_eps: 1e-8
+warmup_fraction: 0.05
+min_lr_ratio: 0.01
+
+valid_every: 1
+# Validation is monitoring-only; train through the prescribed final epoch.
+early_stopping_patience: 0
+early_stopping_min_delta: 1e-4
+log_every_batches: 250
+
+# Optional complete training-state checkpoint. The native source checkpoint is
+# always loaded first and remains separate from this resume state.
+resume_state_path:

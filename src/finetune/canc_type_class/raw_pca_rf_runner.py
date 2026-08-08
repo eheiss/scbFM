@@ -54,29 +54,7 @@ class CancTypeClassRawPCARFRunner(CancTypeClassRunner):
         return f"{self.task_name}_{self._finetune_mode()}"
 
     def _save_run_metadata(self, checkpoint_paths: dict[str, str] | None = None) -> None:
-        if not self.is_master:
-            return
-        out_dir = self._task_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self._output_prefix()
-        (out_dir / f"{prefix}_config.yaml").write_text(
-            OmegaConf.to_yaml(self.cfg, resolve=True),
-            encoding="utf-8",
-        )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
-            {
-                "task": "finetune.canc_type_class_raw_pca_rf",
-                "baseline": "raw_expression_pca_random_forest",
-                "variant": self._finetune_mode(),
-                "feature_mode": str(getattr(self.task_cfg, "raw_pca_rf_feature_mode", "all_genes")),
-                "hvg_selection_method": str(getattr(self.task_cfg, "hvg_selection_method", "mad")),
-                "pca_components": int(getattr(self.task_cfg, "raw_pca_rf_components", 256)),
-                "rf_n_estimators": int(getattr(self.task_cfg, "raw_pca_rf_n_estimators", 500)),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-            },
-        )
+        CancTypeClassRunner._save_run_metadata(self, checkpoint_paths or {})
 
     def _select_feature_indices(self, train_adata: ad.AnnData) -> np.ndarray:
         feature_mode = str(getattr(self.task_cfg, "raw_pca_rf_feature_mode", "all_genes"))
@@ -204,15 +182,15 @@ class CancTypeClassRawPCARFRunner(CancTypeClassRunner):
                 raise ValueError("Raw PCA+RF baseline should be launched with one process.")
 
             adata, labels_str, groups = self._prepare_cv_data()
-            splits = self._build_cv_splits(labels_str, groups)
+            splits = self._build_or_load_cv_splits(adata, labels_str, groups)
             self._save_run_metadata({})
             label_to_idx = {label: idx for idx, label in enumerate(self.label_dict.tolist())}
             labels = np.array([label_to_idx[label] for label in labels_str], dtype=np.int64)
 
             if self.is_master:
                 log.info(
-                    "Prepared raw PCA+RF TCGA 5-type classification data: "
-                    "samples=%d, genes=%d, folds=%d",
+                    "Prepared raw PCA+RF %s data: samples=%d, genes=%d, folds=%d",
+                    self.task_name,
                     adata.n_obs,
                     adata.n_vars,
                     len(splits),
@@ -293,6 +271,9 @@ class CancTypeClassRawPCARFRunner(CancTypeClassRunner):
                 out_dir = self._task_output_dir()
                 output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, [aggregate])
+                from run_provenance import complete_run_metadata
+
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {"results_path": str(output_path), "results": [aggregate]}
             return {}
         finally:

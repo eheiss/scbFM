@@ -19,6 +19,10 @@ from torch.utils.data.distributed import DistributedSampler
 from finetune.canc_type_class.raw_mlp_runner import solve_hidden_dim
 from finetune.canc_type_class.runner import GroupedCosineAnnealingWarmupRestarts
 from finetune.deconv.runner import DeconvRunner
+from finetune.training_correctness import (
+    is_accumulation_boundary,
+    normalize_accumulated_gradients,
+)
 from utils import SequentialDistributedSampler, distributed_concat, get_reduced, seed_all
 
 
@@ -198,30 +202,56 @@ class DeconvRawMLPRunner(DeconvRunner):
         self.model.train()
         self.model.zero_grad(set_to_none=True)
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 1)))
-        running_loss = 0.0
+        running_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        accumulated_normalizer = 0.0
+        total_steps = len(self.train_loader)
         for step_idx, (data, targets) in enumerate(self.train_loader, start=1):
             data = data.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            use_no_sync = self.is_distributed and isinstance(self.model, DDP) and step_idx % grad_acc_steps != 0
+            should_step = is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
+            use_no_sync = (
+                self.is_distributed
+                and isinstance(self.model, DDP)
+                and not should_step
+            )
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
             with sync_context:
                 logits = self.model(data)
-                loss = self._compute_loss(logits, targets)
-                (loss / grad_acc_steps).backward()
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
+                loss_sum, loss_normalizer = self._loss_sum_and_normalizer(logits, targets)
+                loss_sum.backward()
+            accumulated_normalizer += loss_normalizer
+            if should_step:
+                normalize_accumulated_gradients(
+                    self._optimizer_parameters(),
+                    accumulated_normalizer,
+                    device=self.device,
+                    is_distributed=self.is_distributed,
+                    world_size=self.world_size,
+                )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), float(getattr(self.task_cfg, "max_grad_norm", 1e6)))
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
-            running_loss += loss.item()
-        epoch_loss = running_loss / len(self.train_loader)
+                accumulated_normalizer = 0.0
+            running_loss_numerator += float(loss_sum.detach().item())
+            running_loss_normalizer += loss_normalizer
+        loss_totals = torch.tensor(
+            [running_loss_numerator, running_loss_normalizer],
+            dtype=torch.float64,
+            device=self.device,
+        )
         if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
+            dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
+        epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
         self.scheduler.step()
         return {"loss": epoch_loss}
 
     def _evaluate(self) -> dict:
         self.model.eval()
-        running_loss = 0.0
         predictions = []
         truths = []
         if self.is_distributed:
@@ -231,7 +261,6 @@ class DeconvRawMLPRunner(DeconvRunner):
                 data = data.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 logits = self.model(data)
-                running_loss += self._compute_loss(logits, targets).item()
                 predictions.append(F.softmax(logits, dim=-1))
                 truths.append(targets)
         predictions = torch.cat(predictions, dim=0)
@@ -242,9 +271,17 @@ class DeconvRawMLPRunner(DeconvRunner):
 
         predictions_np = predictions.cpu().numpy()
         truths_np = truths.cpu().numpy()
-        test_loss = running_loss / len(self.test_loader)
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.local_rank, 0, self.world_size)
+        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
+        if loss_name == "kl":
+            test_loss = F.kl_div(
+                predictions.clamp_min(1e-12).log(),
+                truths,
+                reduction="batchmean",
+            ).item()
+        elif loss_name == "mse":
+            test_loss = F.mse_loss(predictions, truths).item()
+        else:
+            test_loss = F.l1_loss(predictions, truths).item()
 
         per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
         per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))

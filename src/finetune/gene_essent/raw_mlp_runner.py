@@ -101,26 +101,7 @@ class GeneEssentRawMLPRunner(GeneEssentRunner):
         return {"raw_mlp": ""}
 
     def _save_run_metadata(self, checkpoint_paths: dict | None = None) -> None:
-        if not self.is_master:
-            return
-        out_dir = self._task_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self._output_prefix()
-        (out_dir / f"{prefix}_config.yaml").write_text(
-            OmegaConf.to_yaml(self.cfg, resolve=True),
-            encoding="utf-8",
-        )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
-            {
-                "task": "finetune.gene_essent_raw_mlp",
-                "baseline": "raw_expression_mlp_selected_gene_targets",
-                "variant": self._finetune_mode(),
-                "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "n_valid_genes": self.n_valid_genes,
-                "git_commit": self._get_git_commit(),
-            },
-        )
+        super()._save_run_metadata(checkpoint_paths or {"raw_mlp": ""})
 
     def _select_raw_feature_indices(self, X_expression_train) -> np.ndarray:
         feature_mode = str(getattr(self.task_cfg, "raw_mlp_feature_mode", "all_genes"))

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Callable
 
 import anndata as ad
 import hydra
@@ -26,7 +28,8 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
 from finetune.canc_type_class.runner import ROOT, CancTypeClassRunner
-from utils import seed_all
+from run_provenance import complete_run_metadata, start_run_metadata
+from utils import SequentialDistributedSampler, distributed_concat, seed_all
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +60,8 @@ class _ScGPTExpressionDataset(Dataset):
             row = np.asarray(row).ravel()
 
         nonzero_idx = np.flatnonzero(row != 0)
+        if nonzero_idx.size == 0:
+            nonzero_idx = np.arange(row.size, dtype=np.int64)
         genes = np.concatenate(([self.cls_token_id], self.gene_ids[nonzero_idx]))
         values = np.concatenate(([self.cls_value], row[nonzero_idx].astype(np.float32, copy=False)))
         example = {
@@ -64,6 +69,28 @@ class _ScGPTExpressionDataset(Dataset):
             "expressions": torch.as_tensor(values, dtype=torch.float32),
         }
         return example, torch.tensor(self.labels[index], dtype=torch.long)
+
+
+def _bin_scgpt_examples_safely(
+    examples: list[dict[str, torch.Tensor]],
+    binning_fn: Callable[..., torch.Tensor],
+    *,
+    keep_first_n_tokens: int = 1,
+    n_bins: int = 51,
+) -> list[dict[str, torch.Tensor]]:
+    binned_examples = []
+    for example in examples:
+        expressions = example["expressions"].clone()
+        values = expressions[keep_first_n_tokens:]
+        if torch.count_nonzero(values).item() > 0:
+            expressions[keep_first_n_tokens:] = binning_fn(row=values, n_bins=n_bins)
+        binned_examples.append(
+            {
+                **example,
+                "expressions": expressions,
+            }
+        )
+    return binned_examples
 
 
 class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
@@ -85,6 +112,10 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
         variant = str(getattr(self.task_cfg, "scgpt_variant", "") or "").strip()
         return variant or "scgpt_pca_rf"
 
+    def _model_key(self) -> str:
+        model_key = str(getattr(self.task_cfg, "scgpt_model_key", "") or "").strip()
+        return model_key or "scgpt"
+
     def _task_output_dir(self) -> Path:
         return ROOT / "output" / self.task_name / self._finetune_mode()
 
@@ -101,22 +132,64 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
             OmegaConf.to_yaml(self.cfg, resolve=True),
             encoding="utf-8",
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
-                "task": "finetune.canc_type_class_scgpt_pca_rf",
+                "task": f"finetune.{self.task_name}_scgpt_pca_rf",
                 "baseline": "scgpt_frozen_cls_embedding_pca_random_forest",
                 "variant": self._finetune_mode(),
+                "model_key": self._model_key(),
                 "scgpt_repo_dir": str(getattr(self.task_cfg, "scgpt_repo_dir", "")),
                 "scgpt_model_dir": str(getattr(self.task_cfg, "scgpt_model_dir", "")),
                 "scgpt_gene_info_path": str(getattr(self.task_cfg, "scgpt_gene_info_path", "")),
+                "source_gene_count": int(getattr(self, "_scgpt_source_gene_count", 0)),
+                "vocab_matched_gene_count": int(
+                    getattr(self, "_scgpt_vocab_matched_gene_count", 0)
+                ),
+                "max_sequence_length": int(
+                    getattr(self, "_scgpt_effective_max_seq_len", 0)
+                ),
+                "world_size": int(self.world_size),
+                "per_device_batch_size": int(
+                    getattr(self.task_cfg, "scgpt_batch_size", 4)
+                ),
+                "global_inference_batch_size": int(
+                    getattr(self.task_cfg, "scgpt_batch_size", 4)
+                )
+                * int(self.world_size),
                 "pca_components": int(getattr(self.task_cfg, "scgpt_pca_components", 256)),
                 "rf_n_estimators": int(getattr(self.task_cfg, "scgpt_rf_n_estimators", 500)),
                 "selected_gene_count": int(self.selected_gene_count),
+                "checkpoint_loading": getattr(self, "_scgpt_load_report", {}),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
             },
+            checkpoint_paths={self._model_key(): str(self._scgpt_paths()["checkpoint"])},
+            repo_dir=ROOT / "scbFM",
         )
+
+    @staticmethod
+    def _checkpoint_state_dict(checkpoint) -> dict[str, torch.Tensor]:
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            checkpoint = checkpoint["model_state_dict"]
+        if not isinstance(checkpoint, dict):
+            raise TypeError("The scGPT checkpoint must contain a state dictionary.")
+        state_dict: dict[str, torch.Tensor] = {}
+        for key, value in checkpoint.items():
+            if not torch.is_tensor(value):
+                continue
+            clean_key = str(key)
+            for prefix in ("module.", "_orig_mod."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix) :]
+            state_dict[clean_key] = value
+        return state_dict
 
     def _required_path(self, attr: str) -> Path:
         value = getattr(self.task_cfg, attr, None)
@@ -133,7 +206,7 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
         args_filename = str(getattr(self.task_cfg, "scgpt_args_filename", "args.json"))
         vocab_filename = str(getattr(self.task_cfg, "scgpt_vocab_filename", "vocab.json"))
         checkpoint_filename = str(
-            getattr(self.task_cfg, "scgpt_checkpoint_filename", "best_model.pt")
+            getattr(self.task_cfg, "scgpt_checkpoint_filename", "last_model.pt")
         )
         paths = {
             "repo_dir": repo_dir,
@@ -169,7 +242,20 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
     def _strip_ensembl_version(values: pd.Series | np.ndarray | list[str]) -> pd.Series:
         return pd.Series(values, dtype="string").str.replace(r"\.\d+$", "", regex=True)
 
-    def _add_scgpt_gene_symbols(self, adata: ad.AnnData, gene_info_path: Path, vocab) -> ad.AnnData:
+    def _add_scgpt_gene_symbols(
+        self,
+        adata: ad.AnnData,
+        gene_info_path: Path,
+        vocab,
+    ) -> ad.AnnData:
+        expected_source_gene_count = int(
+            getattr(self.task_cfg, "scgpt_expected_source_gene_count", 13004)
+        )
+        if adata.n_vars != expected_source_gene_count:
+            raise ValueError(
+                f"scGPT source expression input contains {adata.n_vars} genes; "
+                f"expected {expected_source_gene_count}."
+            )
         gene_info = pd.read_csv(gene_info_path)
         required_columns = {"ensg_id", "gene_symbol"}
         missing = sorted(required_columns.difference(gene_info.columns))
@@ -190,19 +276,30 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                 ensg = self._strip_ensembl_version(adata.var_names).to_numpy()
             symbols = np.asarray([ensg_to_symbol.get(str(gene), "") for gene in ensg], dtype=object)
 
-        in_vocab = np.asarray([bool(symbol) and symbol in vocab for symbol in symbols], dtype=bool)
+        in_vocab = np.zeros(len(symbols), dtype=bool)
+        seen_token_ids: set[int] = set()
+        for index, symbol in enumerate(symbols):
+            if not symbol or symbol not in vocab:
+                continue
+            token_id = int(vocab[str(symbol)])
+            if token_id in seen_token_ids:
+                continue
+            seen_token_ids.add(token_id)
+            in_vocab[index] = True
         if int(in_vocab.sum()) < self.selected_gene_count:
             raise ValueError(
                 "Only "
-                f"{int(in_vocab.sum())} genes map to scGPT vocabulary, fewer than "
-                f"selected_gene_count={self.selected_gene_count}."
+                f"{int(in_vocab.sum())} genes map to unique scGPT vocabulary tokens, fewer "
+                f"than selected_gene_count={self.selected_gene_count}."
             )
 
+        self._scgpt_source_gene_count = int(adata.n_vars)
         adata = adata[:, in_vocab].copy()
         adata.var["scgpt_gene_symbol"] = np.asarray(symbols, dtype=object)[in_vocab]
         adata.var_names_make_unique()
+        self._scgpt_vocab_matched_gene_count = int(adata.n_vars)
         log.info(
-            "Mapped TCGA genes to scGPT vocabulary: %d/%d retained",
+            "Mapped source genes to unique scGPT vocabulary tokens: %d/%d retained",
             int(in_vocab.sum()),
             len(in_vocab),
         )
@@ -216,7 +313,6 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
         try:
             from scgpt.model import TransformerModel
             from scgpt.tokenizer import GeneVocab
-            from scgpt.utils import load_pretrained
         except ImportError as exc:
             raise ImportError(
                 "scGPT requires its repository on PYTHONPATH plus dependencies such as "
@@ -238,7 +334,7 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
             nhead=int(model_configs["nheads"]),
             d_hid=int(model_configs["d_hid"]),
             nlayers=int(model_configs["nlayers"]),
-            nlayers_cls=int(model_configs["n_layers_cls"]),
+            nlayers_cls=int(model_configs.get("n_layers_cls", 3)),
             n_cls=1,
             vocab=vocab,
             dropout=float(model_configs["dropout"]),
@@ -252,12 +348,72 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
             input_emb_style=str(model_configs.get("input_emb_style", "continuous")),
             n_input_bins=int(model_configs.get("n_bins", 51)),
             cell_emb_style="cls",
+            mvc_decoder_style="inner product",
             use_fast_transformer=bool(getattr(self.task_cfg, "scgpt_use_fast_transformer", False)),
             fast_transformer_backend="flash",
-            pre_norm=False,
+            pre_norm=bool(model_configs.get("pre_norm", False)),
         )
         log.info("Loading scGPT checkpoint from %s", paths["checkpoint"])
-        load_pretrained(model, torch.load(paths["checkpoint"], map_location=self.device), verbose=False)
+        source_state = self._checkpoint_state_dict(
+            torch.load(paths["checkpoint"], map_location="cpu")
+        )
+        if not bool(getattr(model, "use_fast_transformer", False)):
+            source_state = {
+                key.replace("Wqkv.", "in_proj_"): value
+                for key, value in source_state.items()
+            }
+        target_state = model.state_dict()
+        merged_state = dict(target_state)
+        matched: list[str] = []
+        missing: list[str] = []
+        shape_mismatches: list[dict[str, object]] = []
+        for key, target_value in target_state.items():
+            source_value = source_state.get(key)
+            if source_value is None:
+                missing.append(key)
+            elif tuple(source_value.shape) != tuple(target_value.shape):
+                shape_mismatches.append(
+                    {
+                        "key": key,
+                        "source_shape": list(source_value.shape),
+                        "target_shape": list(target_value.shape),
+                    }
+                )
+            else:
+                merged_state[key] = source_value
+                matched.append(key)
+
+        allowed_head_prefixes = ("mvc_decoder.", "cls_decoder.")
+        invalid_missing = [
+            key for key in missing if not key.startswith(allowed_head_prefixes)
+        ]
+        invalid_shapes = [
+            item
+            for item in shape_mismatches
+            if not str(item["key"]).startswith(allowed_head_prefixes)
+        ]
+        if invalid_missing or invalid_shapes:
+            raise ValueError(
+                "The pretrained scGPT checkpoint is incompatible with args.json/vocab.json. "
+                f"Core missing keys={invalid_missing[:20]}, "
+                f"core shape mismatches={invalid_shapes[:20]}"
+            )
+        model.load_state_dict(merged_state, strict=True)
+        unexpected = sorted(set(source_state).difference(target_state))
+        self._scgpt_load_report = {
+            "strict_core_loading": True,
+            "checkpoint_tensor_count": len(source_state),
+            "model_tensor_count": len(target_state),
+            "matched_tensor_count": len(matched),
+            "matched_parameter_fraction": (
+                sum(target_state[key].numel() for key in matched)
+                / sum(value.numel() for value in target_state.values())
+            ),
+            "newly_initialized_keys": sorted(
+                set(missing).union(str(item["key"]) for item in shape_mismatches)
+            ),
+            "unexpected_checkpoint_keys": unexpected,
+        }
         model = model.to(self.device)
         model.eval()
         n_params = sum(p.numel() for p in model.parameters())
@@ -278,11 +434,36 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
         gene_ids: np.ndarray,
         vocab,
         model_configs: dict,
+        *,
+        stage: str,
     ) -> DataLoader:
         from scgpt.data_collator import DataCollator
+        from scgpt.preprocess import binning
 
         pad_token = str(model_configs["pad_token"])
         pad_value = int(model_configs["pad_value"])
+        if sparse.issparse(adata.X):
+            empty_profile_indices = np.flatnonzero(
+                np.asarray((adata.X.tocsr() != 0).getnnz(axis=1)).ravel() == 0
+            )
+        else:
+            empty_profile_indices = np.flatnonzero(
+                np.count_nonzero(np.asarray(adata.X), axis=1) == 0
+            )
+        if empty_profile_indices.size and self.is_master:
+            sample_ids = (
+                adata.obs["sample_id"].astype(str).to_numpy()
+                if "sample_id" in adata.obs
+                else adata.obs_names.astype(str).to_numpy()
+            )
+            affected_sample_ids = sample_ids[empty_profile_indices].tolist()
+            log.warning(
+                "scGPT all-zero selected-gene fallback | stage=%s | samples=%d | "
+                "sample_ids=%s",
+                stage,
+                empty_profile_indices.size,
+                affected_sample_ids,
+            )
         dataset = _ScGPTExpressionDataset(
             matrix=adata.X,
             labels=labels,
@@ -290,28 +471,54 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
             cls_token_id=int(vocab["<cls>"]),
             cls_value=float(pad_value),
         )
+        required_length = int(gene_ids.size + 1)
+        configured_max_length = getattr(self.task_cfg, "scgpt_max_seq_len", None)
+        if configured_max_length is None:
+            max_length = required_length
+        else:
+            max_length = int(configured_max_length)
+            if max_length < required_length:
+                raise ValueError(
+                    f"scgpt_max_seq_len={max_length} would truncate the configured "
+                    f"{gene_ids.size} selected genes plus CLS. Set it to at least "
+                    f"{required_length}, or leave it null for automatic sizing."
+                )
+        self._scgpt_effective_max_seq_len = max_length
         collator = DataCollator(
             do_padding=True,
             pad_token_id=int(vocab[pad_token]),
             pad_value=pad_value,
             do_mlm=False,
-            do_binning=True,
+            do_binning=False,
             mlm_probability=0.15,
             mask_value=int(model_configs.get("mask_value", -1)),
-            max_length=int(getattr(self.task_cfg, "scgpt_max_seq_len", model_configs.get("max_seq_len", 1200))),
+            max_length=max_length,
             sampling=False,
             keep_first_n_tokens=1,
         )
 
         def collate_fn(batch):
             examples, batch_labels = zip(*batch)
-            return collator(list(examples)), torch.stack(list(batch_labels))
+            binned_examples = _bin_scgpt_examples_safely(list(examples), binning)
+            return collator(binned_examples), torch.stack(list(batch_labels))
 
         workers = int(getattr(self.task_cfg, "num_workers", 2))
+        batch_size = int(getattr(self.task_cfg, "scgpt_batch_size", 4))
+        sampler = (
+            SequentialDistributedSampler(
+                dataset,
+                batch_size=batch_size,
+                world_size=self.world_size,
+                rank=self.rank,
+            )
+            if self.is_distributed
+            else None
+        )
         return DataLoader(
             dataset,
-            batch_size=int(getattr(self.task_cfg, "scgpt_batch_size", 32)),
+            batch_size=batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=workers > 0,
@@ -321,7 +528,12 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
     def _extract_scgpt_embeddings(self, model, loader: DataLoader) -> tuple[np.ndarray, np.ndarray]:
         embeddings = []
         labels = []
-        with torch.no_grad():
+        autocast_context = (
+            torch.cuda.amp.autocast(enabled=True)
+            if self.device.type == "cuda"
+            else nullcontext()
+        )
+        with torch.no_grad(), autocast_context:
             for batch, batch_labels in loader:
                 gene = batch["gene"].to(self.device, non_blocking=True)
                 expr = batch["expr"].to(self.device, non_blocking=True)
@@ -329,9 +541,84 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                 hidden = model._encode(gene, expr, padding_mask)
                 cell_emb = hidden[:, 0, :]
                 cell_emb = torch.nn.functional.normalize(cell_emb, p=2, dim=1)
-                embeddings.append(cell_emb.detach().cpu().numpy())
+                embeddings.append(
+                    cell_emb.detach().cpu().numpy().astype(np.float32, copy=False)
+                )
                 labels.append(batch_labels.numpy())
         return np.vstack(embeddings), np.concatenate(labels)
+
+    def _extract_scgpt_embeddings_safely(
+        self,
+        model,
+        loader: DataLoader,
+        *,
+        stage: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        local_error: Exception | None = None
+        result: tuple[np.ndarray, np.ndarray] | None = None
+        try:
+            result = self._extract_scgpt_embeddings(model, loader)
+        except Exception as exc:
+            local_error = exc
+            log.exception(
+                "scGPT embedding extraction failed | rank=%d | stage=%s | samples=%d",
+                self.rank,
+                stage,
+                len(loader.dataset),
+            )
+
+        if self.is_distributed:
+            failure_flag = torch.tensor(
+                [int(local_error is not None)],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            dist.all_reduce(failure_flag, op=dist.ReduceOp.MAX)
+            if int(failure_flag.item()) != 0:
+                if local_error is not None:
+                    raise local_error
+                raise RuntimeError(
+                    "scGPT embedding extraction failed on another distributed rank "
+                    f"during {stage}; inspect that rank's traceback in the Slurm error log."
+                )
+
+        if local_error is not None:
+            raise local_error
+        if result is None:
+            raise RuntimeError(
+                f"scGPT embedding extraction produced no result during {stage}."
+            )
+        return result
+
+    def _gather_scgpt_embeddings(
+        self,
+        embeddings: np.ndarray,
+        labels: np.ndarray,
+        total_examples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.is_distributed:
+            return embeddings, labels
+
+        embedding_tensor = torch.as_tensor(
+            embeddings,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        label_tensor = torch.as_tensor(labels, dtype=torch.long, device=self.device)
+        gathered_embeddings = distributed_concat(
+            embedding_tensor,
+            total_examples,
+            self.world_size,
+        )
+        gathered_labels = distributed_concat(
+            label_tensor,
+            total_examples,
+            self.world_size,
+        )
+        return (
+            gathered_embeddings.cpu().numpy().astype(np.float32, copy=False),
+            gathered_labels.cpu().numpy().astype(np.int64, copy=False),
+        )
 
     def _fit_predict_embeddings(
         self,
@@ -432,26 +719,32 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
     def run(self) -> dict:
         try:
             self._setup_runtime()
-            if self.is_distributed and self.world_size != 1:
-                raise ValueError("scGPT PCA+RF baseline should be launched with one process.")
 
             paths = self._scgpt_paths()
             seed_all(int(getattr(self.task_cfg, "random_seed", 42)))
             model, vocab, model_configs = self._build_scgpt_model(paths)
             adata, labels_str, groups = self._prepare_raw_tcga_data()
             adata = self._add_scgpt_gene_symbols(adata, paths["gene_info"], vocab)
-            splits = self._build_cv_splits(labels_str, groups)
-            self._save_run_metadata()
+            splits = self._build_or_load_cv_splits(adata, labels_str, groups)
             label_to_idx = {label: idx for idx, label in enumerate(self.label_dict.tolist())}
             labels = np.asarray([label_to_idx[label] for label in labels_str], dtype=np.int64)
+            configured_max_length = getattr(self.task_cfg, "scgpt_max_seq_len", None)
+            self._scgpt_effective_max_seq_len = (
+                self.selected_gene_count + 1
+                if configured_max_length is None
+                else int(configured_max_length)
+            )
+            self._save_run_metadata()
             log.info(
-                "Prepared scGPT PCA+RF CV data: samples=%d, vocab-matched genes=%d, folds=%d",
+                "Prepared scGPT PCA+RF CV data: samples=%d, vocab-matched source "
+                "genes=%d, selected genes per fold=%d, folds=%d",
                 adata.n_obs,
                 adata.n_vars,
+                self.selected_gene_count,
                 len(splits),
             )
 
-            model_key = "scgpt"
+            model_key = self._model_key()
             checkpoint_path = str(paths["checkpoint"])
             fold_rows: list[dict[str, object]] = []
             prediction_rows: list[dict[str, object]] = []
@@ -476,6 +769,7 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                     gene_ids,
                     vocab,
                     model_configs,
+                    stage=f"fold {fold_idx} training split",
                 )
                 test_loader = self._make_scgpt_loader(
                     fold_adata[test_idx].copy(),
@@ -483,16 +777,49 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                     gene_ids,
                     vocab,
                     model_configs,
+                    stage=f"fold {fold_idx} validation split",
                 )
-                train_emb, train_y = self._extract_scgpt_embeddings(model, train_loader)
-                test_emb, test_y = self._extract_scgpt_embeddings(model, test_loader)
+                train_emb, train_y = self._extract_scgpt_embeddings_safely(
+                    model,
+                    train_loader,
+                    stage=f"fold {fold_idx} training split",
+                )
+                test_emb, test_y = self._extract_scgpt_embeddings_safely(
+                    model,
+                    test_loader,
+                    stage=f"fold {fold_idx} validation split",
+                )
+                train_emb, train_y = self._gather_scgpt_embeddings(
+                    train_emb,
+                    train_y,
+                    len(train_idx),
+                )
+                test_emb, test_y = self._gather_scgpt_embeddings(
+                    test_emb,
+                    test_y,
+                    len(test_idx),
+                )
+                if not np.array_equal(train_y, labels[train_idx]):
+                    raise RuntimeError(
+                        "Distributed scGPT extraction changed training-sample order."
+                    )
+                if not np.array_equal(test_y, labels[test_idx]):
+                    raise RuntimeError(
+                        "Distributed scGPT extraction changed validation-sample order."
+                    )
                 log.info(
-                    "scGPT PCA+RF | Fold %d/%d | embeddings train=%s test=%s",
+                    "scGPT PCA+RF | Fold %d/%d | selected genes=%d | "
+                    "embeddings train=%s test=%s",
                     fold_idx,
                     len(splits),
+                    fold_adata.n_vars,
                     train_emb.shape,
                     test_emb.shape,
                 )
+                if not self.is_master:
+                    if self.is_distributed:
+                        dist.barrier()
+                    continue
                 train_metrics, test_metrics = self._fit_predict_embeddings(
                     train_emb,
                     train_y,
@@ -530,19 +857,23 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                     )
                 )
                 confusion_matrices.append(np.asarray(test_metrics["confusion_matrix"]))
+                if self.is_distributed:
+                    dist.barrier()
 
-            aggregate = self._write_model_results(
-                checkpoint_path,
-                fold_rows,
-                prediction_rows,
-                confusion_matrices,
-            )
             out_dir = self._task_output_dir()
             output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
-            self._write_csv(output_path, [aggregate])
-            log.info("scGPT PCA+RF results written to %s", output_path)
-            return {"results_path": str(output_path), "results": [aggregate]}
+            if self.is_master:
+                aggregate = self._write_model_results(
+                    checkpoint_path,
+                    fold_rows,
+                    prediction_rows,
+                    confusion_matrices,
+                )
+                self._write_csv(output_path, [aggregate])
+                complete_run_metadata(self._run_metadata_path, output_path)
+                log.info("scGPT PCA+RF results written to %s", output_path)
+                return {"results_path": str(output_path), "results": [aggregate]}
+            return {"results_path": str(output_path), "results": []}
         finally:
             if self.is_distributed and dist.is_initialized():
-                dist.barrier()
                 dist.destroy_process_group()

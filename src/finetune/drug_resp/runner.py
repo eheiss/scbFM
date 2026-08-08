@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import csv
+import fcntl
+import hashlib
 import json
 import logging
+import math
 import os
+import re
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -12,7 +16,6 @@ import anndata as ad
 import hydra
 import numpy as np
 import pandas as pd
-import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -28,13 +31,21 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import (
-    GroupedCosineAnnealingWarmupRestarts,
+    GroupedCosineWarmupUpdateScheduler,
     _quantile_bin_expression,
+    _set_finetune_training_mode,
+)
+from finetune.training_correctness import (
+    add_optimizer_parameter_group,
+    is_accumulation_boundary,
+    normalize_accumulated_gradients,
+    validate_backbone_checkpoint,
 )
 from preprocess import (
     reindex_adata_genes,
     validate_token_matrix,
 )
+from run_provenance import complete_run_metadata, start_run_metadata
 from utils import (
     SequentialDistributedSampler,
     distributed_concat,
@@ -207,6 +218,7 @@ class DrugRespDataset(Dataset):
 
 class DrugRespRunner:
     task_name = TASK_NAME
+    config_node = TASK_NAME
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
@@ -265,11 +277,25 @@ class DrugRespRunner:
     def _finetune_mode(self) -> str:
         return str(getattr(self.task_cfg, "finetune_mode", "head_only"))
 
+    def _output_suffix(self) -> str:
+        configured = str(getattr(self.task_cfg, "output_suffix", "") or "").strip()
+        if configured and not re.fullmatch(r"[A-Za-z0-9_-]+", configured):
+            raise ValueError(
+                "finetune.drug_resp.output_suffix may contain only letters, numbers, "
+                "underscores, and hyphens."
+            )
+        return configured
+
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / TASK_NAME / self._finetune_mode()
+        mode = self._finetune_mode()
+        suffix = self._output_suffix()
+        directory = f"{mode}_{suffix}" if suffix else mode
+        return ROOT / "output" / TASK_NAME / directory
 
     def _output_prefix(self) -> str:
-        return f"{TASK_NAME}_{self._finetune_mode()}"
+        mode = self._finetune_mode()
+        suffix = self._output_suffix()
+        return f"{TASK_NAME}_{mode}_{suffix}" if suffix else f"{TASK_NAME}_{mode}"
 
     def _resolve_gene_list_path(self) -> Path:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
@@ -341,15 +367,36 @@ class DrugRespRunner:
         (out_dir / f"{prefix}_config.yaml").write_text(
             OmegaConf.to_yaml(self.cfg, resolve=True), encoding="utf-8"
         )
-        self._write_json(
-            out_dir / f"{prefix}_run_metadata.json",
+        self._run_metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        start_run_metadata(
+            self._run_metadata_path,
             {
                 "task": self.task_name,
                 "finetune_mode": self._finetune_mode(),
+                "head_only_backbone_eval": self._finetune_mode() == "head_only",
+                "output_suffix": self._output_suffix(),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
-                "git_commit": self._get_git_commit(),
-                "checkpoint_paths": checkpoint_paths,
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
+                "epochs": int(getattr(self.task_cfg, "epochs", 20)),
+                "warmup_epochs": int(getattr(self.task_cfg, "warmup_epochs", 2)),
+                "batch_size_per_gpu": int(getattr(self.task_cfg, "batch_size", 4)),
+                "gradient_accumulation_steps": int(
+                    getattr(self.task_cfg, "grad_accumulation_steps", 4)
+                ),
+                "world_size": int(self.world_size),
+                "global_effective_batch_size": int(
+                    getattr(self.task_cfg, "batch_size", 4)
+                )
+                * int(getattr(self.task_cfg, "grad_accumulation_steps", 4))
+                * int(self.world_size),
             },
+            checkpoint_paths=checkpoint_paths,
+            repo_dir=ROOT / "scbFM",
         )
 
     @staticmethod
@@ -377,9 +424,28 @@ class DrugRespRunner:
             raise ValueError(
                 f"finetune.drug_resp.pretrained_model_paths must define {', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
+        configured_model_keys = getattr(self.task_cfg, "model_keys", None)
+        if configured_model_keys is None:
+            selected_model_keys = list(MODEL_KEYS)
+        else:
+            selected_model_keys = [str(key) for key in configured_model_keys]
+            if not selected_model_keys:
+                raise ValueError("finetune.drug_resp.model_keys may not be empty.")
+            invalid = sorted(set(selected_model_keys).difference(MODEL_KEYS))
+            if invalid:
+                raise ValueError(
+                    f"Invalid finetune.drug_resp.model_keys: {invalid}; expected a subset "
+                    f"of {list(MODEL_KEYS)}."
+                )
+            if len(set(selected_model_keys)) != len(selected_model_keys):
+                raise ValueError("finetune.drug_resp.model_keys contains duplicates.")
+
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
+        for key in selected_model_keys:
+            if key == RANDOM_INIT_MODEL_KEY:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -389,7 +455,6 @@ class DrugRespRunner:
             raise ValueError(
                 f"Missing checkpoint paths in finetune.drug_resp.pretrained_model_paths: {missing}"
             )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     # ------------------------------------------------------------------
@@ -418,10 +483,15 @@ class DrugRespRunner:
         drug_feat_path = Path(hydra.utils.to_absolute_path(
             str(getattr(self.task_cfg, "drug_features_path", ""))
         ))
-        gene_info_path = Path(hydra.utils.to_absolute_path(
-            str(getattr(self.task_cfg, "gene_info_path",
-                        str(ROOT / "scbFM" / "data" / "bulkformer_gene_info.csv")))
-        ))
+        configured_gene_info = getattr(self.task_cfg, "gene_info_path", None)
+        gene_info_path = Path(
+            hydra.utils.to_absolute_path(
+                str(
+                    configured_gene_info
+                    or ROOT / "scbFM" / "data" / "bulkformer_gene_info.csv"
+                )
+            )
+        )
 
         paths_to_check = [
             (expr_path, "expression_data_path"),
@@ -537,7 +607,9 @@ class DrugRespRunner:
             ascending=True,
         )
         ic50_df = ic50_df.drop_duplicates(subset=[model_id_col, drug_id_col], keep="last")
-        ic50_df = ic50_df.dropna(subset=[ic50_col]).reset_index(drop=True)
+        ic50_df[ic50_col] = pd.to_numeric(ic50_df[ic50_col], errors="coerce")
+        ic50_df = ic50_df[np.isfinite(ic50_df[ic50_col].to_numpy(dtype=float))]
+        ic50_df = ic50_df.reset_index(drop=True)
 
         # Keep pairs with both expression data and drug embeddings
         mask = (
@@ -563,6 +635,10 @@ class DrugRespRunner:
         ic50_values = ic50_df[ic50_col].values.astype(np.float32)
         pair_cell_ids = ic50_df[model_id_col].values
 
+        self._canonical_adata = adata
+        self._canonical_cell_ids = adata.obs_names.astype(str).to_numpy()
+        self._pair_drug_ids = ic50_df[drug_id_col].astype(str).to_numpy()
+
         return X_cell, drug_emb_matrix, cell_idxs, drug_idxs, ic50_values, pair_cell_ids
 
     def _select_training_hvg_indices(
@@ -570,44 +646,57 @@ class DrugRespRunner:
         X_cell,
         training_cell_idxs: np.ndarray,
     ) -> np.ndarray:
-        """Fit the fixed sequence vocabulary on training-fold cell lines only."""
+        """Select the highest-MAD genes on distinct training-fold cell lines."""
         unique_training_cells = np.unique(training_cell_idxs).astype(np.int64)
         if unique_training_cells.size == 0:
             raise ValueError("The drug-response training fold contains no cell lines.")
-
-        hvg_adata = ad.AnnData(X=X_cell[unique_training_cells])
-        hvg_stats = sc.pp.highly_variable_genes(
-            hvg_adata,
-            n_top_genes=self.selected_gene_count,
-            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            inplace=False,
-        )
-        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
-        if selected.size > self.selected_gene_count:
-            ranking_column = (
-                "highly_variable_rank"
-                if "highly_variable_rank" in hvg_stats
-                else "dispersions_norm"
+        if X_cell.shape[1] < self.selected_gene_count:
+            raise ValueError(
+                f"Cannot select {self.selected_gene_count} genes from "
+                f"only {X_cell.shape[1]} genes."
             )
-            scores = hvg_stats[ranking_column].to_numpy()[selected]
-            if ranking_column == "highly_variable_rank":
-                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
-            else:
-                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
-            selected = selected[order[: self.selected_gene_count]]
+        selection_method = str(
+            getattr(self.task_cfg, "hvg_selection_method", "mad")
+        ).strip().lower()
+        if selection_method != "mad":
+            raise ValueError(
+                "Drug response supports only hvg_selection_method=mad; "
+                f"got '{selection_method}'."
+            )
 
+        matrix = X_cell[unique_training_cells]
+        if sparse.issparse(matrix):
+            matrix = matrix.toarray()
+        matrix = np.asarray(matrix, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise ValueError(f"Expected 2D expression matrix, got shape {matrix.shape}.")
+
+        gene_medians = np.nanmedian(matrix, axis=0)
+        mad = np.nanmedian(np.abs(matrix - gene_medians), axis=0)
+        scores = np.nan_to_num(mad, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        if not np.any(np.isfinite(scores)):
+            raise ValueError("Could not compute finite MAD scores for any genes.")
+
+        ranked = np.lexsort((np.arange(scores.size), -scores))
+        selected = np.sort(ranked[: self.selected_gene_count]).astype(
+            np.int64,
+            copy=False,
+        )
         if selected.size != self.selected_gene_count:
             raise RuntimeError(
-                f"Scanpy selected {selected.size} HVGs; "
+                f"MAD selection selected {selected.size} genes; "
                 f"expected exactly {self.selected_gene_count}."
             )
         log.info(
-            "Selected %d HVGs from %d training-fold cell lines with flavor=%s",
+            "Selected %d genes from %d distinct training-fold cell lines "
+            "with method=mad | selected MAD min=%.6g median=%.6g max=%.6g",
             selected.size,
             unique_training_cells.size,
-            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            float(np.min(scores[selected])),
+            float(np.median(scores[selected])),
+            float(np.max(scores[selected])),
         )
-        return selected.astype(np.int64, copy=False)
+        return selected
 
     def _cell_backbone_batch(self, X_cell, cell_indices: np.ndarray) -> dict[str, torch.Tensor]:
         if self.fold_gene_indices is None:
@@ -655,6 +744,183 @@ class DrugRespRunner:
             random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
         return list(splitter.split(np.arange(n_pairs)))
+
+    @staticmethod
+    def _fold_assignments_from_splits(
+        n_pairs: int,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        assignments = np.full(n_pairs, -1, dtype=np.int64)
+        all_indices = np.arange(n_pairs, dtype=np.int64)
+        for fold, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_idx = np.asarray(train_idx, dtype=np.int64)
+            test_idx = np.asarray(test_idx, dtype=np.int64)
+            if np.intersect1d(train_idx, test_idx).size:
+                raise ValueError(f"CV fold {fold} contains overlapping train and test pairs.")
+            if not np.array_equal(
+                np.sort(np.concatenate((train_idx, test_idx))),
+                all_indices,
+            ):
+                raise ValueError(f"CV fold {fold} does not partition every pair exactly once.")
+            if np.any(assignments[test_idx] != -1):
+                raise ValueError("A pair appears in the test partition of multiple CV folds.")
+            assignments[test_idx] = fold
+        if np.any(assignments < 1):
+            raise ValueError("Every pair must appear in exactly one CV test fold.")
+        return assignments
+
+    def _cv_manifest_source_rows(
+        self,
+        pair_cell_ids: np.ndarray,
+        pair_drug_ids: np.ndarray,
+        ic50_values: np.ndarray,
+    ) -> list[dict[str, str]]:
+        if not (
+            len(pair_cell_ids) == len(pair_drug_ids) == len(ic50_values)
+        ):
+            raise ValueError("Drug-response pair metadata arrays must have equal lengths.")
+        rows = [
+            {
+                "cell_line_id": str(cell_id),
+                "drug_id": str(drug_id),
+                "target": format(float(target), ".9g"),
+            }
+            for cell_id, drug_id, target in zip(
+                pair_cell_ids,
+                pair_drug_ids,
+                ic50_values,
+            )
+        ]
+        pair_keys = [(row["cell_line_id"], row["drug_id"]) for row in rows]
+        if len(set(pair_keys)) != len(pair_keys):
+            raise ValueError("Canonical drug-response pairs must be unique after GDSC deduplication.")
+        return rows
+
+    def _resolve_cv_fold_manifest_path(
+        self,
+        source_rows: list[dict[str, str]],
+    ) -> Path | None:
+        configured = getattr(self.task_cfg, "cv_fold_manifest_path", None)
+        if configured is None or not str(configured).strip():
+            return None
+        configured_str = str(configured).strip()
+        if configured_str.lower() != "auto":
+            return Path(hydra.utils.to_absolute_path(configured_str))
+
+        ic50_path = Path(
+            hydra.utils.to_absolute_path(str(getattr(self.task_cfg, "ic50_data_path", "")))
+        )
+        signature_payload = {
+            "task": self.task_name,
+            "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+            "random_seed": int(getattr(self.task_cfg, "random_seed", 42)),
+            "pairs": source_rows,
+        }
+        source_fingerprint = hashlib.sha256(
+            json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        self._cv_source_fingerprint = source_fingerprint
+        return ic50_path.with_name(
+            f"{ic50_path.stem}_{self.task_name}_{source_fingerprint[:16]}_cv_folds.csv"
+        )
+
+    def _load_cv_fold_manifest(
+        self,
+        manifest_path: Path,
+        source_rows: list[dict[str, str]],
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        required_fields = {"cell_line_id", "drug_id", "target", "fold"}
+        observed_fields = set(rows[0]) if rows else set()
+        if not required_fields.issubset(observed_fields):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} is missing columns "
+                f"{sorted(required_fields - observed_fields)}."
+            )
+        if len(rows) != len(source_rows):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} contains {len(rows)} pairs; "
+                f"expected {len(source_rows)}."
+            )
+
+        assignments = np.empty(len(rows), dtype=np.int64)
+        for index, (observed, expected) in enumerate(zip(rows, source_rows)):
+            if {key: observed[key] for key in expected} != expected:
+                raise ValueError(
+                    f"CV fold manifest {manifest_path} differs from canonical pair row {index}."
+                )
+            assignments[index] = int(observed["fold"])
+
+        n_folds = int(getattr(self.task_cfg, "cv_folds", 5))
+        if set(assignments.tolist()) != set(range(1, n_folds + 1)):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} must contain folds 1..{n_folds}."
+            )
+        indices = np.arange(len(rows), dtype=np.int64)
+        return [
+            (indices[assignments != fold], indices[assignments == fold])
+            for fold in range(1, n_folds + 1)
+        ]
+
+    def _build_or_load_cv_splits(
+        self,
+        pair_cell_ids: np.ndarray,
+        pair_drug_ids: np.ndarray,
+        ic50_values: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        source_rows = self._cv_manifest_source_rows(
+            pair_cell_ids,
+            pair_drug_ids,
+            ic50_values,
+        )
+        manifest_path = self._resolve_cv_fold_manifest_path(source_rows)
+        if manifest_path is None:
+            return self._build_cv_splits(len(source_rows))
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            if manifest_path.exists():
+                splits = self._load_cv_fold_manifest(manifest_path, source_rows)
+            else:
+                splits = self._build_cv_splits(len(source_rows))
+                assignments = self._fold_assignments_from_splits(len(source_rows), splits)
+                temporary_path = manifest_path.with_name(
+                    f"{manifest_path.name}.tmp.{os.getpid()}.{self.rank}"
+                )
+                try:
+                    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=["cell_line_id", "drug_id", "target", "fold"],
+                        )
+                        writer.writeheader()
+                        for row, fold in zip(source_rows, assignments):
+                            writer.writerow({**row, "fold": int(fold)})
+                    os.replace(temporary_path, manifest_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        assignments = self._fold_assignments_from_splits(len(source_rows), splits)
+        fold_fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{row['cell_line_id']}\t{row['drug_id']}\t{int(fold)}"
+                for row, fold in zip(source_rows, assignments)
+            ).encode("utf-8")
+        ).hexdigest()
+        self._cv_fold_manifest_path = manifest_path
+        self._cv_fold_fingerprint = fold_fingerprint
+        log.info(
+            "Using shared drug-response CV fold manifest %s | fingerprint=%s",
+            manifest_path,
+            fold_fingerprint,
+        )
+        return splits
 
     # ------------------------------------------------------------------
     # Data loaders
@@ -824,6 +1090,14 @@ class DrugRespRunner:
         if checkpoint_path:
             resolved = hydra.utils.to_absolute_path(str(checkpoint_path))
             checkpoint = torch.load(resolved, map_location="cpu")
+            validate_backbone_checkpoint(
+                checkpoint,
+                resolved,
+                gene_num=int(self.model_cfg.gene_num),
+                selected_gene_count=self.selected_gene_count,
+                max_seq_len=self.max_seq_len,
+                bin_num=int(self.model_cfg.bin_num),
+            )
             state_dict = self._strip_module_prefix(checkpoint["model_state_dict"])
             backbone.load_state_dict(state_dict)
             log.info("Loaded pretrained checkpoint from %s", resolved)
@@ -924,16 +1198,32 @@ class DrugRespRunner:
         configured_ratio = getattr(self.task_cfg, "min_lr_ratio", None)
         min_lr_ratio = float(configured_ratio) if configured_ratio is not None else min_lr / max(head_lr, 1e-12)
 
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        epochs = int(getattr(self.task_cfg, "epochs", 20))
+        warmup_epochs = int(getattr(self.task_cfg, "warmup_epochs", 2))
+
         self.optimizer = Adam(param_groups)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 20)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
         )
+        if self.is_master:
+            log.info(
+                "Update-based LR schedule: updates_per_epoch=%d | total_updates=%d | "
+                "warmup_epochs=%d | warmup_updates=%d",
+                updates_per_epoch,
+                self.scheduler.total_updates,
+                warmup_epochs,
+                self.scheduler.warmup_updates,
+            )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
         burn_in = int(getattr(self.task_cfg, "burn_in_epochs", 3))
@@ -944,8 +1234,15 @@ class DrugRespRunner:
             or epoch <= burn_in
         ):
             return
+        raw_model = self.model.module if isinstance(self.model, DDP) else self.model
+        add_optimizer_parameter_group(
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            parameters=raw_model.backbone.parameters(),
+            max_lr=float(self.task_cfg.backbone_learning_rate),
+            name="backbone",
+        )
         self.backbone_optimizer_enabled = True
-        self._build_optimization()
         if self.is_master:
             log.info("Finished %d burn-in epochs; enabled backbone optimization.", burn_in)
 
@@ -992,14 +1289,16 @@ class DrugRespRunner:
                 self.train_loader.sampler.set_epoch(epoch)
             dist.barrier()
 
-        self.model.train()
+        _set_finetune_training_mode(self.model, self._finetune_mode())
         self.model.zero_grad(set_to_none=True)
         self.optimizer.zero_grad(set_to_none=True)
 
         grad_acc_steps = max(1, int(getattr(self.task_cfg, "grad_accumulation_steps", 4)))
         max_grad_norm = float(getattr(self.task_cfg, "max_grad_norm", 1e6))
-        running_loss = 0.0
-        n_batches = 0
+        running_loss_numerator = 0.0
+        running_loss_normalizer = 0.0
+        accumulated_normalizer = 0.0
+        total_steps = len(self.train_loader)
 
         for step_idx, (cell_idxs_b, batch, drug_emb, targets) in enumerate(self.train_loader, start=1):
             drug_emb = drug_emb.to(self.device, non_blocking=True)
@@ -1014,36 +1313,55 @@ class DrugRespRunner:
                 }
                 cell_emb = None
 
+            should_step = is_accumulation_boundary(
+                step_idx,
+                total_steps,
+                grad_acc_steps,
+            )
             use_no_sync = (
                 self.is_distributed
                 and isinstance(self.model, DDP)
-                and step_idx % grad_acc_steps != 0
-                and step_idx != len(self.train_loader)
+                and not should_step
             )
             sync_context = self.model.no_sync() if use_no_sync else nullcontext()
             with sync_context:
                 preds = self.model(batch_arg, drug_emb, cell_emb)  # (B,)
-                loss = F.mse_loss(preds, targets)
-                (loss / grad_acc_steps).backward()
+                loss_sum = F.mse_loss(preds, targets, reduction="sum")
+                loss_normalizer = float(targets.numel())
+                loss_sum.backward()
 
-            if step_idx % grad_acc_steps == 0 or step_idx == len(self.train_loader):
+            accumulated_normalizer += loss_normalizer
+
+            if should_step:
+                normalize_accumulated_gradients(
+                    self._optimizer_parameters(),
+                    accumulated_normalizer,
+                    device=self.device,
+                    is_distributed=self.is_distributed,
+                    world_size=self.world_size,
+                )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
+                self.scheduler.step()
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
                 self.optimizer.zero_grad(set_to_none=True)
+                accumulated_normalizer = 0.0
 
-            running_loss += loss.item()
-            n_batches += 1
+            running_loss_numerator += float(loss_sum.detach().item())
+            running_loss_normalizer += loss_normalizer
 
-        epoch_loss = running_loss / max(n_batches, 1)
+        loss_totals = torch.tensor(
+            [running_loss_numerator, running_loss_normalizer],
+            dtype=torch.float64,
+            device=self.device,
+        )
         if self.is_distributed:
-            epoch_loss = get_reduced(epoch_loss, self.local_rank, 0, self.world_size)
-        self.scheduler.step()
+            dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
+        epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
         return {"loss": epoch_loss}
 
     def _evaluate(self, test_pair_cell_ids: np.ndarray) -> dict:
         self.model.eval()
-        running_loss = 0.0
         all_preds: list[torch.Tensor] = []
         all_targets: list[torch.Tensor] = []
 
@@ -1063,8 +1381,6 @@ class DrugRespRunner:
                         for key, value in batch.items()
                     }
                     preds = self.model(batch, drug_emb)    # (B,)
-                loss = F.mse_loss(preds, targets)
-                running_loss += loss.item()
                 all_preds.append(preds)
                 all_targets.append(targets)
 
@@ -1103,11 +1419,9 @@ class DrugRespRunner:
         mean_pcc = float(np.nanmean(list(cell_pccs.values()))) if cell_pccs else float("nan")
         mean_scc = float(np.nanmean(list(cell_sccs.values()))) if cell_sccs else float("nan")
 
-        test_loss = running_loss / max(1, len(self.test_loader))
-        if self.is_distributed:
-            test_loss = get_reduced(test_loss, self.local_rank, 0, self.world_size)
+        test_loss = F.mse_loss(all_preds_t, all_targets_t).item()
 
-        return {
+        row = {
             "loss": float(test_loss),
             "global_pcc": float(global_pcc) if np.isfinite(global_pcc) else float("nan"),
             "global_scc": float(global_scc) if np.isfinite(global_scc) else float("nan"),
@@ -1118,6 +1432,7 @@ class DrugRespRunner:
             "n_test_pairs": int(preds_np.shape[0]),
             "n_test_cell_lines": len(cell_pccs),
         }
+        return row
 
     # ------------------------------------------------------------------
     # Results writing
@@ -1132,7 +1447,7 @@ class DrugRespRunner:
         train_metrics: dict,
         test_metrics: dict,
     ) -> dict:
-        return {
+        row = {
             "model": model_key,
             "fold": fold,
             "n_folds": n_folds,
@@ -1147,6 +1462,10 @@ class DrugRespRunner:
             "n_test_pairs": int(test_metrics["n_test_pairs"]),
             "n_test_cell_lines": int(test_metrics["n_test_cell_lines"]),
         }
+        for field in ("pca_components", "cell_embedding_dim", "pair_feature_dim"):
+            if field in test_metrics:
+                row[field] = int(test_metrics[field])
+        return row
 
     def _per_cell_line_rows(
         self,
@@ -1213,7 +1532,11 @@ class DrugRespRunner:
             )
             drug_emb_dim = drug_emb_matrix.shape[1]
             n_pairs = len(ic50_values)
-            splits = self._build_cv_splits(n_pairs)
+            splits = self._build_or_load_cv_splits(
+                pair_cell_ids,
+                self._pair_drug_ids,
+                ic50_values,
+            )
             fold_hvg_indices = [
                 self._select_training_hvg_indices(X_cell, cell_idxs[train_idx])
                 for train_idx, _ in splits
@@ -1236,6 +1559,7 @@ class DrugRespRunner:
             for model_key, checkpoint_path in checkpoint_paths.items():
                 fold_rows: list[dict] = []
                 cell_line_rows: list[dict] = []
+                curve_rows: list[dict] = []
 
                 for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
                     seed_all(
@@ -1268,15 +1592,46 @@ class DrugRespRunner:
                     self._build_optimization()
 
                     last_train_metrics = {"loss": float("nan")}
+                    last_validation_metrics: dict | None = None
                     for epoch in range(1, epochs + 1):
                         last_train_metrics = self._train_one_epoch(epoch)
+                        last_validation_metrics = self._evaluate(test_pair_cell_ids)
                         if self.is_master:
+                            curve_rows.append(
+                                {
+                                    "model": model_key,
+                                    "fold": fold_idx,
+                                    "epoch": epoch,
+                                    "finetune_mode": self._finetune_mode(),
+                                    "train_loss": last_train_metrics["loss"],
+                                    "validation_loss": last_validation_metrics["loss"],
+                                    "validation_global_pcc": last_validation_metrics["global_pcc"],
+                                    "validation_global_scc": last_validation_metrics["global_scc"],
+                                    "learning_rates": ";".join(
+                                        f"{float(group['lr']):.6g}"
+                                        for group in self.optimizer.param_groups
+                                    ),
+                                    "optimizer_updates": self.scheduler.completed_updates,
+                                }
+                            )
+                            self._write_csv(
+                                self._task_output_dir()
+                                / f"{self._output_prefix()}_{model_key}_training_curves.csv",
+                                curve_rows,
+                            )
                             log.info(
-                                "Model %s | Fold %d/%d | Epoch %d | Train Loss: %.6f",
-                                model_key, fold_idx, len(splits), epoch, last_train_metrics["loss"],
+                                "Model %s | Fold %d/%d | Epoch %d | "
+                                "Train Loss: %.6f | Validation Loss: %.6f",
+                                model_key, fold_idx, len(splits), epoch,
+                                last_train_metrics["loss"],
+                                last_validation_metrics["loss"],
                             )
 
-                    test_metrics = self._evaluate(test_pair_cell_ids)
+                    test_metrics = (
+                        last_validation_metrics
+                        if last_validation_metrics is not None
+                        else self._evaluate(test_pair_cell_ids)
+                    )
                     if self.is_master:
                         log.info(
                             "Model %s | Fold %d/%d | "
@@ -1308,9 +1663,9 @@ class DrugRespRunner:
                 out_dir = self._task_output_dir()
                 output_path = out_dir / f"{self._output_prefix()}_evaluation_metrics.csv"
                 self._write_csv(output_path, aggregate_rows, comment=getattr(self, "_missing_genes_note", ""))
+                complete_run_metadata(self._run_metadata_path, output_path)
                 return {"results_path": str(output_path), "results": aggregate_rows}
             return {}
         finally:
             if self.is_distributed and dist.is_initialized():
-                dist.barrier()
                 dist.destroy_process_group()
