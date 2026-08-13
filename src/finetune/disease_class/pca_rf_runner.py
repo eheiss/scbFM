@@ -25,6 +25,9 @@ class DiseaseClassPCARFRunner(CancTypeClassPCARFRunner):
     def _load_input_adata(self):
         return DiseaseClassRunner._load_input_adata(self)
 
+    def _read_disignatlas(self, data_path):
+        return DiseaseClassRunner._read_disignatlas(self, data_path)
+
     def _load_disignatlas(self):
         return DiseaseClassRunner._load_disignatlas(self)
 

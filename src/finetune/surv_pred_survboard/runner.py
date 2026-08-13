@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -14,7 +15,6 @@ import anndata as ad
 import hydra
 import numpy as np
 import pandas as pd
-import scanpy as sc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -28,6 +28,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import (
+    CancTypeClassRunner,
+    GroupedCosineWarmupUpdateScheduler,
     _quantile_bin_expression,
     _set_finetune_training_mode,
 )
@@ -52,122 +54,6 @@ TASK_NAME = "surv_pred_survboard"
 CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 RANDOM_INIT_MODEL_KEY = "random_init"
 MODEL_KEYS = (*CHECKPOINT_MODEL_KEYS, RANDOM_INIT_MODEL_KEY)
-
-
-# ---------------------------------------------------------------------------
-# Scheduler (mirrors canc_type_class runner exactly)
-# ---------------------------------------------------------------------------
-
-class GroupedCosineAnnealingWarmupRestarts:
-    """Cosine warmup scheduler that preserves per-parameter-group max LRs."""
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        first_cycle_steps: int,
-        max_lrs: list[float],
-        min_lr_ratio: float,
-        cycle_mult: float = 1.0,
-        warmup_steps: int = 0,
-        gamma: float = 1.0,
-    ) -> None:
-        if warmup_steps >= first_cycle_steps:
-            raise ValueError("warmup_steps must be smaller than first_cycle_steps.")
-        if len(max_lrs) != len(optimizer.param_groups):
-            raise ValueError("max_lrs must match optimizer.param_groups.")
-
-        self.optimizer = optimizer
-        self.first_cycle_steps = first_cycle_steps
-        self.cycle_mult = cycle_mult
-        self.base_max_lrs = [float(lr) for lr in max_lrs]
-        self.max_lrs = list(self.base_max_lrs)
-        self.min_lrs = [float(lr) * float(min_lr_ratio) for lr in self.base_max_lrs]
-        self.warmup_steps = warmup_steps
-        self.gamma = gamma
-        self.cur_cycle_steps = first_cycle_steps
-        self.cycle = 0
-        self.step_in_cycle = -1
-        self.last_epoch = -1
-        self._set_lrs(self.min_lrs)
-
-    def _set_lrs(self, lrs: list[float]) -> None:
-        for param_group, lr in zip(self.optimizer.param_groups, lrs):
-            param_group["lr"] = lr
-
-    def get_lr(self) -> list[float]:
-        if self.step_in_cycle == -1:
-            return self.min_lrs
-        if self.step_in_cycle < self.warmup_steps:
-            return [
-                min_lr + (max_lr - min_lr) * self.step_in_cycle / self.warmup_steps
-                for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-            ]
-        return [
-            min_lr
-            + (max_lr - min_lr)
-            * (
-                1
-                + math.cos(
-                    math.pi
-                    * (self.step_in_cycle - self.warmup_steps)
-                    / (self.cur_cycle_steps - self.warmup_steps)
-                )
-            )
-            / 2
-            for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-        ]
-
-    def step(self, epoch: int | None = None) -> None:
-        if epoch is None:
-            epoch = self.last_epoch + 1
-            self.step_in_cycle += 1
-            if self.step_in_cycle >= self.cur_cycle_steps:
-                self.cycle += 1
-                self.step_in_cycle -= self.cur_cycle_steps
-                self.cur_cycle_steps = int(
-                    (self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult
-                ) + self.warmup_steps
-        else:
-            if epoch >= self.first_cycle_steps:
-                if self.cycle_mult == 1.0:
-                    self.step_in_cycle = epoch % self.first_cycle_steps
-                    self.cycle = epoch // self.first_cycle_steps
-                else:
-                    self.cycle = int(
-                        math.log(
-                            epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1,
-                            self.cycle_mult,
-                        )
-                    )
-                    self.step_in_cycle = epoch - int(
-                        self.first_cycle_steps * (self.cycle_mult**self.cycle - 1)
-                        / (self.cycle_mult - 1)
-                    )
-                    self.cur_cycle_steps = (
-                        self.first_cycle_steps * self.cycle_mult**self.cycle
-                    )
-            else:
-                self.cur_cycle_steps = self.first_cycle_steps
-                self.step_in_cycle = epoch
-
-        self.max_lrs = [lr * (self.gamma**self.cycle) for lr in self.base_max_lrs]
-        self.last_epoch = math.floor(epoch)
-        self._set_lrs(self.get_lr())
-
-    def state_dict(self) -> dict[str, object]:
-        return {
-            "first_cycle_steps": self.first_cycle_steps,
-            "cycle_mult": self.cycle_mult,
-            "base_max_lrs": self.base_max_lrs,
-            "max_lrs": self.max_lrs,
-            "min_lrs": self.min_lrs,
-            "warmup_steps": self.warmup_steps,
-            "gamma": self.gamma,
-            "cur_cycle_steps": self.cur_cycle_steps,
-            "cycle": self.cycle,
-            "step_in_cycle": self.step_in_cycle,
-            "last_epoch": self.last_epoch,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +185,28 @@ def cox_partial_log_likelihood(
     time: torch.Tensor,
     event: torch.Tensor,
 ) -> torch.Tensor:
-    """Breslow-approximation negative partial log-likelihood (batch-level Cox loss)."""
+    """Breslow negative partial log-likelihood over one effective update batch."""
     order = torch.argsort(time, descending=True)
     lh = log_hazard[order]
     e = event[order]
     n_events = e.sum().clamp(min=1.0)
     log_cumsum_exp = torch.logcumsumexp(lh, dim=0)
-    return -((lh - log_cumsum_exp) * e).sum() / n_events
+    _, tie_counts = torch.unique_consecutive(time[order], return_counts=True)
+    tie_ids = torch.repeat_interleave(
+        torch.arange(tie_counts.numel(), device=lh.device), tie_counts
+    )
+    event_log_hazard = torch.zeros(
+        tie_counts.numel(), dtype=lh.dtype, device=lh.device
+    ).scatter_add_(0, tie_ids, lh * e)
+    event_counts = torch.zeros(
+        tie_counts.numel(), dtype=lh.dtype, device=lh.device
+    ).scatter_add_(0, tie_ids, e)
+    risk_set_ends = torch.cumsum(tie_counts, dim=0) - 1
+    log_risk_sets = log_cumsum_exp[risk_set_ends]
+    partial_log_likelihood = (
+        event_log_hazard - event_counts * log_risk_sets
+    ).sum()
+    return -partial_log_likelihood / n_events
 
 
 def gather_cox_update_batch(
@@ -339,11 +240,28 @@ def antolini_concordance(
     time: np.ndarray,
     event: np.ndarray,
 ) -> float:
-    """Antolini's time-dependent concordance (exact match with SurvBoard leaderboard)."""
-    from pycox.evaluation import EvalSurv
-    surv_df = pd.DataFrame(survival_probs.T, index=time_points.astype(float))
-    ev = EvalSurv(surv_df, time, event, censor_surv="km", steps="post")
-    return float(ev.concordance_td())
+    """Antolini's time-dependent concordance for right-continuous curves."""
+    survival_probs = np.asarray(survival_probs, dtype=float)
+    time_points = np.asarray(time_points, dtype=float)
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event, dtype=bool)
+    concordant = 0.0
+    comparable = 0
+    for i in np.flatnonzero(event):
+        later = time > time[i]
+        if not np.any(later):
+            continue
+        column = np.searchsorted(time_points, time[i], side="right") - 1
+        patient_survival = 1.0 if column < 0 else survival_probs[i, column]
+        comparator_survival = (
+            np.ones(int(later.sum()), dtype=float)
+            if column < 0
+            else survival_probs[later, column]
+        )
+        concordant += float(np.sum(patient_survival < comparator_survival))
+        concordant += 0.5 * float(np.sum(patient_survival == comparator_survival))
+        comparable += int(later.sum())
+    return float(concordant / comparable) if comparable else float("nan")
 
 
 def harrell_c_index(
@@ -401,6 +319,69 @@ def _step_survival_at(
     return out
 
 
+def _step_survival_before(
+    query_times: np.ndarray,
+    step_times: np.ndarray,
+    step_survival: np.ndarray,
+) -> np.ndarray:
+    query_times = np.asarray(query_times, dtype=float)
+    if len(step_times) == 0:
+        return np.ones_like(query_times, dtype=float)
+    idx = np.searchsorted(step_times, query_times, side="left") - 1
+    out = np.ones_like(query_times, dtype=float)
+    valid = idx >= 0
+    out[valid] = step_survival[np.clip(idx[valid], 0, len(step_survival) - 1)]
+    return out
+
+
+def integrated_brier_score(
+    survival_probs: np.ndarray,
+    time_points: np.ndarray,
+    time: np.ndarray,
+    event: np.ndarray,
+    evaluation_grid: np.ndarray,
+    eps: float = 1e-8,
+) -> float:
+    """IPCW integrated Brier score using the held-out censoring KM curve."""
+    survival_probs = np.asarray(survival_probs, dtype=float)
+    time_points = np.asarray(time_points, dtype=float)
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event, dtype=bool)
+    evaluation_grid = np.asarray(evaluation_grid, dtype=float)
+    if evaluation_grid.size < 2:
+        return float("nan")
+
+    censor_times, censor_surv = _km_survival(time, ~event)
+    g_before_event = np.clip(
+        _step_survival_before(time, censor_times, censor_surv), eps, None
+    )
+    scores = []
+    for evaluation_time in evaluation_grid:
+        column = np.searchsorted(time_points, evaluation_time, side="right") - 1
+        predicted = (
+            np.ones(len(time), dtype=float)
+            if column < 0
+            else survival_probs[:, column]
+        )
+        g_at_time = max(
+            float(
+                _step_survival_at(
+                    np.asarray([evaluation_time]), censor_times, censor_surv
+                )[0]
+            ),
+            eps,
+        )
+        observed_before = (time <= evaluation_time) & event
+        still_observed = time > evaluation_time
+        score = np.zeros(len(time), dtype=float)
+        score[observed_before] = (
+            predicted[observed_before] ** 2 / g_before_event[observed_before]
+        )
+        score[still_observed] = (1.0 - predicted[still_observed]) ** 2 / g_at_time
+        scores.append(float(np.mean(score)))
+    return float(np.trapz(scores, evaluation_grid) / np.ptp(evaluation_grid))
+
+
 def ipcw_weighted_c_index(
     risk: np.ndarray,
     time: np.ndarray,
@@ -455,7 +436,7 @@ def d_calibration(
     time_points: np.ndarray,
     time: np.ndarray,
     event: np.ndarray,
-    n_bins: int = 10,
+    n_bins: int = 5,
 ) -> tuple[float, float]:
     """D-calibration chi-square statistic and p-value.
 
@@ -469,19 +450,19 @@ def d_calibration(
     counts = np.zeros(n_bins, dtype=float)
 
     for s, is_event in zip(s_obs, event):
+        s = float(np.clip(s, np.finfo(float).eps, 1.0))
         if is_event:
-            bin_idx = min(np.searchsorted(edges, s, side="right") - 1, n_bins - 1)
+            bin_idx = min(int(np.floor(s * n_bins)), n_bins - 1)
             counts[max(bin_idx, 0)] += 1.0
             continue
 
-        if s <= 0:
-            continue
-        # Conditional on surviving past censoring, S(T) is uniform on [0, S(C)].
-        for b in range(n_bins):
-            lo, hi = edges[b], edges[b + 1]
-            overlap = max(0.0, min(hi, s) - lo)
-            if overlap > 0:
-                counts[b] += overlap / s
+        # Exact censored-sample allocation used in SurvBoard's D-calibration
+        # implementation: partial mass in the current bin and equal mass in
+        # every lower-probability bin.
+        bin_idx = min(int(np.floor(s * n_bins)), n_bins - 1)
+        counts[bin_idx] += 1.0 - (bin_idx / n_bins) / s
+        if bin_idx > 0:
+            counts[:bin_idx] += 1.0 / (n_bins * s)
 
     expected = len(time) / n_bins
     if expected <= 0:
@@ -501,21 +482,21 @@ def survival_metrics(
     train_event: np.ndarray,
 ) -> dict[str, float]:
     """Compute SurvBoard and BulkRNABert-style survival metrics."""
-    from pycox.evaluation import EvalSurv
+    antolini = antolini_concordance(
+        survival_probs, time_points, test_time, test_event
+    )
 
-    surv_df = pd.DataFrame(survival_probs.T, index=time_points.astype(float))
-    ev = EvalSurv(surv_df, test_time, test_event, censor_surv="km", steps="post")
-    antolini = float(ev.concordance_td())
-
-    brier_grid = time_points[
-        (time_points > np.min(test_time)) & (time_points < np.max(test_time))
-    ].astype(float)
-    if brier_grid.size >= 2:
-        try:
-            ibs = float(ev.integrated_brier_score(brier_grid))
-        except Exception as exc:  # pragma: no cover - depends on pycox internals/data.
-            log.warning("Could not compute integrated Brier score: %s", exc)
-            ibs = float("nan")
+    min_test_time = float(np.min(test_time))
+    max_test_time = float(np.max(test_time))
+    brier_grid = np.linspace(min_test_time, max_test_time, int(100))
+    if max_test_time > min_test_time:
+        ibs = integrated_brier_score(
+            survival_probs,
+            time_points,
+            test_time,
+            test_event,
+            brier_grid,
+        )
     else:
         ibs = float("nan")
 
@@ -663,7 +644,10 @@ class SurvPredSurvBoardRunner:
         return f"{self._finetune_mode()}_{suffix}" if suffix else self._finetune_mode()
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / TASK_NAME / self._output_variant()
+        cancer = str(getattr(self.task_cfg, "cancer", "")).strip().upper()
+        if not cancer:
+            return ROOT / "output" / TASK_NAME / self._output_variant()
+        return ROOT / "output" / TASK_NAME / cancer / self._output_variant()
 
     def _output_prefix(self) -> str:
         return f"{TASK_NAME}_{self._output_variant()}"
@@ -766,6 +750,21 @@ class SurvPredSurvBoardRunner:
                 "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "cancer": str(getattr(self.task_cfg, "cancer", "")),
                 "project": str(getattr(self.task_cfg, "project", "TCGA")),
+                "evaluation_protocol": "survboard_repeated_five_fold_cross_validation",
+                "cv_folds": 5,
+                "cv_repetitions": 5,
+                "n_outer_splits": int(
+                    getattr(self.task_cfg, "expected_outer_splits", 25)
+                ),
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
+                "survboard_split_fingerprint": str(
+                    getattr(self, "_survboard_split_fingerprint", "")
+                ),
             },
             checkpoint_paths=checkpoint_paths,
             repo_dir=ROOT / "scbFM",
@@ -806,9 +805,17 @@ class SurvPredSurvBoardRunner:
                 "finetune.surv_pred_survboard.pretrained_model_paths must define "
                 f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
+        requested = getattr(self.task_cfg, "model_keys", None)
+        model_keys = MODEL_KEYS if requested is None else tuple(map(str, requested))
+        invalid = sorted(set(model_keys).difference(MODEL_KEYS))
+        if invalid:
+            raise ValueError(f"Unknown survival model_keys: {invalid}.")
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
+        for key in model_keys:
+            if key == RANDOM_INIT_MODEL_KEY:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(
@@ -820,7 +827,6 @@ class SurvPredSurvBoardRunner:
             raise ValueError(
                 f"Missing checkpoint paths in finetune.surv_pred_survboard.pretrained_model_paths: {missing}"
             )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     # ------------------------------------------------------------------
@@ -894,6 +900,14 @@ class SurvPredSurvBoardRunner:
             )
 
         X = df[mapped_cols].values.astype(np.float32)
+        if not np.all(np.isfinite(X)):
+            raise ValueError("SurvBoard GEX contains non-finite expression values.")
+        if bool(getattr(self.task_cfg, "convert_log2_to_log1p", True)):
+            # SurvBoard publishes log2(1 + x); the shared benchmark input is
+            # natural-log1p. Multiplication by ln(2) converts between them.
+            X *= np.float32(np.log(2.0))
+            if self.is_master:
+                log.info("Converted SurvBoard GEX from log2(1+x) to ln(1+x).")
         adata = ad.AnnData(X=X)
         adata.var_names = mapped_ensg
 
@@ -968,10 +982,19 @@ class SurvPredSurvBoardRunner:
             if not p.exists():
                 raise FileNotFoundError(f"SurvBoard split file not found: {p}")
 
-        train_df = pd.read_csv(train_path, header=None)
-        test_df = pd.read_csv(test_path, header=None)
+        # The published SurvBoard split files were written with pandas column
+        # headers and are read with the default header handling in the paper's
+        # evaluation code. Treating the header as a split shifts all 25 folds.
+        train_df = pd.read_csv(train_path)
+        test_df = pd.read_csv(test_path)
+        expected_splits = int(getattr(self.task_cfg, "expected_outer_splits", 25))
+        if len(train_df) != expected_splits or len(test_df) != expected_splits:
+            raise ValueError(
+                "SurvBoard split files must contain "
+                f"{expected_splits} rows; got train={len(train_df)}, test={len(test_df)}."
+            )
 
-        outer_splits = list(getattr(self.task_cfg, "outer_splits", list(range(len(train_df)))))
+        outer_splits = list(range(len(train_df)))
         train_splits, test_splits = [], []
         for s in outer_splits:
             if s >= len(train_df):
@@ -987,53 +1010,24 @@ class SurvPredSurvBoardRunner:
             train_splits.append(train_ix)
             test_splits.append(test_ix)
 
+        fingerprint_payload = "\n".join(
+            f"{split_id}\t{','.join(map(str, train_ix))}\t{','.join(map(str, test_ix))}"
+            for split_id, train_ix, test_ix in zip(
+                outer_splits, train_splits, test_splits
+            )
+        )
+        self._survboard_split_fingerprint = hashlib.sha256(
+            fingerprint_payload.encode("utf-8")
+        ).hexdigest()
+
         return train_splits, test_splits
 
     def _select_training_hvg_indices(self, train_adata: ad.AnnData) -> np.ndarray:
-        """Fit the 1,199-gene input vocabulary on the training split only."""
-        if train_adata.n_vars < self.selected_gene_count:
-            raise ValueError(
-                f"Cannot select {self.selected_gene_count} HVGs from "
-                f"only {train_adata.n_vars} genes."
-            )
-        batch_key = getattr(self.task_cfg, "hvg_batch_key", None)
-        if batch_key is not None:
-            batch_key = str(batch_key).strip() or None
-        if batch_key is not None and batch_key not in train_adata.obs:
-            raise ValueError(f"HVG batch key '{batch_key}' is not present in adata.obs.")
+        """Fit the shared training-fold MAD gene vocabulary."""
+        return CancTypeClassRunner._select_training_hvg_indices(self, train_adata)
 
-        hvg_stats = sc.pp.highly_variable_genes(
-            train_adata,
-            n_top_genes=self.selected_gene_count,
-            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            batch_key=batch_key,
-            inplace=False,
-        )
-        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
-        if selected.size > self.selected_gene_count:
-            ranking_column = (
-                "highly_variable_rank"
-                if "highly_variable_rank" in hvg_stats
-                else "dispersions_norm"
-            )
-            scores = hvg_stats[ranking_column].to_numpy()[selected]
-            if ranking_column == "highly_variable_rank":
-                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
-            else:
-                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
-            selected = selected[order[: self.selected_gene_count]]
-        if selected.size != self.selected_gene_count:
-            raise RuntimeError(
-                f"Scanpy selected {selected.size} HVGs; "
-                f"expected exactly {self.selected_gene_count}."
-            )
-        log.info(
-            "Selected %d training-split HVGs with flavor=%s, batch_key=%s",
-            selected.size,
-            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            batch_key,
-        )
-        return selected.astype(np.int64, copy=False)
+    def _select_training_mad_indices(self, train_adata: ad.AnnData) -> np.ndarray:
+        return CancTypeClassRunner._select_training_mad_indices(self, train_adata)
 
     def _build_loaders(
         self,
@@ -1305,15 +1299,22 @@ class SurvPredSurvBoardRunner:
             else min_lr / max(head_learning_rate, 1e-12)
         )
 
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        epochs = int(getattr(self.task_cfg, "epochs", 20))
+        warmup_epochs = int(getattr(self.task_cfg, "warmup_epochs", 2))
+
         self.optimizer = Adam(param_groups)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 30)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
         )
 
         if self.is_master:
@@ -1407,6 +1408,7 @@ class SurvPredSurvBoardRunner:
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
+                self.scheduler.step()
                 self.optimizer.step()
                 self.model.zero_grad(set_to_none=True)
                 event_count = float(update_event.sum().item())
@@ -1420,7 +1422,6 @@ class SurvPredSurvBoardRunner:
             raise ValueError("A survival training epoch contained no observed events.")
         epoch_loss = running_loss_numerator / running_event_count
 
-        self.scheduler.step()
         return {"loss": epoch_loss}
 
     # ------------------------------------------------------------------
@@ -1499,7 +1500,9 @@ class SurvPredSurvBoardRunner:
         prefix = self._output_prefix()
         self._write_csv(out_dir / f"{prefix}_{model_key}_fold_metrics.csv", fold_rows)
         self._write_csv(out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv", [aggregate], comment=getattr(self, "_missing_genes_note", ""))
-        self._write_csv(out_dir / f"{prefix}_{model_key}_curves.csv", curves_rows)
+        self._write_csv(
+            out_dir / f"{prefix}_{model_key}_training_curves.csv", curves_rows
+        )
         return aggregate
 
     def _save_survboard_predictions(
@@ -1646,7 +1649,7 @@ class SurvPredSurvBoardRunner:
                             )
                             self._write_csv(
                                 self._task_output_dir()
-                                / f"{self._output_prefix()}_{model_key}_curves.csv",
+                                / f"{self._output_prefix()}_{model_key}_training_curves.csv",
                                 curves_rows,
                             )
 
@@ -1664,11 +1667,18 @@ class SurvPredSurvBoardRunner:
                         breslow = BreslowEstimator()
                         breslow.fit(train_lh, train_times, train_events)
                         event_times = np.unique(train_times[train_events.astype(bool)])
-                        survival_probs = breslow.predict_survival(test_lh, event_times)
+                        evaluation_times = np.unique(
+                            np.concatenate(
+                                (event_times, [np.min(test_times), np.max(test_times)])
+                            )
+                        )
+                        survival_probs = breslow.predict_survival(
+                            test_lh, evaluation_times
+                        )
 
                         test_metrics = survival_metrics(
                             survival_probs=survival_probs,
-                            time_points=event_times,
+                            time_points=evaluation_times,
                             test_time=test_times,
                             test_event=test_events,
                             test_log_hazard=test_lh,
@@ -1701,7 +1711,7 @@ class SurvPredSurvBoardRunner:
 
                         # SurvBoard-style output
                         self._save_survboard_predictions(
-                            model_key, split_idx, survival_probs, event_times
+                            model_key, split_idx, survival_probs, evaluation_times
                         )
 
                     self._cleanup_fold_state()

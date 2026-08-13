@@ -151,11 +151,13 @@ class DrugRespBulkFormerPCARFRunner(DrugRespPCARFRunner):
         max_expected = float(
             getattr(self.task_cfg, "bulkformer_max_expected_expression", 30.0)
         )
-        if expression_min < 0 or expression_max > max_expected:
+        max_observed_magnitude = max(abs(expression_min), abs(expression_max))
+        if max_observed_magnitude > max_expected:
             raise ValueError(
-                "BulkFormer expects non-negative normalized GDSC expression, but observed "
+                "BulkFormer expects normalized GDSC expression with bounded magnitude, but "
+                "observed "
                 f"range is [{expression_min:.6g}, {expression_max:.6g}] with configured "
-                f"maximum {max_expected:.6g}."
+                f"absolute limit {max_expected:.6g}."
             )
 
         gene_info = pd.read_csv(paths["gene_info"])
@@ -292,5 +294,4 @@ class DrugRespBulkFormerPCARFRunner(DrugRespPCARFRunner):
             return {"results_path": str(output_path), "results": [aggregate]}
         finally:
             if self.is_distributed and dist.is_initialized():
-                dist.barrier()
                 dist.destroy_process_group()

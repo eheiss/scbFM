@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 
 import anndata as ad
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.raw_mlp_runner import solve_hidden_dim
-from finetune.canc_type_class.runner import GroupedCosineAnnealingWarmupRestarts
+from finetune.canc_type_class.runner import GroupedCosineWarmupUpdateScheduler
 from finetune.deconv.runner import DeconvRunner
 from finetune.training_correctness import (
     is_accumulation_boundary,
@@ -115,7 +116,7 @@ class DeconvRawMLPRunner(DeconvRunner):
         if feature_mode == "all_genes":
             return np.arange(train_adata.n_vars, dtype=np.int64)
         if feature_mode == "hvg1199":
-            return self._select_training_hvg_indices(train_adata)
+            return self._select_distributed_training_hvg_indices(train_adata)
         raise ValueError("raw_mlp_feature_mode must be one of: all_genes, hvg1199.")
 
     def _build_loaders(self, train_adata, test_adata, train_targets, test_targets) -> None:
@@ -134,15 +135,18 @@ class DeconvRawMLPRunner(DeconvRunner):
             )
 
         self.raw_feature_indices = self._select_raw_feature_indices(train_adata)
+        local_feature_indices = np.arange(len(self.raw_feature_indices), dtype=np.int64)
+        train_expression = train_adata.X[:, self.raw_feature_indices].copy()
+        test_expression = test_adata.X[:, self.raw_feature_indices].copy()
         if bool(getattr(self.task_cfg, "raw_mlp_standardize", True)):
-            mean, std = self._feature_mean_std(train_adata.X, self.raw_feature_indices)
+            mean, std = self._feature_mean_std(train_expression, local_feature_indices)
         else:
             mean, std = None, None
 
         train_target_sums = train_targets.sum(axis=1, keepdims=True)
         self.fold_train_target_mean = np.mean(train_targets / train_target_sums, axis=0)
-        train_dataset = RawDeconvDataset(train_adata.X, train_targets, self.raw_feature_indices, mean, std)
-        test_dataset = RawDeconvDataset(test_adata.X, test_targets, self.raw_feature_indices, mean, std)
+        train_dataset = RawDeconvDataset(train_expression, train_targets, local_feature_indices, mean, std)
+        test_dataset = RawDeconvDataset(test_expression, test_targets, local_feature_indices, mean, std)
         self.test_dataset_size = len(test_dataset)
 
         if self.is_distributed:
@@ -179,14 +183,18 @@ class DeconvRawMLPRunner(DeconvRunner):
         self.optimizer = Adam([{"params": params, "lr": lr, "name": "raw_mlp"}])
         min_lr = float(getattr(self.task_cfg, "min_lr", 1e-6))
         min_lr_ratio = min_lr / max(lr, 1e-12)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 20)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=[lr],
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=int(getattr(self.task_cfg, "epochs", 20)),
+            warmup_epochs=int(getattr(self.task_cfg, "warmup_epochs", 2)),
         )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:
@@ -235,6 +243,7 @@ class DeconvRawMLPRunner(DeconvRunner):
                 )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), float(getattr(self.task_cfg, "max_grad_norm", 1e6)))
                 self.optimizer.step()
+                self.scheduler.step()
                 self.model.zero_grad(set_to_none=True)
                 accumulated_normalizer = 0.0
             running_loss_numerator += float(loss_sum.detach().item())
@@ -247,7 +256,6 @@ class DeconvRawMLPRunner(DeconvRunner):
         if self.is_distributed:
             dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
         epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
-        self.scheduler.step()
         return {"loss": epoch_loss}
 
     def _evaluate(self) -> dict:

@@ -394,10 +394,200 @@ class DrugRespRunner:
                 )
                 * int(getattr(self.task_cfg, "grad_accumulation_steps", 4))
                 * int(self.world_size),
+                "resume_completed_models": bool(
+                    getattr(self.task_cfg, "resume_completed_models", False)
+                ),
+                "reused_completed_models": list(
+                    getattr(self, "_reused_completed_models", [])
+                ),
             },
             checkpoint_paths=checkpoint_paths,
             repo_dir=ROOT / "scbFM",
         )
+
+    @staticmethod
+    def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(
+                csv.DictReader(line for line in handle if not line.startswith("#"))
+            )
+
+    def _load_completed_model_results(
+        self,
+        checkpoint_paths: dict[str, str],
+    ) -> dict[str, dict[str, str]]:
+        if not bool(getattr(self.task_cfg, "resume_completed_models", False)):
+            return {}
+
+        out_dir = self._task_output_dir()
+        prefix = self._output_prefix()
+        completed_candidates = {
+            model_key: out_dir / f"{prefix}_{model_key}_evaluation_metrics.csv"
+            for model_key in checkpoint_paths
+        }
+        completed_candidates = {
+            model_key: path
+            for model_key, path in completed_candidates.items()
+            if path.is_file()
+        }
+        if not completed_candidates:
+            return {}
+
+        metadata_path = out_dir / f"{prefix}_run_metadata.json"
+        if not metadata_path.is_file():
+            raise ValueError(
+                "Cannot resume drug response: completed model outputs exist without "
+                f"run metadata at {metadata_path}."
+            )
+        with metadata_path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+        config_path = out_dir / f"{prefix}_config.yaml"
+        if not config_path.is_file():
+            raise ValueError(
+                "Cannot resume drug response: completed model outputs exist without "
+                f"the resolved run config at {config_path}."
+            )
+        previous_cfg = OmegaConf.load(config_path)
+        previous_task_cfg = previous_cfg.finetune.drug_resp
+        previous_model_cfg = previous_cfg.pretrain
+
+        expected_metadata = {
+            "task": self.task_name,
+            "finetune_mode": self._finetune_mode(),
+            "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+            "cv_fold_fingerprint": str(self._cv_fold_fingerprint),
+            "epochs": int(getattr(self.task_cfg, "epochs", 20)),
+            "warmup_epochs": int(getattr(self.task_cfg, "warmup_epochs", 2)),
+            "batch_size_per_gpu": int(getattr(self.task_cfg, "batch_size", 4)),
+            "gradient_accumulation_steps": int(
+                getattr(self.task_cfg, "grad_accumulation_steps", 4)
+            ),
+            "world_size": int(self.world_size),
+        }
+        mismatches = {
+            field: {"expected": expected, "observed": metadata.get(field)}
+            for field, expected in expected_metadata.items()
+            if metadata.get(field) != expected
+        }
+        previous_checkpoints = metadata.get("checkpoint_paths", {})
+        for model_key in completed_candidates:
+            expected_path = str(checkpoint_paths[model_key])
+            observed_path = str(previous_checkpoints.get(model_key, ""))
+            if observed_path != expected_path:
+                mismatches[f"checkpoint_paths.{model_key}"] = {
+                    "expected": expected_path,
+                    "observed": observed_path,
+                }
+        task_config_fields = (
+            "expression_data_path",
+            "ic50_data_path",
+            "drug_features_path",
+            "gene_list_path",
+            "preprocess",
+            "hvg_selection_method",
+            "random_seed",
+            "burn_in_epochs",
+            "adapter_bottleneck_dim",
+            "adapter_dropout",
+            "adapter_learning_rate",
+            "adapter_after_attention",
+            "adapter_after_ff",
+            "head_hidden_dim",
+            "head_bottleneck_dim",
+            "head_learning_rate",
+            "backbone_learning_rate",
+            "max_grad_norm",
+            "min_lr",
+            "min_lr_ratio",
+        )
+        model_config_fields = (
+            "gene_num",
+            "selected_gene_count",
+            "max_seq_len",
+            "bin_num",
+            "embsize",
+            "nlayers",
+            "nheads",
+            "d_hid",
+            "dropout",
+            "value_encoder_max_value",
+        )
+        for field in task_config_fields:
+            expected = getattr(self.task_cfg, field, None)
+            observed = getattr(previous_task_cfg, field, None)
+            if observed != expected:
+                mismatches[f"finetune.drug_resp.{field}"] = {
+                    "expected": expected,
+                    "observed": observed,
+                }
+        for field in model_config_fields:
+            expected = getattr(self.model_cfg, field, None)
+            observed = getattr(previous_model_cfg, field, None)
+            if observed != expected:
+                mismatches[f"pretrain.{field}"] = {
+                    "expected": expected,
+                    "observed": observed,
+                }
+        if mismatches:
+            raise ValueError(
+                "Cannot resume drug response because the interrupted run is not "
+                f"benchmark-compatible with this run: {mismatches}"
+            )
+
+        expected_folds = {str(fold) for fold in range(1, expected_metadata["cv_folds"] + 1)}
+        expected_epoch_pairs = {
+            (str(fold), str(epoch))
+            for fold in range(1, expected_metadata["cv_folds"] + 1)
+            for epoch in range(1, expected_metadata["epochs"] + 1)
+        }
+        completed: dict[str, dict[str, str]] = {}
+        for model_key, evaluation_path in completed_candidates.items():
+            artifact_paths = {
+                "evaluation": evaluation_path,
+                "fold": out_dir / f"{prefix}_{model_key}_fold_metrics.csv",
+                "cell_line": out_dir / f"{prefix}_{model_key}_cell_line_metrics.csv",
+                "curve": out_dir / f"{prefix}_{model_key}_training_curves.csv",
+            }
+            missing = [name for name, path in artifact_paths.items() if not path.is_file()]
+            if missing:
+                raise ValueError(
+                    f"Cannot reuse completed model {model_key!r}; missing artifacts: {missing}"
+                )
+            rows = {
+                name: self._read_csv_rows(path)
+                for name, path in artifact_paths.items()
+            }
+            if len(rows["evaluation"]) != 1:
+                raise ValueError(
+                    f"Completed model {model_key!r} must have one aggregate row."
+                )
+            if {row.get("fold") for row in rows["fold"]} != expected_folds:
+                raise ValueError(
+                    f"Completed model {model_key!r} does not contain all CV folds."
+                )
+            observed_epoch_pairs = {
+                (row.get("fold", ""), row.get("epoch", ""))
+                for row in rows["curve"]
+            }
+            if observed_epoch_pairs != expected_epoch_pairs:
+                raise ValueError(
+                    f"Completed model {model_key!r} does not contain every fold/epoch."
+                )
+            for artifact, artifact_rows in rows.items():
+                if not artifact_rows or any(
+                    row.get("model") != model_key for row in artifact_rows
+                ):
+                    raise ValueError(
+                        f"Completed model {model_key!r} has invalid {artifact} rows."
+                    )
+            aggregate = rows["evaluation"][0]
+            if aggregate.get("checkpoint_path", "") != str(checkpoint_paths[model_key]):
+                raise ValueError(
+                    f"Completed model {model_key!r} uses a different checkpoint."
+                )
+            completed[model_key] = aggregate
+        return completed
 
     @staticmethod
     def _aggregate_numeric_rows(rows: list[dict]) -> dict:
@@ -1542,6 +1732,18 @@ class DrugRespRunner:
                 for train_idx, _ in splits
             ]
             checkpoint_paths = self._get_checkpoint_paths()
+            if self.is_distributed:
+                dist.barrier()
+            completed_model_results = self._load_completed_model_results(
+                checkpoint_paths
+            )
+            if self.is_distributed:
+                dist.barrier()
+            self._reused_completed_models = [
+                model_key
+                for model_key in checkpoint_paths
+                if model_key in completed_model_results
+            ]
             self._save_run_metadata(checkpoint_paths)
 
             if self.is_master:
@@ -1554,9 +1756,22 @@ class DrugRespRunner:
                 )
 
             epochs = int(getattr(self.task_cfg, "epochs", 20))
-            aggregate_rows: list[dict] = []
+            aggregate_rows: list[dict] = [
+                completed_model_results[model_key]
+                for model_key in checkpoint_paths
+                if model_key in completed_model_results
+            ]
 
             for model_key, checkpoint_path in checkpoint_paths.items():
+                if model_key in completed_model_results:
+                    if self.is_master:
+                        log.info(
+                            "Reusing completed model %s after validating all resume artifacts.",
+                            model_key,
+                        )
+                    if self.is_distributed:
+                        dist.barrier()
+                    continue
                 fold_rows: list[dict] = []
                 cell_line_rows: list[dict] = []
                 curve_rows: list[dict] = []

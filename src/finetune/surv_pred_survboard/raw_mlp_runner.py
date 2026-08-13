@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -11,8 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.raw_mlp_runner import solve_hidden_dim
+from finetune.canc_type_class.runner import GroupedCosineWarmupUpdateScheduler
 from finetune.surv_pred_survboard.runner import (
-    GroupedCosineAnnealingWarmupRestarts,
     SurvPredSurvBoardRunner,
 )
 from utils import SequentialDistributedSampler
@@ -168,14 +170,18 @@ class SurvPredSurvBoardRawMLPRunner(SurvPredSurvBoardRunner):
         lr = float(getattr(self.task_cfg, "raw_mlp_learning_rate", 1e-4))
         self.optimizer = Adam([{"params": self.model.parameters(), "lr": lr, "name": "raw_mlp"}])
         min_lr = float(getattr(self.task_cfg, "min_lr", 1e-6))
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 30)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=[lr],
             min_lr_ratio=min_lr / max(lr, 1e-12),
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=int(getattr(self.task_cfg, "epochs", 20)),
+            warmup_epochs=int(getattr(self.task_cfg, "warmup_epochs", 2)),
         )
 
     def _maybe_enable_backbone_optimizer(self, epoch: int) -> None:

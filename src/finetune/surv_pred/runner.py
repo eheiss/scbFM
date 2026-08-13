@@ -9,23 +9,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
-from sklearn.model_selection import GroupKFold, StratifiedKFold
-
-try:
-    from sklearn.model_selection import StratifiedGroupKFold
-except ImportError:  # pragma: no cover - depends on sklearn version.
-    StratifiedGroupKFold = None
-
 from finetune.surv_pred_survboard.runner import (
-    CHECKPOINT_MODEL_KEYS,
-    RANDOM_INIT_MODEL_KEY,
     SurvPredSurvBoardRunner,
     cox_partial_log_likelihood,
     harrell_c_index,
     ipcw_weighted_c_index,
 )
+from finetune.canc_type_class.runner import CancTypeClassRunner
 from preprocess import reindex_adata_genes, validate_token_matrix
-from run_provenance import complete_run_metadata
+from run_provenance import complete_run_metadata, update_run_metadata
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +39,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
     """
 
     task_name = TASK_NAME
+    config_node = TASK_NAME
 
     @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
@@ -63,27 +56,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
         return f"{TASK_NAME}_{self._output_variant()}"
 
     def _get_checkpoint_paths(self) -> dict[str, str]:
-        paths_cfg = getattr(self.task_cfg, "pretrained_model_paths", None)
-        if paths_cfg is None:
-            raise ValueError(
-                "finetune.surv_pred.pretrained_model_paths must define "
-                f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
-            )
-
-        checkpoint_paths: dict[str, str] = {}
-        missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
-            value = paths_cfg.get(key)
-            if value:
-                checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
-            else:
-                missing.append(key)
-        if missing:
-            raise ValueError(
-                f"Missing checkpoint paths in finetune.surv_pred.pretrained_model_paths: {missing}"
-            )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
-        return checkpoint_paths
+        return super()._get_checkpoint_paths()
 
     @staticmethod
     def _numeric_obs(adata: ad.AnnData, column: str) -> np.ndarray:
@@ -129,7 +102,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
         times = self._numeric_obs(adata, str(getattr(self.task_cfg, "survival_time_col", "OS.time")))
         events = self._numeric_obs(adata, str(getattr(self.task_cfg, "survival_event_col", "OS")))
         valid = np.isfinite(times) & np.isfinite(events) & (times > 0)
-        if valid.sum() < int(getattr(self.task_cfg, "cv_folds", 5)) * 2:
+        if valid.sum() < 10:
             raise ValueError(f"Only {int(valid.sum())} TCGA samples have usable survival labels.")
 
         adata = adata[valid].copy()
@@ -175,37 +148,77 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
             )
         return adata, times, events, projects, groups
 
-    def _build_cv_splits(
+    def _survival_stratification_labels(
         self,
         events: np.ndarray,
         cohorts: np.ndarray,
-        groups: np.ndarray | None,
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
+    ) -> np.ndarray:
         n_splits = int(getattr(self.task_cfg, "cv_folds", 5))
         if n_splits < 2:
             raise ValueError("finetune.surv_pred.cv_folds must be at least 2.")
-        strat_labels = np.asarray([f"{cohort}_{int(event)}" for cohort, event in zip(cohorts, events)])
-        _, counts = np.unique(strat_labels, return_counts=True)
-        if counts.min() < n_splits:
-            strat_labels = events.astype(int)
 
-        if groups is not None:
-            if StratifiedGroupKFold is not None:
-                splitter = StratifiedGroupKFold(
-                    n_splits=n_splits,
-                    shuffle=True,
-                    random_state=int(getattr(self.task_cfg, "random_seed", 42)),
-                )
-                return list(splitter.split(np.zeros(len(events)), strat_labels, groups))
-            splitter = GroupKFold(n_splits=n_splits)
-            return list(splitter.split(np.zeros(len(events)), strat_labels, groups))
+        cohort_labels = np.asarray(cohorts).astype(str)
+        event_labels = (np.asarray(events) > 0).astype(np.int64).astype(str)
+        joint_labels = np.char.add(np.char.add(cohort_labels, "|"), event_labels)
+        _, joint_counts = np.unique(joint_labels, return_counts=True)
+        if joint_counts.min() >= n_splits:
+            return joint_labels
 
-        splitter = StratifiedKFold(
-            n_splits=n_splits,
-            shuffle=True,
-            random_state=int(getattr(self.task_cfg, "random_seed", 42)),
+        _, event_counts = np.unique(event_labels, return_counts=True)
+        if event_counts.min() < n_splits:
+            raise ValueError(
+                f"cv_folds={n_splits} is larger than the smallest event-status "
+                f"stratum ({int(event_counts.min())})."
+            )
+        log.warning(
+            "Some cohort/event strata contain fewer than %d samples; "
+            "falling back to event-status stratification.",
+            n_splits,
         )
-        return list(splitter.split(np.zeros(len(events)), strat_labels))
+        return event_labels
+
+    def _build_cv_splits(
+        self,
+        strat_labels: np.ndarray,
+        groups: np.ndarray | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        return CancTypeClassRunner._build_cv_splits(self, strat_labels, groups)
+
+    def _cv_manifest_source_rows(self, adata, labels, groups):
+        return CancTypeClassRunner._cv_manifest_source_rows(self, adata, labels, groups)
+
+    def _resolve_cv_fold_manifest_path(self, source_rows):
+        return CancTypeClassRunner._resolve_cv_fold_manifest_path(self, source_rows)
+
+    def _load_cv_fold_manifest(self, manifest_path, source_rows):
+        return CancTypeClassRunner._load_cv_fold_manifest(
+            self, manifest_path, source_rows
+        )
+
+    @staticmethod
+    def _fold_assignments_from_splits(n_samples, splits):
+        return CancTypeClassRunner._fold_assignments_from_splits(n_samples, splits)
+
+    def _build_or_load_cv_splits(self, adata, labels, groups=None):
+        return CancTypeClassRunner._build_or_load_cv_splits(
+            self, adata, labels, groups
+        )
+
+    def _save_run_metadata(self, checkpoint_paths: dict[str, str]) -> None:
+        super()._save_run_metadata(checkpoint_paths)
+        if self.is_master:
+            update_run_metadata(
+                self._run_metadata_path,
+                {
+                    "evaluation_protocol": "stratified_five_fold_cross_validation",
+                    "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+                    "cv_repetitions": None,
+                    "cv_repeats": None,
+                    "cv_test_size": None,
+                    "n_outer_splits": None,
+                    "survboard_split_fingerprint": None,
+                },
+            )
 
     @staticmethod
     def _cohort_c_index_metrics(
@@ -242,7 +255,10 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
         try:
             self._setup_runtime()
             adata, times, events, cohorts, groups = self._load_tcga_survival_data()
-            splits = self._build_cv_splits(events, cohorts, groups)
+            strat_labels = self._survival_stratification_labels(events, cohorts)
+            splits = self._build_or_load_cv_splits(
+                adata, strat_labels, groups
+            )
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
 
@@ -251,7 +267,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
 
             if self.is_master:
                 log.info(
-                    "BulkRNABert-style survival CV ready: samples=%d, folds=%d, epochs=%d",
+                    "BulkRNABert-style survival evaluation ready: samples=%d, folds=%d, epochs=%d",
                     adata.n_obs,
                     len(splits),
                     epochs,
@@ -322,7 +338,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
                             )
                             self._write_csv(
                                 self._task_output_dir()
-                                / f"{self._output_prefix()}_{model_key}_curves.csv",
+                                / f"{self._output_prefix()}_{model_key}_training_curves.csv",
                                 curves_rows,
                             )
 

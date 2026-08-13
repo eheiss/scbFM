@@ -19,7 +19,14 @@ from finetune.canc_type_class_33 import (
     CancTypeClass33Runner,
     CancTypeClass33ScGPTPCARFRunner,
 )
-from finetune.deconv import DeconvRawMLPRunner, DeconvRunner
+from finetune.deconv import (
+    DeconvBulkFormerPCARFRunner,
+    DeconvPCARFRunner,
+    DeconvRawMLPRunner,
+    DeconvRawPCARFRunner,
+    DeconvRunner,
+    DeconvScGPTPCARFRunner,
+)
 from finetune.disease_class import (
     DiseaseClassBulkFormerPCARFRunner,
     DiseaseClassPCARFRunner,
@@ -36,10 +43,38 @@ from finetune.drug_resp import (
     DrugRespRunner,
     DrugRespScGPTPCARFRunner,
 )
-from finetune.gene_essent import GeneEssentRawMLPRunner, GeneEssentRunner
-from finetune.surv_pred import SurvPredRawMLPRunner, SurvPredRunner
-from finetune.surv_pred_binary import SurvPredBinaryRawMLPRunner, SurvPredBinaryRunner
-from finetune.surv_pred_survboard import SurvPredSurvBoardRawMLPRunner, SurvPredSurvBoardRunner
+from finetune.gene_essent import (
+    GeneEssentBulkFormerPCARFRunner,
+    GeneEssentPCARFRunner,
+    GeneEssentRawMLPRunner,
+    GeneEssentRawPCARFRunner,
+    GeneEssentRunner,
+    GeneEssentScGPTPCARFRunner,
+)
+from finetune.surv_pred import (
+    SurvPredBulkFormerPCARFRunner,
+    SurvPredPCARFRunner,
+    SurvPredRawMLPRunner,
+    SurvPredRawPCARFRunner,
+    SurvPredRunner,
+    SurvPredScGPTPCARFRunner,
+)
+from finetune.surv_pred_binary import (
+    SurvPredBinaryBulkFormerPCARFRunner,
+    SurvPredBinaryPCARFRunner,
+    SurvPredBinaryRawMLPRunner,
+    SurvPredBinaryRawPCARFRunner,
+    SurvPredBinaryRunner,
+    SurvPredBinaryScGPTPCARFRunner,
+)
+from finetune.surv_pred_survboard import (
+    SurvPredSurvBoardBulkFormerPCARFRunner,
+    SurvPredSurvBoardPCARFRunner,
+    SurvPredSurvBoardRawMLPRunner,
+    SurvPredSurvBoardRawPCARFRunner,
+    SurvPredSurvBoardRunner,
+    SurvPredSurvBoardScGPTPCARFRunner,
+)
 from pretrain import PreTrainRunner, ScGPTPreadaptRunner
 
 
@@ -79,18 +114,50 @@ def main(cfg: DictConfig):
         runner = DeconvRunner(cfg)
     elif task_name == "finetune.deconv_raw_mlp":
         runner = DeconvRawMLPRunner(cfg)
+    elif task_name == "finetune.deconv_raw_pca_rf":
+        runner = DeconvRawPCARFRunner(cfg)
+    elif task_name == "finetune.deconv_pca_rf":
+        runner = DeconvPCARFRunner(cfg)
+    elif task_name == "finetune.deconv_bulkformer_pca_rf":
+        runner = DeconvBulkFormerPCARFRunner(cfg)
+    elif task_name == "finetune.deconv_scgpt_pca_rf":
+        runner = DeconvScGPTPCARFRunner(cfg)
     elif task_name == "finetune.surv_pred":
         runner = SurvPredRunner(cfg)
     elif task_name == "finetune.surv_pred_raw_mlp":
         runner = SurvPredRawMLPRunner(cfg)
+    elif task_name == "finetune.surv_pred_raw_pca_rf":
+        runner = SurvPredRawPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_pca_rf":
+        runner = SurvPredPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_scgpt_pca_rf":
+        runner = SurvPredScGPTPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_bulkformer_pca_rf":
+        runner = SurvPredBulkFormerPCARFRunner(cfg)
     elif task_name == "finetune.surv_pred_survboard":
         runner = SurvPredSurvBoardRunner(cfg)
     elif task_name == "finetune.surv_pred_survboard_raw_mlp":
         runner = SurvPredSurvBoardRawMLPRunner(cfg)
+    elif task_name == "finetune.surv_pred_survboard_raw_pca_rf":
+        runner = SurvPredSurvBoardRawPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_survboard_pca_rf":
+        runner = SurvPredSurvBoardPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_survboard_scgpt_pca_rf":
+        runner = SurvPredSurvBoardScGPTPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_survboard_bulkformer_pca_rf":
+        runner = SurvPredSurvBoardBulkFormerPCARFRunner(cfg)
     elif task_name == "finetune.surv_pred_binary":
         runner = SurvPredBinaryRunner(cfg)
     elif task_name == "finetune.surv_pred_binary_raw_mlp":
         runner = SurvPredBinaryRawMLPRunner(cfg)
+    elif task_name == "finetune.surv_pred_binary_raw_pca_rf":
+        runner = SurvPredBinaryRawPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_binary_pca_rf":
+        runner = SurvPredBinaryPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_binary_scgpt_pca_rf":
+        runner = SurvPredBinaryScGPTPCARFRunner(cfg)
+    elif task_name == "finetune.surv_pred_binary_bulkformer_pca_rf":
+        runner = SurvPredBinaryBulkFormerPCARFRunner(cfg)
     elif task_name == "finetune.disease_class":
         runner = DiseaseClassRunner(cfg)
     elif task_name == "finetune.disease_class_raw_mlp":
@@ -107,6 +174,14 @@ def main(cfg: DictConfig):
         runner = GeneEssentRunner(cfg)
     elif task_name == "finetune.gene_essent_raw_mlp":
         runner = GeneEssentRawMLPRunner(cfg)
+    elif task_name == "finetune.gene_essent_raw_pca_rf":
+        runner = GeneEssentRawPCARFRunner(cfg)
+    elif task_name == "finetune.gene_essent_pca_rf":
+        runner = GeneEssentPCARFRunner(cfg)
+    elif task_name == "finetune.gene_essent_bulkformer_pca_rf":
+        runner = GeneEssentBulkFormerPCARFRunner(cfg)
+    elif task_name == "finetune.gene_essent_scgpt_pca_rf":
+        runner = GeneEssentScGPTPCARFRunner(cfg)
     elif task_name == "finetune.drug_resp":
         runner = DrugRespRunner(cfg)
     elif task_name == "finetune.drug_resp_raw_mlp":
@@ -134,15 +209,31 @@ def main(cfg: DictConfig):
             "'finetune.canc_type_class_33_pca_rf', "
             "'finetune.canc_type_class_33_bulkformer_pca_rf', "
             "'finetune.canc_type_class_33_scgpt_pca_rf', "
-            "'finetune.deconv', 'finetune.deconv_raw_mlp', 'finetune.surv_pred', "
-            "'finetune.surv_pred_raw_mlp', 'finetune.surv_pred_survboard', "
-            "'finetune.surv_pred_survboard_raw_mlp', 'finetune.surv_pred_binary', "
-            "'finetune.surv_pred_binary_raw_mlp', 'finetune.disease_class', "
+            "'finetune.deconv', 'finetune.deconv_raw_mlp', "
+            "'finetune.deconv_raw_pca_rf', 'finetune.deconv_pca_rf', "
+            "'finetune.deconv_bulkformer_pca_rf', "
+            "'finetune.deconv_scgpt_pca_rf', 'finetune.surv_pred', "
+            "'finetune.surv_pred_raw_mlp', 'finetune.surv_pred_raw_pca_rf', "
+            "'finetune.surv_pred_pca_rf', 'finetune.surv_pred_bulkformer_pca_rf', "
+            "'finetune.surv_pred_scgpt_pca_rf', 'finetune.surv_pred_survboard', "
+            "'finetune.surv_pred_survboard_raw_mlp', "
+            "'finetune.surv_pred_survboard_raw_pca_rf', "
+            "'finetune.surv_pred_survboard_pca_rf', "
+            "'finetune.surv_pred_survboard_bulkformer_pca_rf', "
+            "'finetune.surv_pred_survboard_scgpt_pca_rf', "
+            "'finetune.surv_pred_binary', 'finetune.surv_pred_binary_raw_mlp', "
+            "'finetune.surv_pred_binary_raw_pca_rf', "
+            "'finetune.surv_pred_binary_pca_rf', "
+            "'finetune.surv_pred_binary_bulkformer_pca_rf', "
+            "'finetune.surv_pred_binary_scgpt_pca_rf', 'finetune.disease_class', "
             "'finetune.disease_class_raw_mlp', 'finetune.disease_class_pca_rf', "
             "'finetune.disease_class_raw_pca_rf', "
             "'finetune.disease_class_bulkformer_pca_rf', "
             "'finetune.disease_class_scgpt_pca_rf', "
             "'finetune.gene_essent', 'finetune.gene_essent_raw_mlp', "
+            "'finetune.gene_essent_raw_pca_rf', 'finetune.gene_essent_pca_rf', "
+            "'finetune.gene_essent_bulkformer_pca_rf', "
+            "'finetune.gene_essent_scgpt_pca_rf', "
             "'finetune.drug_resp', "
             "'finetune.drug_resp_raw_mlp', 'finetune.drug_resp_raw_pca_rf', "
             "'finetune.drug_resp_pca_rf', "

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
-import math
 import os
 import re
 import subprocess
@@ -13,7 +13,6 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
-import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -29,6 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import (
+    GroupedCosineWarmupUpdateScheduler,
     _quantile_bin_expression,
     _set_finetune_training_mode,
 )
@@ -67,25 +67,10 @@ class GeneEssentPredHead(nn.Module):
         embedding_dim: int,
         hidden_dim: int = 512,
         bottleneck_dim: int = 256,
-        context_pooling: str = "none",
     ) -> None:
         super().__init__()
-        valid_pooling = {"none", "cls", "mean", "mean_cls"}
-        if context_pooling not in valid_pooling:
-            raise ValueError(
-                f"Unsupported gene-essentiality context pooling '{context_pooling}'. "
-                f"Expected one of {sorted(valid_pooling)}."
-            )
-        self.context_pooling = context_pooling
-        context_multiplier = {
-            "none": 0,
-            "cls": 1,
-            "mean": 1,
-            "mean_cls": 2,
-        }[context_pooling]
-        input_dim = embedding_dim * (1 + context_multiplier)
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(embedding_dim, hidden_dim),
             nn.SELU(),
             nn.Linear(hidden_dim, bottleneck_dim),
             nn.SELU(),
@@ -117,22 +102,7 @@ class CancerFoundationGeneEssentModel(nn.Module):
         # Position zero is the CancerFoundation <cls> token. Every remaining
         # output stays aligned with the corresponding selected input gene.
         gene_hidden = hidden[:, 1:, :]
-        if self.to_out.context_pooling == "none":
-            head_input = gene_hidden
-        else:
-            contexts = []
-            if self.to_out.context_pooling in {"cls", "mean_cls"}:
-                contexts.append(hidden[:, 0, :])
-            if self.to_out.context_pooling in {"mean", "mean_cls"}:
-                contexts.append(gene_hidden.mean(dim=1))
-            sample_context = torch.cat(contexts, dim=-1)
-            sample_context = sample_context[:, None, :].expand(
-                -1,
-                gene_hidden.shape[1],
-                -1,
-            )
-            head_input = torch.cat((gene_hidden, sample_context), dim=-1)
-        return self.to_out(head_input)
+        return self.to_out(gene_hidden)
 
     def add_adapters(self, **kwargs) -> nn.ModuleList:
         return self.backbone.add_adapters(**kwargs)
@@ -142,116 +112,6 @@ class CancerFoundationGeneEssentModel(nn.Module):
 
     def enable_grad_checkpoint(self) -> None:
         self.backbone.enable_grad_checkpoint()
-
-
-class GroupedCosineAnnealingWarmupRestarts:
-    """Cosine warmup scheduler that preserves per-parameter-group max LRs."""
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        first_cycle_steps: int,
-        max_lrs: list[float],
-        min_lr_ratio: float,
-        cycle_mult: float = 1.0,
-        warmup_steps: int = 0,
-        gamma: float = 1.0,
-    ) -> None:
-        if warmup_steps >= first_cycle_steps:
-            raise ValueError("warmup_steps must be smaller than first_cycle_steps.")
-        if len(max_lrs) != len(optimizer.param_groups):
-            raise ValueError("max_lrs must match optimizer.param_groups.")
-
-        self.optimizer = optimizer
-        self.first_cycle_steps = first_cycle_steps
-        self.cycle_mult = cycle_mult
-        self.base_max_lrs = [float(lr) for lr in max_lrs]
-        self.max_lrs = list(self.base_max_lrs)
-        self.min_lrs = [float(lr) * float(min_lr_ratio) for lr in self.base_max_lrs]
-        self.warmup_steps = warmup_steps
-        self.gamma = gamma
-        self.cur_cycle_steps = first_cycle_steps
-        self.cycle = 0
-        self.step_in_cycle = -1
-        self.last_epoch = -1
-        self._set_lrs(self.min_lrs)
-
-    def _set_lrs(self, lrs: list[float]) -> None:
-        for param_group, lr in zip(self.optimizer.param_groups, lrs):
-            param_group["lr"] = lr
-
-    def get_lr(self) -> list[float]:
-        if self.step_in_cycle == -1:
-            return self.min_lrs
-        if self.step_in_cycle < self.warmup_steps:
-            return [
-                min_lr + (max_lr - min_lr) * self.step_in_cycle / self.warmup_steps
-                for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-            ]
-        return [
-            min_lr
-            + (max_lr - min_lr)
-            * (
-                1
-                + math.cos(
-                    math.pi
-                    * (self.step_in_cycle - self.warmup_steps)
-                    / (self.cur_cycle_steps - self.warmup_steps)
-                )
-            )
-            / 2
-            for min_lr, max_lr in zip(self.min_lrs, self.max_lrs)
-        ]
-
-    def step(self, epoch: int | None = None) -> None:
-        if epoch is None:
-            epoch = self.last_epoch + 1
-            self.step_in_cycle += 1
-            if self.step_in_cycle >= self.cur_cycle_steps:
-                self.cycle += 1
-                self.step_in_cycle -= self.cur_cycle_steps
-                self.cur_cycle_steps = int(
-                    (self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult
-                ) + self.warmup_steps
-        else:
-            if epoch >= self.first_cycle_steps:
-                if self.cycle_mult == 1.0:
-                    self.step_in_cycle = epoch % self.first_cycle_steps
-                    self.cycle = epoch // self.first_cycle_steps
-                else:
-                    self.cycle = int(
-                        math.log(
-                            epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1,
-                            self.cycle_mult,
-                        )
-                    )
-                    self.step_in_cycle = epoch - int(
-                        self.first_cycle_steps * (self.cycle_mult**self.cycle - 1)
-                        / (self.cycle_mult - 1)
-                    )
-                    self.cur_cycle_steps = self.first_cycle_steps * self.cycle_mult**self.cycle
-            else:
-                self.cur_cycle_steps = self.first_cycle_steps
-                self.step_in_cycle = epoch
-
-        self.max_lrs = [lr * (self.gamma**self.cycle) for lr in self.base_max_lrs]
-        self.last_epoch = math.floor(epoch)
-        self._set_lrs(self.get_lr())
-
-    def state_dict(self) -> dict[str, object]:
-        return {
-            "first_cycle_steps": self.first_cycle_steps,
-            "cycle_mult": self.cycle_mult,
-            "base_max_lrs": self.base_max_lrs,
-            "max_lrs": self.max_lrs,
-            "min_lrs": self.min_lrs,
-            "warmup_steps": self.warmup_steps,
-            "gamma": self.gamma,
-            "cur_cycle_steps": self.cur_cycle_steps,
-            "cycle": self.cycle,
-            "step_in_cycle": self.step_in_cycle,
-            "last_epoch": self.last_epoch,
-        }
 
 
 class GeneEssentDataset(Dataset):
@@ -497,7 +357,17 @@ class GeneEssentRunner:
                 "finetune_mode": self._finetune_mode(),
                 "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
                 "n_valid_genes": self.n_valid_genes,
+                "gene_selection_method": "mad",
+                "gene_selection_fit_scope": "training_cell_lines_only",
+                "gene_selection_expression_scale": "log1p",
+                "selected_gene_count": self.selected_gene_count,
             },
             checkpoint_paths=checkpoint_paths,
             repo_dir=ROOT / "scbFM",
@@ -536,9 +406,30 @@ class GeneEssentRunner:
                 "finetune.gene_essent.pretrained_model_paths must define "
                 f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
+        configured_model_keys = getattr(self.task_cfg, "model_keys", None)
+        if configured_model_keys is None:
+            selected_model_keys = list(MODEL_KEYS)
+        else:
+            selected_model_keys = [str(key) for key in configured_model_keys]
+            if not selected_model_keys:
+                raise ValueError("finetune.gene_essent.model_keys may not be empty.")
+            duplicates = sorted(
+                key for key in set(selected_model_keys)
+                if selected_model_keys.count(key) > 1
+            )
+            invalid = sorted(set(selected_model_keys).difference(MODEL_KEYS))
+            if duplicates or invalid:
+                raise ValueError(
+                    "Invalid finetune.gene_essent.model_keys: "
+                    f"duplicates={duplicates}, unsupported={invalid}."
+                )
+
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
+        for key in selected_model_keys:
+            if key == RANDOM_INIT_MODEL_KEY:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -549,7 +440,6 @@ class GeneEssentRunner:
                 "Missing checkpoint paths in finetune.gene_essent.pretrained_model_paths: "
                 f"{missing}"
             )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     # ------------------------------------------------------------------
@@ -698,45 +588,39 @@ class GeneEssentRunner:
         X_expression,
         train_idx: np.ndarray,
     ) -> np.ndarray:
-        """Fit the 1,199-gene input vocabulary using training cell lines only."""
+        """Select the highest-MAD genes using training cell lines only."""
         if X_expression.shape[1] < self.selected_gene_count:
             raise ValueError(
                 f"Cannot select {self.selected_gene_count} HVGs from "
                 f"{X_expression.shape[1]} genes."
             )
-        hvg_adata = ad.AnnData(X=X_expression[train_idx])
-        hvg_stats = sc.pp.highly_variable_genes(
-            hvg_adata,
-            n_top_genes=self.selected_gene_count,
-            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            inplace=False,
+        matrix = X_expression[train_idx]
+        if sparse.issparse(matrix):
+            matrix = matrix.toarray()
+        matrix = np.asarray(matrix, dtype=np.float32)
+        gene_medians = np.nanmedian(matrix, axis=0)
+        mad = np.nanmedian(np.abs(matrix - gene_medians), axis=0)
+        scores = np.nan_to_num(mad, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        if not np.any(np.isfinite(scores)):
+            raise ValueError("Could not compute finite MAD scores for any genes.")
+        ranked = np.lexsort((np.arange(scores.size), -scores))
+        selected = np.sort(ranked[: self.selected_gene_count]).astype(
+            np.int64,
+            copy=False,
         )
-        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
-        if selected.size > self.selected_gene_count:
-            ranking_column = (
-                "highly_variable_rank"
-                if "highly_variable_rank" in hvg_stats
-                else "dispersions_norm"
-            )
-            scores = hvg_stats[ranking_column].to_numpy()[selected]
-            if ranking_column == "highly_variable_rank":
-                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
-            else:
-                order = np.argsort(
-                    -np.nan_to_num(scores, nan=-np.inf),
-                    kind="stable",
-                )
-            selected = selected[order[: self.selected_gene_count]]
         if selected.size != self.selected_gene_count:
             raise RuntimeError(
-                f"Scanpy selected {selected.size} HVGs; expected exactly "
+                f"MAD selected {selected.size} genes; expected exactly "
                 f"{self.selected_gene_count}."
             )
         log.info(
-            "Selected %d HVGs from %d training cell lines with flavor=%s",
+            "Selected %d training-fold genes with MAD on log1p expression from "
+            "%d cell lines | selected MAD min=%.6g median=%.6g max=%.6g",
             selected.size,
             len(train_idx),
-            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
+            float(np.min(scores[selected])),
+            float(np.median(scores[selected])),
+            float(np.max(scores[selected])),
         )
         return selected.astype(np.int64, copy=False)
 
@@ -754,6 +638,138 @@ class GeneEssentRunner:
             random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
         return list(splitter.split(np.arange(n_samples)))
+
+    def _resolve_cv_fold_manifest_path(self, cell_ids: list[str]) -> Path | None:
+        configured = getattr(self.task_cfg, "cv_fold_manifest_path", None)
+        if configured is None or not str(configured).strip():
+            return None
+        configured_str = str(configured).strip()
+        if configured_str.lower() != "auto":
+            return Path(hydra.utils.to_absolute_path(configured_str))
+
+        signature_payload = {
+            "task": self.task_name,
+            "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+            "random_seed": int(getattr(self.task_cfg, "random_seed", 42)),
+            "cell_line_ids": [str(value) for value in cell_ids],
+        }
+        source_fingerprint = hashlib.sha256(
+            json.dumps(
+                signature_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self._cv_source_fingerprint = source_fingerprint
+        data_path = Path(
+            hydra.utils.to_absolute_path(str(self.task_cfg.depmap_data_path))
+        )
+        return data_path.with_name(
+            f"{data_path.stem}_{self.task_name}_{source_fingerprint[:16]}_cv_folds.csv"
+        )
+
+    @staticmethod
+    def _fold_assignments_from_splits(
+        n_samples: int,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        assignments = np.full(n_samples, -1, dtype=np.int64)
+        all_indices = np.arange(n_samples, dtype=np.int64)
+        for fold, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_idx = np.asarray(train_idx, dtype=np.int64)
+            test_idx = np.asarray(test_idx, dtype=np.int64)
+            if np.intersect1d(train_idx, test_idx).size:
+                raise ValueError(f"CV fold {fold} overlaps between train and test.")
+            if not np.array_equal(
+                np.sort(np.concatenate((train_idx, test_idx))),
+                all_indices,
+            ):
+                raise ValueError(f"CV fold {fold} does not partition all cell lines.")
+            if np.any(assignments[test_idx] != -1):
+                raise ValueError("A cell line appears in multiple CV test folds.")
+            assignments[test_idx] = fold
+        if np.any(assignments < 1):
+            raise ValueError("Every cell line must appear in exactly one CV test fold.")
+        return assignments
+
+    def _load_cv_fold_manifest(
+        self,
+        manifest_path: Path,
+        cell_ids: list[str],
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        if len(rows) != len(cell_ids):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} contains {len(rows)} cell lines; "
+                f"expected {len(cell_ids)}."
+            )
+        observed_ids = [str(row.get("cell_line_id", "")) for row in rows]
+        if observed_ids != [str(value) for value in cell_ids]:
+            raise ValueError(
+                f"CV fold manifest {manifest_path} does not match the canonical "
+                "DepMap cell-line order."
+            )
+        assignments = np.asarray([int(row["fold"]) for row in rows], dtype=np.int64)
+        n_folds = int(getattr(self.task_cfg, "cv_folds", 5))
+        if set(assignments.tolist()) != set(range(1, n_folds + 1)):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} must contain folds 1..{n_folds}."
+            )
+        all_indices = np.arange(len(cell_ids), dtype=np.int64)
+        return [
+            (all_indices[assignments != fold], all_indices[assignments == fold])
+            for fold in range(1, n_folds + 1)
+        ]
+
+    def _build_or_load_cv_splits(
+        self,
+        cell_ids: list[str],
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        if len(set(map(str, cell_ids))) != len(cell_ids):
+            raise ValueError("Gene-essentiality CV requires unique cell-line IDs.")
+        manifest_path = self._resolve_cv_fold_manifest_path(cell_ids)
+        if manifest_path is None:
+            splits = self._build_cv_splits(len(cell_ids))
+            assignments = self._fold_assignments_from_splits(len(cell_ids), splits)
+            manifest_bytes = "\n".join(
+                f"{cell_id},{int(fold)}"
+                for cell_id, fold in zip(cell_ids, assignments)
+            ).encode("utf-8")
+            self._cv_fold_manifest_path = ""
+            self._cv_fold_fingerprint = hashlib.sha256(manifest_bytes).hexdigest()
+            return splits
+
+        if self.is_master and not manifest_path.exists():
+            splits = self._build_cv_splits(len(cell_ids))
+            assignments = self._fold_assignments_from_splits(len(cell_ids), splits)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = manifest_path.with_name(
+                f"{manifest_path.name}.tmp.{os.getpid()}"
+            )
+            with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["cell_line_id", "fold"])
+                writer.writeheader()
+                writer.writerows(
+                    {"cell_line_id": cell_id, "fold": int(fold)}
+                    for cell_id, fold in zip(cell_ids, assignments)
+                )
+            temporary_path.replace(manifest_path)
+        if self.is_distributed:
+            dist.barrier()
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"CV fold manifest was not created: {manifest_path}")
+
+        splits = self._load_cv_fold_manifest(manifest_path, cell_ids)
+        self._fold_assignments_from_splits(len(cell_ids), splits)
+        self._cv_fold_manifest_path = str(manifest_path)
+        self._cv_fold_fingerprint = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        log.info(
+            "Using gene-essentiality CV fold manifest %s (sha256=%s)",
+            manifest_path,
+            self._cv_fold_fingerprint,
+        )
+        return splits
 
     # ------------------------------------------------------------------
     # Data loaders
@@ -916,18 +932,12 @@ class GeneEssentRunner:
             embedding_dim=int(self.model_cfg.embsize),
             hidden_dim=int(getattr(self.task_cfg, "head_hidden_dim", 512)),
             bottleneck_dim=int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
-            context_pooling=str(getattr(self.task_cfg, "head_pooling", "none")),
         )
         if self.is_master:
-            input_dim = int(self.model_cfg.embsize) * (
-                3 if head.context_pooling == "mean_cls"
-                else 2 if head.context_pooling in {"cls", "mean"}
-                else 1
-            )
             log.info(
-                "Gene essentiality head pooling: %s | dims: %d -> %d -> %d -> 1",
-                head.context_pooling,
-                input_dim,
+                "Gene essentiality representation: contextualized gene token only | "
+                "head dims: %d -> %d -> %d -> 1",
+                int(self.model_cfg.embsize),
                 int(getattr(self.task_cfg, "head_hidden_dim", 512)),
                 int(getattr(self.task_cfg, "head_bottleneck_dim", 256)),
             )
@@ -1021,14 +1031,20 @@ class GeneEssentRunner:
         )
 
         self.optimizer = Adam(param_groups)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        grad_accumulation_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = (
+            len(self.train_loader) + grad_accumulation_steps - 1
+        ) // grad_accumulation_steps
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 20)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 1)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 1.0)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=int(getattr(self.task_cfg, "epochs", 20)),
+            warmup_epochs=int(getattr(self.task_cfg, "warmup_epochs", 2)),
         )
 
         if self.is_master:
@@ -1160,6 +1176,7 @@ class GeneEssentRunner:
                 )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
                 self.optimizer.step()
+                self.scheduler.step()
                 self.model.zero_grad(set_to_none=True)
                 accumulated_normalizer = 0.0
 
@@ -1174,7 +1191,6 @@ class GeneEssentRunner:
         if self.is_distributed:
             dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
         epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
-        self.scheduler.step()
         return {"loss": epoch_loss}
 
     def _evaluate(self) -> dict:
@@ -1215,6 +1231,8 @@ class GeneEssentRunner:
             p, t = preds_np[i], targets_np[i]
             finite_mask = np.isfinite(p) & np.isfinite(t)
             if finite_mask.sum() < 2:
+                pccs.append(float("nan"))
+                sccs.append(float("nan"))
                 continue
             pcc, _ = pearsonr(p[finite_mask], t[finite_mask])
             scc, _ = spearmanr(p[finite_mask], t[finite_mask])
@@ -1284,6 +1302,15 @@ class GeneEssentRunner:
             )
         return rows
 
+    @staticmethod
+    def _mean_cell_line_metric(
+        rows: list[dict[str, object]],
+        field: str,
+    ) -> float:
+        values = np.asarray([float(row[field]) for row in rows], dtype=float)
+        values = values[np.isfinite(values)]
+        return float(np.mean(values)) if values.size else float("nan")
+
     def _write_model_results(
         self,
         checkpoint_path: str,
@@ -1291,6 +1318,16 @@ class GeneEssentRunner:
         cell_line_rows: list[dict[str, object]],
     ) -> dict[str, object]:
         aggregate = self._aggregate_numeric_rows(fold_rows)
+        # The task metric is the mean over held-out cell lines, rather than an
+        # unweighted mean of fold means when fold sizes differ by one sample.
+        aggregate["test_pcc_mean"] = self._mean_cell_line_metric(
+            cell_line_rows,
+            "pcc",
+        )
+        aggregate["test_scc_mean"] = self._mean_cell_line_metric(
+            cell_line_rows,
+            "scc",
+        )
         aggregate.update(
             {
                 "model": fold_rows[0]["model"],
@@ -1328,7 +1365,7 @@ class GeneEssentRunner:
 
             X_expression, Y_targets, cell_ids = self._load_depmap_data()
             n_samples = len(cell_ids)
-            splits = self._build_cv_splits(n_samples)
+            splits = self._build_or_load_cv_splits(cell_ids)
             fold_hvg_indices = [
                 self._select_training_hvg_indices(X_expression, train_idx)
                 for train_idx, _ in splits

@@ -1,11 +1,14 @@
 import csv
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
+import pandas as pd
 import torch
 
 
@@ -163,6 +166,136 @@ class DrugResponseSetupTest(unittest.TestCase):
         self.assertEqual(bulkformer._rf_prefix(), "bulkformer_rf")
         self.assertEqual(scgpt._pca_prefix(), "scgpt_pca")
         self.assertEqual(scgpt._rf_prefix(), "scgpt_rf")
+
+    def test_bulkformer_accepts_signed_normalized_expression(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            expression_path = root / "gdsc_expression.csv"
+            gene_info_path = root / "bulkformer_gene_info.csv"
+            pd.DataFrame(
+                [[3.0, 4.0], [-1.8, 2.0]],
+                index=["cell-b", "cell-a"],
+                columns=["GENE1", "GENE2"],
+            ).to_csv(expression_path)
+            pd.DataFrame(
+                {
+                    "gene_symbol": ["GENE1", "GENE2"],
+                    "ensg_id": ["ENSG1", "ENSG2"],
+                }
+            ).to_csv(gene_info_path, index=False)
+
+            runner = object.__new__(DrugRespBulkFormerPCARFRunner)
+            runner.task_cfg = SimpleNamespace(
+                bulkformer_expected_gene_count=2,
+                bulkformer_max_expected_expression=30.0,
+            )
+            runner._canonical_cell_ids = ["cell-a", "cell-b"]
+
+            expression, missing_fraction = runner._prepare_bulkformer_expression(
+                {"expression": expression_path, "gene_info": gene_info_path}
+            )
+
+            np.testing.assert_array_equal(
+                expression,
+                np.asarray([[-1.8, 2.0], [3.0, 4.0]], dtype=np.float32),
+            )
+            self.assertEqual(missing_fraction, 0.0)
+
+    def test_bulkformer_cleanup_does_not_wait_for_master_only_rf(self) -> None:
+        runner = object.__new__(DrugRespBulkFormerPCARFRunner)
+        runner.is_distributed = True
+        runner._setup_runtime = Mock(side_effect=RuntimeError("stop after setup"))
+
+        with (
+            patch(
+                "finetune.drug_resp.bulkformer_pca_rf_runner.dist.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "finetune.drug_resp.bulkformer_pca_rf_runner.dist.barrier"
+            ) as barrier,
+            patch(
+                "finetune.drug_resp.bulkformer_pca_rf_runner.dist.destroy_process_group"
+            ) as destroy_process_group,
+            self.assertRaisesRegex(RuntimeError, "stop after setup"),
+        ):
+            runner.run()
+
+        barrier.assert_not_called()
+        destroy_process_group.assert_called_once_with()
+
+    def test_resume_reuses_only_complete_benchmark_compatible_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            out_dir = Path(temporary_directory)
+            runner = object.__new__(DrugRespRunner)
+            runner.task_cfg = SimpleNamespace(
+                resume_completed_models=True,
+                cv_folds=2,
+                epochs=3,
+                warmup_epochs=2,
+                batch_size=4,
+                grad_accumulation_steps=4,
+            )
+            runner.model_cfg = SimpleNamespace()
+            runner.world_size = 4
+            runner._cv_fold_fingerprint = "shared-folds"
+            runner._task_output_dir = lambda: out_dir
+            runner._output_prefix = lambda: "drug_resp_adapters"
+            runner._finetune_mode = lambda: "adapters"
+            checkpoint_paths = {"pretrain_sc": "checkpoint.pth"}
+            metadata = {
+                "task": "drug_resp",
+                "finetune_mode": "adapters",
+                "cv_folds": 2,
+                "cv_fold_fingerprint": "shared-folds",
+                "epochs": 3,
+                "warmup_epochs": 2,
+                "batch_size_per_gpu": 4,
+                "gradient_accumulation_steps": 4,
+                "world_size": 4,
+                "checkpoint_paths": checkpoint_paths,
+            }
+            (out_dir / "drug_resp_adapters_run_metadata.json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            (out_dir / "drug_resp_adapters_config.yaml").write_text(
+                "pretrain: {}\nfinetune:\n  drug_resp: {}\n",
+                encoding="utf-8",
+            )
+
+            def write_rows(name: str, rows: list[dict]) -> None:
+                runner._write_csv(
+                    out_dir / f"drug_resp_adapters_pretrain_sc_{name}.csv",
+                    rows,
+                )
+
+            write_rows(
+                "evaluation_metrics",
+                [{"model": "pretrain_sc", "checkpoint_path": "checkpoint.pth"}],
+            )
+            write_rows(
+                "fold_metrics",
+                [
+                    {"model": "pretrain_sc", "fold": fold}
+                    for fold in (1, 2)
+                ],
+            )
+            write_rows(
+                "cell_line_metrics",
+                [{"model": "pretrain_sc", "cell_line_id": "cell-a"}],
+            )
+            write_rows(
+                "training_curves",
+                [
+                    {"model": "pretrain_sc", "fold": fold, "epoch": epoch}
+                    for fold in (1, 2)
+                    for epoch in (1, 2, 3)
+                ],
+            )
+
+            completed = runner._load_completed_model_results(checkpoint_paths)
+            self.assertEqual(set(completed), {"pretrain_sc"})
 
     def test_submission_matrix_has_expected_jobs(self) -> None:
         job_dir = REPO.parent / "job_files" / "finetune" / "drug_resp"

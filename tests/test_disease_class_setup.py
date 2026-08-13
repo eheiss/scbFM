@@ -54,18 +54,29 @@ class DiseaseClassSetupTest(unittest.TestCase):
                 var=pd.DataFrame(index=["ENSG1", "ENSG2"]),
             ).write_h5ad(data_path)
 
-            runner = object.__new__(DiseaseClassRunner)
-            runner.task_cfg = SimpleNamespace(
-                disignatlas_data_path=str(data_path),
-                disease_label_col="label",
-                binary_label_col="binary_label",
-                disease_sample_id_col="GSM_ID",
-            )
-            loaded = runner._load_disignatlas()
+            for runner_class in (
+                DiseaseClassRunner,
+                DiseaseClassPCARFRunner,
+                DiseaseClassRawMLPRunner,
+                DiseaseClassRawPCARFRunner,
+                DiseaseClassBulkFormerPCARFRunner,
+                DiseaseClassScGPTPCARFRunner,
+            ):
+                runner = object.__new__(runner_class)
+                runner.task_cfg = SimpleNamespace(
+                    disignatlas_data_path=str(data_path),
+                    disease_label_col="label",
+                    binary_label_col="binary_label",
+                    disease_sample_id_col="GSM_ID",
+                )
+                loaded = runner._load_disignatlas()
 
-            self.assertEqual(loaded.obs_names.tolist(), ["GSM1", "GSM3"])
-            self.assertEqual(loaded.obs["disease_label"].tolist(), ["Disease A", "Disease B"])
-            self.assertEqual(loaded.obs["sample_id"].tolist(), ["GSM1", "GSM3"])
+                self.assertEqual(loaded.obs_names.tolist(), ["GSM1", "GSM3"])
+                self.assertEqual(
+                    loaded.obs["disease_label"].tolist(),
+                    ["Disease A", "Disease B"],
+                )
+                self.assertEqual(loaded.obs["sample_id"].tolist(), ["GSM1", "GSM3"])
 
     def test_checkpoint_subset_uses_standard_classification_behavior(self) -> None:
         runner = object.__new__(DiseaseClassRunner)

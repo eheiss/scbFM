@@ -9,9 +9,11 @@ pretrained_model_paths:
 survboard_data_dir:           # e.g. /path/to/survboard/data_reproduced
 project: TCGA                 # TCGA | ICGC | TARGET | METABRIC
 cancer:                       # e.g. BRCA
+eligible_cancers: [BLCA, BRCA, COAD, ESCA, HNSC, KIRC, KIRP, LGG, LUAD, PAAD, SARC, SKCM, STAD, UCEC, OV, LIHC, LUSC, LAML, CESC, GBM, READ]
 
 # Which outer CV folds to run (0-indexed rows of the SurvBoard split CSVs)
 outer_splits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+expected_outer_splits: 25
 
 # Survival column names in the SurvBoard preprocessed CSV
 os_col: OS
@@ -22,10 +24,11 @@ gene_list_path: ../data/gene_list.txt
 # Maps HUGO symbols in SurvBoard gex columns to ENSG IDs used by the backbone
 gene_info_path: ../data/bulkformer_gene_info.csv
 preprocess: true
+convert_log2_to_log1p: true
 # Fold-level HVGs are fitted on training samples only and reused for the held-out
 # split. Their count comes from pretrain.selected_gene_count (1199).
-hvg_flavor: cell_ranger
-hvg_batch_key:
+hvg_selection_method: mad
+model_keys:
 
 # Finetuning mode
 finetune_mode: head_only       # head_only | adapters | full_ft
@@ -53,12 +56,9 @@ max_grad_norm: 1e6
 random_seed: 42
 
 # Scheduler
-first_cycle_steps: 30
-cycle_mult: 1
 min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 2
-gamma: 1.0
+warmup_epochs: 2
 
 # Raw-expression MLP baseline. Launched with task=finetune.surv_pred_survboard_raw_mlp.
 raw_mlp_feature_mode: all_genes  # all_genes | hvg1199
@@ -68,3 +68,73 @@ raw_mlp_hidden_dim:
 raw_mlp_hidden_layers: 2
 raw_mlp_standardize: true
 raw_mlp_learning_rate: 1e-4
+
+raw_pca_rf_feature_mode: all_genes
+raw_pca_rf_variant:
+raw_pca_rf_components: 256
+raw_pca_rf_standardize: true
+raw_pca_rf_whiten: false
+raw_pca_rf_n_estimators: 500
+raw_pca_rf_max_depth:
+raw_pca_rf_min_samples_leaf: 1
+raw_pca_rf_min_samples_split: 2
+raw_pca_rf_max_features: sqrt
+raw_pca_rf_bootstrap: true
+raw_pca_rf_n_jobs: -1
+
+pca_rf_variant:
+pca_rf_components: 256
+pca_rf_standardize: true
+pca_rf_whiten: false
+pca_rf_n_estimators: 500
+pca_rf_max_depth:
+pca_rf_min_samples_leaf: 1
+pca_rf_min_samples_split: 2
+pca_rf_max_features: sqrt
+pca_rf_bootstrap: true
+pca_rf_n_jobs: -1
+
+bulkformer_variant: bulkformer_pca_rf
+bulkformer_repo_dir:
+bulkformer_checkpoint_path:
+bulkformer_gene_info_path:
+bulkformer_graph_path:
+bulkformer_graph_weight_path:
+bulkformer_gene_emb_path:
+bulkformer_interested_gene_list_path:
+bulkformer_expected_gene_count: 20010
+bulkformer_batch_size: 4
+bulkformer_aggregate_type: max
+bulkformer_pca_components: 256
+bulkformer_pca_standardize: true
+bulkformer_pca_whiten: false
+bulkformer_rf_n_estimators: 500
+bulkformer_rf_max_depth:
+bulkformer_rf_min_samples_leaf: 1
+bulkformer_rf_min_samples_split: 2
+bulkformer_rf_max_features: sqrt
+bulkformer_rf_bootstrap: true
+bulkformer_rf_n_jobs: -1
+
+scgpt_variant: scgpt_pca_rf
+scgpt_model_key: scgpt
+scgpt_repo_dir:
+scgpt_model_dir:
+scgpt_args_filename: args.json
+scgpt_vocab_filename: vocab.json
+scgpt_checkpoint_filename: last_model.pt
+scgpt_gene_info_path:
+scgpt_expected_source_gene_count: 13004
+scgpt_batch_size: 4
+scgpt_max_seq_len: 1200
+scgpt_use_fast_transformer: false
+scgpt_pca_components: 256
+scgpt_pca_standardize: true
+scgpt_pca_whiten: false
+scgpt_rf_n_estimators: 500
+scgpt_rf_max_depth:
+scgpt_rf_min_samples_leaf: 1
+scgpt_rf_min_samples_split: 2
+scgpt_rf_max_features: sqrt
+scgpt_rf_bootstrap: true
+scgpt_rf_n_jobs: -1

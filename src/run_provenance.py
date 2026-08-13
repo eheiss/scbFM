@@ -127,3 +127,13 @@ def complete_run_metadata(path: Path, results_path: Path) -> None:
         }
     )
     _atomic_json(path, metadata)
+
+
+def update_run_metadata(path: Path, payload: dict[str, object]) -> None:
+    """Atomically add task-specific provenance to an active run record."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Run metadata was not created: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    metadata.update(payload)
+    _atomic_json(path, metadata)

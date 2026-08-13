@@ -7,6 +7,9 @@ pretrained_model_paths:
 # Optional subset of pretrain_sc, pretrain_bulk, preadapt_sc, preadapt_bulk,
 # and random_init. Null preserves the standard run over all five models.
 model_keys:
+# Reuse only fully completed model states from an interrupted run after strict
+# validation of its folds, optimization settings, and output artifacts.
+resume_completed_models: false
 
 # Data paths
 expression_data_path: /cluster/work/boeva/eheiss/datasets/GDSC/gdsc.h5ad

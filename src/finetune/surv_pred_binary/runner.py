@@ -107,9 +107,18 @@ class SurvPredBinaryRunner:
                 f"{', '.join(self.checkpoint_model_keys)}."
             )
 
+        all_model_keys = (*self.checkpoint_model_keys, self.random_init_model_key)
+        requested = getattr(self.task_cfg, "model_keys", None)
+        model_keys = all_model_keys if requested is None else tuple(map(str, requested))
+        invalid = sorted(set(model_keys).difference(all_model_keys))
+        if invalid:
+            raise ValueError(f"Unknown binary survival model_keys: {invalid}.")
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in self.checkpoint_model_keys:
+        for key in model_keys:
+            if key == self.random_init_model_key:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -120,7 +129,6 @@ class SurvPredBinaryRunner:
                 f"Missing checkpoint paths in finetune.{self.config_node}.pretrained_model_paths: "
                 f"{missing}"
             )
-        checkpoint_paths[self.random_init_model_key] = ""
         return checkpoint_paths
 
     def _load_tcga(self) -> ad.AnnData:
@@ -418,6 +426,11 @@ _GENERIC_METHODS_FROM_CANCER_CLASS_RUNNER = (
     "_preprocess_adata",
     "_select_training_hvg_indices",
     "_build_cv_splits",
+    "_cv_manifest_source_rows",
+    "_resolve_cv_fold_manifest_path",
+    "_fold_assignments_from_splits",
+    "_load_cv_fold_manifest",
+    "_build_or_load_cv_splits",
     "_build_loaders",
     "_strip_module_prefix",
     "_validate_backbone_checkpoint",
@@ -450,6 +463,7 @@ _STATIC_METHODS_FROM_CANCER_CLASS_RUNNER = {
     "_aggregate_numeric_rows",
     "_strip_module_prefix",
     "_is_accumulation_boundary",
+    "_fold_assignments_from_splits",
 }
 for _method_name in _GENERIC_METHODS_FROM_CANCER_CLASS_RUNNER:
     _method = getattr(CancTypeClassRunner, _method_name)

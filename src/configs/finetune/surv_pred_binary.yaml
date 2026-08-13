@@ -44,8 +44,9 @@ cohorts:
   - UVM
 merge_gbm_lgg: false
 preprocess: true
-hvg_flavor: cell_ranger
-hvg_batch_key:
+hvg_selection_method: mad
+model_keys:
+cv_fold_manifest_path: auto
 
 # BulkFormer-style binary prognosis endpoint for AUROC comparison:
 # classify OS event/status directly, 1 = event/deceased, 0 = censored/alive.
@@ -76,12 +77,9 @@ head_learning_rate: 1e-4
 backbone_learning_rate: 1e-4
 max_grad_norm: 1e6
 
-first_cycle_steps: 20
-cycle_mult: 1
 min_lr: 1e-6
 min_lr_ratio:
-warmup_steps: 2
-gamma: 1.0
+warmup_epochs: 2
 
 # Raw-expression MLP baseline. Launched with task=finetune.surv_pred_binary_raw_mlp.
 raw_mlp_feature_mode: all_genes  # all_genes | hvg1199
@@ -91,3 +89,79 @@ raw_mlp_hidden_dim:
 raw_mlp_hidden_layers: 2
 raw_mlp_standardize: true
 raw_mlp_learning_rate: 1e-4
+
+raw_pca_rf_feature_mode: all_genes
+raw_pca_rf_variant:
+raw_pca_rf_components: 256
+raw_pca_rf_standardize: true
+raw_pca_rf_whiten: false
+raw_pca_rf_n_estimators: 500
+raw_pca_rf_max_depth:
+raw_pca_rf_min_samples_leaf: 1
+raw_pca_rf_min_samples_split: 2
+raw_pca_rf_max_features: sqrt
+raw_pca_rf_class_weight: balanced
+raw_pca_rf_bootstrap: true
+raw_pca_rf_n_jobs: -1
+
+pca_rf_variant:
+pca_rf_components: 256
+pca_rf_standardize: true
+pca_rf_whiten: false
+pca_rf_n_estimators: 500
+pca_rf_max_depth:
+pca_rf_min_samples_leaf: 1
+pca_rf_min_samples_split: 2
+pca_rf_max_features: sqrt
+pca_rf_class_weight: balanced
+pca_rf_bootstrap: true
+pca_rf_n_jobs: -1
+
+bulkformer_variant: bulkformer_pca_rf
+bulkformer_repo_dir:
+bulkformer_checkpoint_path:
+bulkformer_tcga_data_path:
+bulkformer_gene_info_path:
+bulkformer_graph_path:
+bulkformer_graph_weight_path:
+bulkformer_gene_emb_path:
+bulkformer_interested_gene_list_path:
+bulkformer_expected_gene_count: 20010
+bulkformer_max_expected_expression: 30.0
+bulkformer_batch_size: 4
+bulkformer_aggregate_type: max
+bulkformer_pca_components: 256
+bulkformer_pca_standardize: true
+bulkformer_pca_whiten: false
+bulkformer_rf_n_estimators: 500
+bulkformer_rf_max_depth:
+bulkformer_rf_min_samples_leaf: 1
+bulkformer_rf_min_samples_split: 2
+bulkformer_rf_max_features: sqrt
+bulkformer_rf_class_weight: balanced
+bulkformer_rf_bootstrap: true
+bulkformer_rf_n_jobs: -1
+
+scgpt_variant: scgpt_pca_rf
+scgpt_model_key: scgpt
+scgpt_repo_dir:
+scgpt_model_dir:
+scgpt_args_filename: args.json
+scgpt_vocab_filename: vocab.json
+scgpt_checkpoint_filename: last_model.pt
+scgpt_gene_info_path:
+scgpt_expected_source_gene_count: 13004
+scgpt_batch_size: 4
+scgpt_max_seq_len: 1200
+scgpt_use_fast_transformer: false
+scgpt_pca_components: 256
+scgpt_pca_standardize: true
+scgpt_pca_whiten: false
+scgpt_rf_n_estimators: 500
+scgpt_rf_max_depth:
+scgpt_rf_min_samples_leaf: 1
+scgpt_rf_min_samples_split: 2
+scgpt_rf_max_features: sqrt
+scgpt_rf_class_weight: balanced
+scgpt_rf_bootstrap: true
+scgpt_rf_n_jobs: -1

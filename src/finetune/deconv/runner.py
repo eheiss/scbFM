@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import csv
+import fcntl
+import gc
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -12,7 +16,6 @@ from pathlib import Path
 import anndata as ad
 import hydra
 import numpy as np
-import scanpy as sc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -29,7 +32,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import (
-    GroupedCosineAnnealingWarmupRestarts,
+    GroupedCosineWarmupUpdateScheduler,
     _quantile_bin_expression,
     _set_finetune_training_mode,
 )
@@ -138,6 +141,11 @@ class DeconvDataset(Dataset):
                 "fixed_gene_indices must contain exactly "
                 f"{self.selected_gene_count} genes."
             )
+        if self.data.shape[1] != self.selected_gene_count:
+            raise ValueError(
+                "DeconvDataset data must already contain exactly the selected "
+                f"{self.selected_gene_count} expression columns."
+            )
 
     def __len__(self) -> int:
         return self.data.shape[0]
@@ -149,7 +157,7 @@ class DeconvDataset(Dataset):
         else:
             values = np.asarray(row).ravel()
 
-        selected_values = values[self.fixed_gene_indices].astype(np.float32, copy=False)
+        selected_values = values.astype(np.float32, copy=False)
         if self.do_binning:
             rng = np.random.default_rng(self.seed + index)
             selected_values = _quantile_bin_expression(
@@ -170,6 +178,7 @@ class DeconvDataset(Dataset):
 
 class DeconvRunner:
     task_name = TASK_NAME
+    config_node = TASK_NAME
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
@@ -318,6 +327,18 @@ class DeconvRunner:
                     getattr(self.task_cfg, "head_bottleneck_dim", 256)
                 ),
                 "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+                "cv_fold_manifest_path": str(
+                    getattr(self, "_cv_fold_manifest_path", "")
+                ),
+                "cv_fold_fingerprint": str(
+                    getattr(self, "_cv_fold_fingerprint", "")
+                ),
+                "gene_selection": str(
+                    getattr(self.task_cfg, "hvg_selection_method", "mad")
+                ),
+                "expression_transform": (
+                    "log1p" if self._should_preprocess_input() else "pretokenized"
+                ),
             },
             checkpoint_paths=checkpoint_paths,
             repo_dir=ROOT / "scbFM",
@@ -350,9 +371,31 @@ class DeconvRunner:
                 f"{', '.join(CHECKPOINT_MODEL_KEYS)}."
             )
 
+        configured_model_keys = getattr(self.task_cfg, "model_keys", None)
+        if configured_model_keys is None:
+            selected_model_keys = list(MODEL_KEYS)
+        else:
+            selected_model_keys = [str(key) for key in configured_model_keys]
+            if not selected_model_keys:
+                raise ValueError("finetune.deconv.model_keys may not be empty.")
+            duplicates = sorted(
+                key for key in set(selected_model_keys)
+                if selected_model_keys.count(key) > 1
+            )
+            invalid = sorted(set(selected_model_keys).difference(MODEL_KEYS))
+            if duplicates or invalid:
+                raise ValueError(
+                    "Invalid finetune.deconv.model_keys: "
+                    f"duplicates={duplicates}, unsupported={invalid}; "
+                    f"supported={list(MODEL_KEYS)}."
+                )
+
         checkpoint_paths: dict[str, str] = {}
         missing = []
-        for key in CHECKPOINT_MODEL_KEYS:
+        for key in selected_model_keys:
+            if key == RANDOM_INIT_MODEL_KEY:
+                checkpoint_paths[key] = ""
+                continue
             value = paths_cfg.get(key)
             if value:
                 checkpoint_paths[key] = str(Path(hydra.utils.to_absolute_path(str(value))))
@@ -363,7 +406,6 @@ class DeconvRunner:
                 "Missing checkpoint paths in finetune.deconv.pretrained_model_paths: "
                 f"{missing}"
             )
-        checkpoint_paths[RANDOM_INIT_MODEL_KEY] = ""
         return checkpoint_paths
 
     @staticmethod
@@ -556,6 +598,24 @@ class DeconvRunner:
             f"{len(missing_genes)} / {int(self.model_cfg.gene_num)}"
         ) if missing_genes else ""
 
+        if self._should_preprocess_input():
+            if sparse.issparse(adata.X):
+                matrix = adata.X.tocsr().astype(np.float32, copy=True)
+                if not np.all(np.isfinite(matrix.data)):
+                    raise ValueError("Raw deconvolution expression contains non-finite values.")
+                if np.any(matrix.data < 0):
+                    raise ValueError("Raw deconvolution expression must be non-negative.")
+                matrix.data = np.log1p(matrix.data)
+                adata.X = matrix
+            else:
+                matrix = np.asarray(adata.X, dtype=np.float32)
+                if not np.all(np.isfinite(matrix)):
+                    raise ValueError("Raw deconvolution expression contains non-finite values.")
+                if np.any(matrix < 0):
+                    raise ValueError("Raw deconvolution expression must be non-negative.")
+                adata.X = np.log1p(matrix).astype(np.float32, copy=False)
+            log.info("Applied log1p to raw deconvolution expression after gene alignment.")
+
         targets = self._load_targets(adata)
 
         expected_gene_num = int(self.model_cfg.gene_num)
@@ -585,54 +645,63 @@ class DeconvRunner:
         return adata, targets, groups
 
     def _select_training_hvg_indices(self, adata: ad.AnnData) -> np.ndarray:
-        """Fit the fixed sequence vocabulary on the training fold only."""
+        """Select the fixed sequence vocabulary from the training fold only."""
         if adata.n_vars < self.selected_gene_count:
             raise ValueError(
                 f"Cannot select {self.selected_gene_count} HVGs from only {adata.n_vars} genes."
             )
 
-        batch_key = getattr(self.task_cfg, "hvg_batch_key", None)
-        if batch_key is not None:
-            batch_key = str(batch_key).strip() or None
-        if batch_key is not None and batch_key not in adata.obs:
-            raise ValueError(f"HVG batch key '{batch_key}' is not present in adata.obs.")
+        selection_method = str(
+            getattr(self.task_cfg, "hvg_selection_method", "mad")
+        ).lower()
+        if selection_method != "mad":
+            raise ValueError(
+                "finetune.deconv.hvg_selection_method must be 'mad' to match the thesis."
+            )
 
-        hvg_stats = sc.pp.highly_variable_genes(
-            adata,
-            n_top_genes=self.selected_gene_count,
-            flavor=str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            batch_key=batch_key,
-            inplace=False,
+        matrix = adata.X
+        if sparse.issparse(matrix):
+            matrix = matrix.toarray()
+        matrix = np.asarray(matrix, dtype=np.float32)
+        gene_medians = np.nanmedian(matrix, axis=0)
+        mad = np.nanmedian(np.abs(matrix - gene_medians), axis=0)
+        scores = np.nan_to_num(mad, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        if not np.any(np.isfinite(scores)):
+            raise ValueError("Could not compute finite MAD scores for any genes.")
+        ranked = np.lexsort((np.arange(scores.size), -scores))
+        selected = np.sort(ranked[: self.selected_gene_count]).astype(
+            np.int64,
+            copy=False,
         )
-        selected = np.flatnonzero(hvg_stats["highly_variable"].to_numpy())
-
-        if selected.size > self.selected_gene_count:
-            ranking_column = (
-                "highly_variable_rank"
-                if "highly_variable_rank" in hvg_stats
-                else "dispersions_norm"
-            )
-            scores = hvg_stats[ranking_column].to_numpy()[selected]
-            if ranking_column == "highly_variable_rank":
-                order = np.argsort(np.nan_to_num(scores, nan=np.inf), kind="stable")
-            else:
-                order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
-            selected = selected[order[: self.selected_gene_count]]
-
-        if selected.size != self.selected_gene_count:
-            raise RuntimeError(
-                f"Scanpy selected {selected.size} HVGs; "
-                f"expected exactly {self.selected_gene_count}."
-            )
 
         log.info(
-            "Selected %d training-fold HVGs for training and evaluation "
-            "with flavor=%s, batch_key=%s",
+            "Selected %d training-fold genes with MAD on log1p expression | "
+            "selected MAD min=%.6g median=%.6g max=%.6g",
             selected.size,
-            str(getattr(self.task_cfg, "hvg_flavor", "cell_ranger")),
-            batch_key,
+            float(np.min(scores[selected])),
+            float(np.median(scores[selected])),
+            float(np.max(scores[selected])),
         )
-        return selected.astype(np.int64, copy=False)
+        return selected
+
+    def _select_distributed_training_hvg_indices(
+        self,
+        adata: ad.AnnData,
+    ) -> np.ndarray:
+        """Compute fold-specific MAD genes once and share them across DDP ranks."""
+        if not self.is_distributed:
+            return self._select_training_hvg_indices(adata)
+
+        selected_tensor = torch.empty(
+            self.selected_gene_count,
+            dtype=torch.long,
+            device=self.device,
+        )
+        if self.is_master:
+            selected = self._select_training_hvg_indices(adata)
+            selected_tensor.copy_(torch.from_numpy(selected).to(self.device))
+        dist.broadcast(selected_tensor, src=0)
+        return selected_tensor.cpu().numpy()
 
     def _build_cv_splits(
         self,
@@ -660,6 +729,184 @@ class DeconvRunner:
             random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
         return list(splitter.split(np.arange(adata.n_obs)))
+
+    def _cv_manifest_source_rows(
+        self,
+        adata: ad.AnnData,
+        groups: np.ndarray | None,
+    ) -> list[dict[str, str]]:
+        sample_ids = adata.obs_names.astype(str).to_numpy()
+        if len(np.unique(sample_ids)) != len(sample_ids):
+            raise ValueError("Deconvolution CV fold manifests require unique sample IDs.")
+        group_ids = (
+            np.asarray(groups).astype(str)
+            if groups is not None
+            else np.asarray([""] * adata.n_obs)
+        )
+        if group_ids.shape[0] != adata.n_obs:
+            raise ValueError(
+                f"CV groups contain {group_ids.shape[0]} rows, but AnnData contains "
+                f"{adata.n_obs}."
+            )
+        return [
+            {"sample_id": str(sample_id), "group_id": str(group_id)}
+            for sample_id, group_id in zip(sample_ids, group_ids)
+        ]
+
+    def _resolve_cv_fold_manifest_path(
+        self,
+        source_rows: list[dict[str, str]],
+    ) -> Path | None:
+        configured = getattr(self.task_cfg, "cv_fold_manifest_path", None)
+        if configured is None or not str(configured).strip():
+            return None
+        configured_str = str(configured).strip()
+        if configured_str.lower() != "auto":
+            return Path(hydra.utils.to_absolute_path(configured_str))
+
+        data_path = Path(
+            hydra.utils.to_absolute_path(str(self.task_cfg.pseudo_bulk_data_path))
+        )
+        signature_payload = {
+            "task": self.task_name,
+            "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
+            "random_seed": int(getattr(self.task_cfg, "random_seed", 42)),
+            "split_by_context": bool(getattr(self.task_cfg, "split_by_context", True)),
+            "context_columns": [
+                str(value) for value in getattr(self.task_cfg, "context_columns", [])
+            ],
+            "samples": source_rows,
+        }
+        source_fingerprint = hashlib.sha256(
+            json.dumps(
+                signature_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self._cv_source_fingerprint = source_fingerprint
+        return data_path.with_name(
+            f"{data_path.stem}_{self.task_name}_{source_fingerprint[:16]}_cv_folds.csv"
+        )
+
+    @staticmethod
+    def _fold_assignments_from_splits(
+        n_samples: int,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        assignments = np.full(n_samples, -1, dtype=np.int64)
+        all_indices = np.arange(n_samples, dtype=np.int64)
+        for fold, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_idx = np.asarray(train_idx, dtype=np.int64)
+            test_idx = np.asarray(test_idx, dtype=np.int64)
+            if np.intersect1d(train_idx, test_idx).size:
+                raise ValueError(f"CV fold {fold} overlaps between train and test.")
+            if not np.array_equal(
+                np.sort(np.concatenate((train_idx, test_idx))),
+                all_indices,
+            ):
+                raise ValueError(f"CV fold {fold} does not partition all samples.")
+            if np.any(assignments[test_idx] != -1):
+                raise ValueError("A sample appears in multiple CV test folds.")
+            assignments[test_idx] = fold
+        if np.any(assignments < 1):
+            raise ValueError("Every sample must appear in exactly one CV test fold.")
+        return assignments
+
+    def _load_cv_fold_manifest(
+        self,
+        manifest_path: Path,
+        source_rows: list[dict[str, str]],
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        if len(rows) != len(source_rows):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} contains {len(rows)} samples; "
+                f"expected {len(source_rows)}."
+            )
+        assignments = np.empty(len(rows), dtype=np.int64)
+        for index, (observed, expected) in enumerate(zip(rows, source_rows)):
+            if {key: observed.get(key) for key in expected} != expected:
+                raise ValueError(
+                    f"CV fold manifest {manifest_path} differs from canonical sample "
+                    f"row {index}."
+                )
+            assignments[index] = int(observed["fold"])
+        n_folds = int(getattr(self.task_cfg, "cv_folds", 5))
+        if set(assignments.tolist()) != set(range(1, n_folds + 1)):
+            raise ValueError(
+                f"CV fold manifest {manifest_path} must contain folds 1..{n_folds}."
+            )
+        indices = np.arange(len(rows), dtype=np.int64)
+        return [
+            (indices[assignments != fold], indices[assignments == fold])
+            for fold in range(1, n_folds + 1)
+        ]
+
+    def _build_or_load_cv_splits(
+        self,
+        adata: ad.AnnData,
+        groups: np.ndarray | None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        source_rows = self._cv_manifest_source_rows(adata, groups)
+        manifest_path = self._resolve_cv_fold_manifest_path(source_rows)
+        if manifest_path is None:
+            return self._build_cv_splits(adata, groups)
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            if manifest_path.exists():
+                splits = self._load_cv_fold_manifest(manifest_path, source_rows)
+            else:
+                splits = self._build_cv_splits(adata, groups)
+                assignments = self._fold_assignments_from_splits(adata.n_obs, splits)
+                temporary_path = manifest_path.with_name(
+                    f"{manifest_path.name}.tmp.{os.getpid()}.{self.rank}"
+                )
+                try:
+                    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=["sample_id", "group_id", "fold"],
+                        )
+                        writer.writeheader()
+                        for row, fold in zip(source_rows, assignments):
+                            writer.writerow({**row, "fold": int(fold)})
+                    os.replace(temporary_path, manifest_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        assignments = self._fold_assignments_from_splits(adata.n_obs, splits)
+        if groups is not None:
+            groups_array = np.asarray(groups).astype(str)
+            split_groups = [
+                group
+                for group in np.unique(groups_array)
+                if np.unique(assignments[groups_array == group]).size != 1
+            ]
+            if split_groups:
+                raise ValueError(
+                    "CV fold manifest splits deconvolution context groups. "
+                    f"Affected groups include: {split_groups[:10]}"
+                )
+        fold_fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{row['sample_id']}\t{row['group_id']}\t{int(fold)}"
+                for row, fold in zip(source_rows, assignments)
+            ).encode("utf-8")
+        ).hexdigest()
+        self._cv_fold_manifest_path = manifest_path
+        self._cv_fold_fingerprint = fold_fingerprint
+        log.info(
+            "Using shared deconvolution CV fold manifest %s | fingerprint=%s",
+            manifest_path,
+            fold_fingerprint,
+        )
+        return splits
 
     def _build_loaders(
         self,
@@ -690,7 +937,9 @@ class DeconvRunner:
 
         random_seed = int(getattr(self.task_cfg, "random_seed", 42))
         do_binning = self._should_preprocess_input()
-        fold_hvg_indices = self._select_training_hvg_indices(train_adata)
+        fold_hvg_indices = self._select_distributed_training_hvg_indices(train_adata)
+        train_expression = train_adata.X[:, fold_hvg_indices].copy()
+        test_expression = test_adata.X[:, fold_hvg_indices].copy()
         train_target_sums = train_targets.sum(axis=1, keepdims=True)
         if np.any(train_target_sums <= 0):
             raise ValueError("Every deconvolution target row must have a positive sum.")
@@ -699,7 +948,7 @@ class DeconvRunner:
             axis=0,
         )
         train_dataset = DeconvDataset(
-            train_adata.X,
+            train_expression,
             train_targets,
             bin_num=int(self.model_cfg.bin_num),
             cls_gene_id=self.cls_gene_id,
@@ -711,7 +960,7 @@ class DeconvRunner:
             fixed_gene_indices=fold_hvg_indices,
         )
         test_dataset = DeconvDataset(
-            test_adata.X,
+            test_expression,
             test_targets,
             bin_num=int(self.model_cfg.bin_num),
             cls_gene_id=self.cls_gene_id,
@@ -920,15 +1169,22 @@ class DeconvRunner:
             else min_lr / max(head_learning_rate, 1e-12)
         )
 
+        grad_acc_steps = max(
+            1,
+            int(getattr(self.task_cfg, "grad_accumulation_steps", 4)),
+        )
+        updates_per_epoch = math.ceil(len(self.train_loader) / grad_acc_steps)
+        epochs = int(getattr(self.task_cfg, "epochs", 20))
+        warmup_epochs = int(getattr(self.task_cfg, "warmup_epochs", 2))
+
         self.optimizer = Adam(param_groups)
-        self.scheduler = GroupedCosineAnnealingWarmupRestarts(
+        self.scheduler = GroupedCosineWarmupUpdateScheduler(
             self.optimizer,
-            first_cycle_steps=int(getattr(self.task_cfg, "first_cycle_steps", 15)),
-            cycle_mult=float(getattr(self.task_cfg, "cycle_mult", 2)),
             max_lrs=max_lrs,
             min_lr_ratio=min_lr_ratio,
-            warmup_steps=int(getattr(self.task_cfg, "warmup_steps", 2)),
-            gamma=float(getattr(self.task_cfg, "gamma", 0.9)),
+            updates_per_epoch=updates_per_epoch,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
         )
 
         if self.is_master:
@@ -1047,6 +1303,7 @@ class DeconvRunner:
                 )
                 torch.nn.utils.clip_grad_norm_(self._optimizer_parameters(), max_grad_norm)
                 self.optimizer.step()
+                self.scheduler.step()
                 self.model.zero_grad(set_to_none=True)
                 accumulated_normalizer = 0.0
 
@@ -1062,7 +1319,6 @@ class DeconvRunner:
             dist.all_reduce(loss_totals, op=dist.ReduceOp.SUM)
         epoch_loss = float(loss_totals[0].item() / loss_totals[1].item())
 
-        self.scheduler.step()
         return {"loss": epoch_loss}
 
     @staticmethod
@@ -1152,46 +1408,31 @@ class DeconvRunner:
             float(np.mean(js)),
         )
 
-    def _evaluate(self) -> dict:
-        self.model.eval()
-        predictions = []
-        truths = []
+    @staticmethod
+    def _normalize_composition_predictions(
+        predictions: np.ndarray,
+        fallback: np.ndarray,
+    ) -> np.ndarray:
+        predictions = np.asarray(predictions, dtype=np.float64)
+        if predictions.ndim == 1:
+            predictions = predictions[:, None]
+        predictions = np.clip(predictions, 0.0, None)
+        row_sums = predictions.sum(axis=1, keepdims=True)
+        invalid = (~np.isfinite(row_sums[:, 0])) | (row_sums[:, 0] <= 0)
+        if np.any(invalid):
+            predictions[invalid] = np.asarray(fallback, dtype=np.float64)
+            row_sums = predictions.sum(axis=1, keepdims=True)
+        return (predictions / row_sums).astype(np.float32, copy=False)
 
-        if self.is_distributed:
-            dist.barrier()
-
-        with torch.no_grad():
-            for data, targets in self.test_loader:
-                data = {
-                    key: value.to(self.device, non_blocking=True)
-                    for key, value in data.items()
-                }
-                targets = targets.to(self.device, non_blocking=True)
-                logits = self.model(data)
-                predictions.append(F.softmax(logits, dim=-1))
-                truths.append(targets)
-
-        predictions = torch.cat(predictions, dim=0)
-        truths = torch.cat(truths, dim=0)
-
-        if self.is_distributed:
-            predictions = distributed_concat(predictions, self.test_dataset_size, self.world_size)
-            truths = distributed_concat(truths, self.test_dataset_size, self.world_size)
-
-        predictions_np = predictions.cpu().numpy()
-        truths_np = truths.cpu().numpy()
-        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
-        if loss_name == "kl":
-            test_loss = F.kl_div(
-                predictions.clamp_min(1e-12).log(),
-                truths,
-                reduction="batchmean",
-            ).item()
-        elif loss_name == "mse":
-            test_loss = F.mse_loss(predictions, truths).item()
-        else:
-            test_loss = F.l1_loss(predictions, truths).item()
-
+    def _evaluation_metrics_from_arrays(
+        self,
+        predictions_np: np.ndarray,
+        truths_np: np.ndarray,
+        *,
+        test_loss: float,
+    ) -> dict[str, object]:
+        predictions_np = np.asarray(predictions_np, dtype=np.float32)
+        truths_np = np.asarray(truths_np, dtype=np.float32)
         per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
         per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))
         per_type_prediction_mean = np.mean(predictions_np, axis=0)
@@ -1252,43 +1493,23 @@ class DeconvRunner:
             "prediction_mae_from_train_mean": float(
                 np.mean(np.abs(predictions_np - mean_baseline))
             ),
-            "per_cell_type_mae": {
-                cell_type: float(value)
-                for cell_type, value in zip(self.cell_types, per_type_mae.tolist())
-            },
-            "per_cell_type_rmse": {
-                cell_type: float(value)
-                for cell_type, value in zip(self.cell_types, per_type_rmse.tolist())
-            },
-            "per_cell_type_prediction_mean": {
-                cell_type: float(value)
-                for cell_type, value in zip(
-                    self.cell_types,
-                    per_type_prediction_mean.tolist(),
-                )
-            },
-            "per_cell_type_prediction_std": {
-                cell_type: float(value)
-                for cell_type, value in zip(
-                    self.cell_types,
-                    per_type_prediction_std.tolist(),
-                )
-            },
-            "per_cell_type_truth_mean": {
-                cell_type: float(value)
-                for cell_type, value in zip(self.cell_types, per_type_truth_mean.tolist())
-            },
-            "per_cell_type_truth_std": {
-                cell_type: float(value)
-                for cell_type, value in zip(self.cell_types, per_type_truth_std.tolist())
-            },
-            "per_cell_type_train_mean": {
-                cell_type: float(value)
-                for cell_type, value in zip(
-                    self.cell_types,
-                    self.fold_train_target_mean.tolist(),
-                )
-            },
+            "per_cell_type_mae": dict(zip(self.cell_types, per_type_mae.astype(float))),
+            "per_cell_type_rmse": dict(zip(self.cell_types, per_type_rmse.astype(float))),
+            "per_cell_type_prediction_mean": dict(
+                zip(self.cell_types, per_type_prediction_mean.astype(float))
+            ),
+            "per_cell_type_prediction_std": dict(
+                zip(self.cell_types, per_type_prediction_std.astype(float))
+            ),
+            "per_cell_type_truth_mean": dict(
+                zip(self.cell_types, per_type_truth_mean.astype(float))
+            ),
+            "per_cell_type_truth_std": dict(
+                zip(self.cell_types, per_type_truth_std.astype(float))
+            ),
+            "per_cell_type_train_mean": dict(
+                zip(self.cell_types, self.fold_train_target_mean.astype(float))
+            ),
             "per_cell_type_pearson_across_samples": cell_type_pearson_across_samples,
             "per_cell_type_spearman_across_samples": cell_type_spearman_across_samples,
             "cell_types": self.cell_types,
@@ -1299,6 +1520,52 @@ class DeconvRunner:
             "sample_pearson_across_cell_types": sample_pearson_across_cell_types,
             "sample_spearman_across_cell_types": sample_spearman_across_cell_types,
         }
+
+    def _evaluate(self) -> dict:
+        self.model.eval()
+        predictions = []
+        truths = []
+
+        if self.is_distributed:
+            dist.barrier()
+
+        with torch.no_grad():
+            for data, targets in self.test_loader:
+                data = {
+                    key: value.to(self.device, non_blocking=True)
+                    for key, value in data.items()
+                }
+                targets = targets.to(self.device, non_blocking=True)
+                logits = self.model(data)
+                predictions.append(F.softmax(logits, dim=-1))
+                truths.append(targets)
+
+        predictions = torch.cat(predictions, dim=0)
+        truths = torch.cat(truths, dim=0)
+
+        if self.is_distributed:
+            predictions = distributed_concat(predictions, self.test_dataset_size, self.world_size)
+            truths = distributed_concat(truths, self.test_dataset_size, self.world_size)
+
+        predictions_np = predictions.cpu().numpy()
+        truths_np = truths.cpu().numpy()
+        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
+        if loss_name == "kl":
+            test_loss = F.kl_div(
+                predictions.clamp_min(1e-12).log(),
+                truths,
+                reduction="batchmean",
+            ).item()
+        elif loss_name == "mse":
+            test_loss = F.mse_loss(predictions, truths).item()
+        else:
+            test_loss = F.l1_loss(predictions, truths).item()
+
+        return self._evaluation_metrics_from_arrays(
+            predictions_np,
+            truths_np,
+            test_loss=float(test_loss),
+        )
 
     def _flatten_fold_metrics(
         self,
@@ -1447,6 +1714,7 @@ class DeconvRunner:
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1454,7 +1722,7 @@ class DeconvRunner:
         try:
             self._setup_runtime()
             adata, targets, groups = self._prepare_cv_data()
-            splits = self._build_cv_splits(adata, groups)
+            splits = self._build_or_load_cv_splits(adata, groups)
             checkpoint_paths = self._get_checkpoint_paths()
             self._save_run_metadata(checkpoint_paths)
             if self.is_master:
@@ -1479,8 +1747,8 @@ class DeconvRunner:
                         + self.rank
                         + fold_idx
                     )
-                    train_adata = adata[train_idx].copy()
-                    test_adata = adata[test_idx].copy()
+                    train_adata = adata[train_idx]
+                    test_adata = adata[test_idx]
                     train_targets = targets[train_idx]
                     test_targets = targets[test_idx]
                     if self.is_master:
@@ -1561,6 +1829,8 @@ class DeconvRunner:
                             )
                         )
                     self._cleanup_fold_state()
+                    del train_adata, test_adata, train_targets, test_targets
+                    gc.collect()
 
                 if self.is_master:
                     aggregate_rows.append(
