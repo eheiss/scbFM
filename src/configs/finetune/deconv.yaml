@@ -23,13 +23,29 @@ adapter_dropout: 0.0
 adapter_learning_rate: 1e-4
 adapter_after_attention: true
 adapter_after_ff: true
-loss: kl
+# Optimize cell-type proportions on their original scale. MAE is the primary
+# held-out metric; KL and Jensen-Shannon metrics remain diagnostic outputs.
+loss: mse
 
 cv_folds: 5
 split_by_context: true
 context_columns: [dataset_id, donor_id, tissue_general]
 random_seed: 42
 cv_fold_manifest_path: auto
+# Reject the legacy fine-grained 829-target pseudobulk and audit the regenerated
+# broad Cell Ontology target space before any model is initialized.
+validate_broad_targets: true
+expected_generator_schema_version: 2
+min_target_cell_types: 15
+max_target_cell_types: 30
+min_active_cell_types: 2
+max_active_cell_types: 8
+min_positive_samples_per_cell_type: 50
+# Assign complete dataset/donor/tissue contexts while balancing broad target
+# presence and mass. The resulting manifest is shared by every runner.
+balanced_group_folds: true
+fold_balance_attempts: 64
+require_target_in_each_test_fold: true
 
 epochs: 20
 batch_size: 4

@@ -1,0 +1,46 @@
+Bootstrap: localimage
+From: /cluster/customapps/biomed/boeva/eheiss/singularity/scgpt.sif
+
+%labels
+    Author Enrico Heiss
+    Application scbFM zero-shot single-cell benchmarks
+    BaseImage scgpt.sif
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export JAX_PLATFORMS=cpu
+    export PATH=/opt/scbfm-single-cell/bin:$PATH
+
+%post
+    python -m venv --system-site-packages /opt/scbfm-single-cell
+    /opt/scbfm-single-cell/bin/python -m pip install --upgrade pip
+    /opt/scbfm-single-cell/bin/python -m pip install --no-cache-dir \
+        numpy==1.24.3 \
+        scipy==1.13.1 \
+        scikit-learn==1.5.2 \
+        scanpy==1.10.3 \
+        anndata==0.10.9 \
+        pandas==2.2.3 \
+        h5py==3.12.1 \
+        matplotlib==3.9.2 \
+        numba==0.60.0 \
+        llvmlite==0.43.0 \
+        scib-metrics==0.5.1 \
+        jax==0.4.30 \
+        jaxlib==0.4.30 \
+        chex==0.1.87 \
+        igraph==0.11.8 \
+        leidenalg==0.10.2 \
+        pynndescent==0.5.13 \
+        umap-learn==0.5.6 \
+        plottable==0.1.5
+
+%test
+    /opt/scbfm-single-cell/bin/python -c \
+        "import importlib.metadata as m; import scib_metrics, torch, torchtext; assert m.version('scib-metrics') == '0.5.1'; print('torch', torch.__version__, 'torchtext', torchtext.__version__, 'scib-metrics', m.version('scib-metrics'))"
+
+%runscript
+    exec /opt/scbfm-single-cell/bin/python "$@"

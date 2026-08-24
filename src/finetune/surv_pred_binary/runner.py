@@ -180,7 +180,7 @@ class SurvPredBinaryRunner:
 
     def _derive_binary_survival_labels(self, adata: ad.AnnData) -> np.ndarray:
         event_col = str(getattr(self.task_cfg, "survival_event_col", "OS"))
-        event = self._numeric_obs(adata, event_col)
+        event = SurvPredBinaryRunner._numeric_obs(adata, event_col)
         valid = np.isfinite(event)
 
         if valid.sum() < int(getattr(self.task_cfg, "cv_folds", 5)) * 2:
@@ -214,7 +214,7 @@ class SurvPredBinaryRunner:
 
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
-        labels = self._derive_binary_survival_labels(adata)
+        labels = SurvPredBinaryRunner._derive_binary_survival_labels(self, adata)
         adata.obs["survival_binary_label"] = labels
         adata.obs["cancer_type"] = labels
 
@@ -425,6 +425,7 @@ _GENERIC_METHODS_FROM_CANCER_CLASS_RUNNER = (
     "_should_preprocess_input",
     "_preprocess_adata",
     "_select_training_hvg_indices",
+    "_select_training_mad_indices",
     "_build_cv_splits",
     "_cv_manifest_source_rows",
     "_resolve_cv_fold_manifest_path",

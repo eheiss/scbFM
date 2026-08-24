@@ -71,6 +71,82 @@ class DrugResponseSetupTest(unittest.TestCase):
             self.assertEqual(len(rows), len(targets))
             self.assertEqual({int(row["fold"]) for row in rows}, {1, 2, 3, 4, 5})
 
+    def test_pair_fold_manifest_is_independent_of_input_row_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manifest = Path(temporary_directory) / "folds.csv"
+            runner = object.__new__(DrugRespRunner)
+            runner.task_cfg = SimpleNamespace(
+                cv_folds=3,
+                random_seed=42,
+                cv_fold_manifest_path=str(manifest),
+            )
+            runner.rank = 0
+            cell_ids = np.asarray(
+                ["cell-a", "cell-b", "cell-c", "cell-d", "cell-e", "cell-f"]
+            )
+            drug_ids = np.asarray(
+                ["drug-1", "drug-2", "drug-3", "drug-4", "drug-5", "drug-6"]
+            )
+            targets = np.linspace(-1.0, 1.0, 6, dtype=np.float32)
+
+            original_splits = runner._build_or_load_cv_splits(
+                cell_ids,
+                drug_ids,
+                targets,
+            )
+            original_fingerprint = runner._cv_fold_fingerprint
+            original_assignments = runner._fold_assignments_from_splits(
+                len(cell_ids),
+                original_splits,
+            )
+            fold_by_pair = {
+                (cell_id, drug_id): int(fold)
+                for cell_id, drug_id, fold in zip(
+                    cell_ids,
+                    drug_ids,
+                    original_assignments,
+                )
+            }
+
+            permutation = np.asarray([4, 0, 5, 2, 1, 3])
+            reordered_splits = runner._build_or_load_cv_splits(
+                cell_ids[permutation],
+                drug_ids[permutation],
+                targets[permutation],
+            )
+            reordered_assignments = runner._fold_assignments_from_splits(
+                len(cell_ids),
+                reordered_splits,
+            )
+
+            self.assertEqual(runner._cv_fold_fingerprint, original_fingerprint)
+            for cell_id, drug_id, fold in zip(
+                cell_ids[permutation],
+                drug_ids[permutation],
+                reordered_assignments,
+            ):
+                self.assertEqual(fold_by_pair[(cell_id, drug_id)], int(fold))
+
+    def test_expected_fold_fingerprint_requires_existing_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runner = object.__new__(DrugRespRunner)
+            runner.task_cfg = SimpleNamespace(
+                cv_folds=2,
+                random_seed=42,
+                cv_fold_manifest_path=str(
+                    Path(temporary_directory) / "missing.csv"
+                ),
+                expected_cv_fold_fingerprint="canonical-folds",
+            )
+            runner.rank = 0
+
+            with self.assertRaisesRegex(FileNotFoundError, "Refusing to recreate"):
+                runner._build_or_load_cv_splits(
+                    np.asarray(["cell-a", "cell-b"]),
+                    np.asarray(["drug-a", "drug-b"]),
+                    np.asarray([0.1, 0.2], dtype=np.float32),
+                )
+
     def test_raw_mlp_supports_expression_and_drug_only_variants(self) -> None:
         runner = object.__new__(DrugRespRawMLPRunner)
         matrix = np.ones((3, 5), dtype=np.float32)

@@ -1,0 +1,8 @@
+# The 2025-11-08 Census LTS documents compatibility with cellxgene-census 1.17.x.
+cellxgene-census==1.17.0
+# This is the TileDB-SOMA version used in the official Census compatibility example.
+tiledbsoma==1.15.5
+# Pin the AnnData writer used for resumable source chunks.
+anndata==0.10.9
+# AnnData 0.10.9 cannot serialize pandas 3 Arrow-backed string arrays.
+pandas==2.2.3

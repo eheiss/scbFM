@@ -27,6 +27,24 @@ class SurvPredSurvBoardBulkFormerPCARFRunner(CancTypeClassBulkFormerPCARFRunner)
     config_node = "surv_pred_survboard"
 
     @staticmethod
+    def _validate_bulkformer_expression_scale(
+        values: np.ndarray,
+        absolute_limit: float,
+    ) -> tuple[float, float]:
+        if not np.all(np.isfinite(values)):
+            raise ValueError("SurvBoard BulkFormer expression contains non-finite values.")
+        expression_min = float(np.min(values))
+        expression_max = float(np.max(values))
+        max_observed_magnitude = max(abs(expression_min), abs(expression_max))
+        if max_observed_magnitude > absolute_limit:
+            raise ValueError(
+                "BulkFormer expects normalized SurvBoard expression with bounded magnitude, "
+                f"but values span [{expression_min:.6g}, {expression_max:.6g}] "
+                f"with configured absolute limit {absolute_limit:.6g}."
+            )
+        return expression_min, expression_max
+
+    @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
         return SurvPredSurvBoardRunner._resolve_task_cfg(cfg)
 
@@ -101,19 +119,13 @@ class SurvPredSurvBoardBulkFormerPCARFRunner(CancTypeClassBulkFormerPCARFRunner)
         values = frame[columns].to_numpy(dtype=np.float32)
         if bool(getattr(self.task_cfg, "convert_log2_to_log1p", True)):
             values *= np.float32(np.log(2.0))
-        if not np.all(np.isfinite(values)):
-            raise ValueError("SurvBoard BulkFormer expression contains non-finite values.")
-        expression_min = float(np.min(values))
-        expression_max = float(np.max(values))
         max_expected = float(
             getattr(self.task_cfg, "bulkformer_max_expected_expression", 30.0)
         )
-        if expression_min < 0.0 or expression_max > max_expected:
-            raise ValueError(
-                "BulkFormer expects non-negative normalized log-expression, but "
-                f"SurvBoard values span [{expression_min:.6g}, {expression_max:.6g}] "
-                f"(configured maximum={max_expected:.6g})."
-            )
+        expression_min, expression_max = self._validate_bulkformer_expression_scale(
+            values,
+            max_expected,
+        )
         self._bulkformer_expression_min = expression_min
         self._bulkformer_expression_max = expression_max
         source = ad.AnnData(values)

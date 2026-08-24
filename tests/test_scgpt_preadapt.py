@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from pretrain.scgpt_preadapt_runner import (  # noqa: E402
+    ScGPTBulkDataset,
     ScGPTPreadaptRunner,
     SeededScGPTCollator,
     _random_train_validation_split,
@@ -76,6 +78,38 @@ class SeededCollatorTest(unittest.TestCase):
         second = collator(self._examples())
 
         self.assertFalse(torch.equal(first["masked_expr"], second["masked_expr"]))
+
+
+class ScGPTBulkDatasetTest(unittest.TestCase):
+    @staticmethod
+    def _dataset(values: np.ndarray) -> ScGPTBulkDataset:
+        dataset = ScGPTBulkDataset(
+            data_paths=[Path("unused.h5ad")],
+            file_indices=np.asarray([0]),
+            row_indices=np.asarray([0]),
+            record_indices=np.asarray([17]),
+            source_ids=np.asarray([3]),
+            source_gene_indices=[np.arange(values.size)],
+            vocab_gene_ids=[np.arange(100, 100 + values.size)],
+            cls_token_id=7,
+            cls_value=-2.0,
+        )
+        dataset._adatas[0] = SimpleNamespace(X=values.reshape(1, -1))
+        return dataset
+
+    def test_only_nonzero_genes_are_tokenized(self) -> None:
+        example = self._dataset(np.asarray([0.0, 2.0, 0.0, 4.0, 0.0]))[0]
+
+        torch.testing.assert_close(example["genes"], torch.tensor([7, 101, 103]))
+        torch.testing.assert_close(
+            example["expressions"], torch.tensor([-2.0, 2.0, 4.0])
+        )
+
+    def test_profile_without_expressed_mapped_genes_is_rejected(self) -> None:
+        dataset = self._dataset(np.zeros(4, dtype=np.float32))
+
+        with self.assertRaisesRegex(ValueError, "no non-zero vocabulary-matched genes"):
+            dataset[0]
 
 
 class GradientNormalizationTest(unittest.TestCase):

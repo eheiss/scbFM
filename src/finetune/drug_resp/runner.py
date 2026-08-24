@@ -790,13 +790,23 @@ class DrugRespRunner:
         ic50_df[model_id_col] = ic50_df[model_id_col].astype(str)
         ic50_df[drug_id_col] = ic50_df[drug_id_col].astype(str)
 
-        # Prefer GDSC2 over GDSC1 for duplicate (cell_line, drug) pairs
+        # Prefer GDSC2 over GDSC1 for duplicate pairs. Include explicit stable
+        # tie-breakers so pair order, deduplication, and CV folds are identical
+        # across runners and compute nodes.
+        ic50_df["_dataset_priority"] = (
+            ic50_df[dataset_col].map({"GDSC1": 0, "GDSC2": 1}).fillna(0)
+        )
+        ic50_df["_source_row"] = np.arange(len(ic50_df), dtype=np.int64)
         ic50_df = ic50_df.sort_values(
-            dataset_col,
-            key=lambda s: s.map({"GDSC1": 0, "GDSC2": 1}).fillna(0),
-            ascending=True,
+            [model_id_col, drug_id_col, "_dataset_priority", "_source_row"],
+            kind="stable",
         )
         ic50_df = ic50_df.drop_duplicates(subset=[model_id_col, drug_id_col], keep="last")
+        ic50_df = ic50_df.drop(columns=["_dataset_priority", "_source_row"])
+        ic50_df = ic50_df.sort_values(
+            [model_id_col, drug_id_col],
+            kind="stable",
+        )
         ic50_df[ic50_col] = pd.to_numeric(ic50_df[ic50_col], errors="coerce")
         ic50_df = ic50_df[np.isfinite(ic50_df[ic50_col].to_numpy(dtype=float))]
         ic50_df = ic50_df.reset_index(drop=True)
@@ -1000,11 +1010,15 @@ class DrugRespRunner:
         ic50_path = Path(
             hydra.utils.to_absolute_path(str(getattr(self.task_cfg, "ic50_data_path", "")))
         )
+        canonical_rows = sorted(
+            source_rows,
+            key=lambda row: (row["cell_line_id"], row["drug_id"]),
+        )
         signature_payload = {
             "task": self.task_name,
             "cv_folds": int(getattr(self.task_cfg, "cv_folds", 5)),
             "random_seed": int(getattr(self.task_cfg, "random_seed", 42)),
-            "pairs": source_rows,
+            "pairs": canonical_rows,
         }
         source_fingerprint = hashlib.sha256(
             json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode(
@@ -1020,7 +1034,7 @@ class DrugRespRunner:
         self,
         manifest_path: Path,
         source_rows: list[dict[str, str]],
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], str]:
         with manifest_path.open("r", newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         required_fields = {"cell_line_id", "drug_id", "target", "fold"}
@@ -1036,11 +1050,38 @@ class DrugRespRunner:
                 f"expected {len(source_rows)}."
             )
 
-        assignments = np.empty(len(rows), dtype=np.int64)
-        for index, (observed, expected) in enumerate(zip(rows, source_rows)):
-            if {key: observed[key] for key in expected} != expected:
+        manifest_by_pair: dict[tuple[str, str], dict[str, str]] = {}
+        for row_index, observed in enumerate(rows):
+            pair_key = (observed["cell_line_id"], observed["drug_id"])
+            if pair_key in manifest_by_pair:
                 raise ValueError(
-                    f"CV fold manifest {manifest_path} differs from canonical pair row {index}."
+                    f"CV fold manifest {manifest_path} contains duplicate pair "
+                    f"{pair_key!r} at row {row_index}."
+                )
+            manifest_by_pair[pair_key] = observed
+
+        source_pair_keys = {
+            (row["cell_line_id"], row["drug_id"])
+            for row in source_rows
+        }
+        manifest_pair_keys = set(manifest_by_pair)
+        if source_pair_keys != manifest_pair_keys:
+            missing = sorted(source_pair_keys - manifest_pair_keys)
+            unexpected = sorted(manifest_pair_keys - source_pair_keys)
+            raise ValueError(
+                f"CV fold manifest {manifest_path} contains different pairs: "
+                f"missing={missing[:5]}, unexpected={unexpected[:5]}."
+            )
+
+        assignments = np.empty(len(source_rows), dtype=np.int64)
+        for index, expected in enumerate(source_rows):
+            pair_key = (expected["cell_line_id"], expected["drug_id"])
+            observed = manifest_by_pair[pair_key]
+            if observed["target"] != expected["target"]:
+                raise ValueError(
+                    f"CV fold manifest {manifest_path} has target "
+                    f"{observed['target']} for pair {pair_key!r}; expected "
+                    f"{expected['target']}."
                 )
             assignments[index] = int(observed["fold"])
 
@@ -1049,11 +1090,18 @@ class DrugRespRunner:
             raise ValueError(
                 f"CV fold manifest {manifest_path} must contain folds 1..{n_folds}."
             )
-        indices = np.arange(len(rows), dtype=np.int64)
-        return [
+        indices = np.arange(len(source_rows), dtype=np.int64)
+        splits = [
             (indices[assignments != fold], indices[assignments == fold])
             for fold in range(1, n_folds + 1)
         ]
+        fold_fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{row['cell_line_id']}\t{row['drug_id']}\t{int(row['fold'])}"
+                for row in rows
+            ).encode("utf-8")
+        ).hexdigest()
+        return splits, fold_fingerprint
 
     def _build_or_load_cv_splits(
         self,
@@ -1070,12 +1118,24 @@ class DrugRespRunner:
         if manifest_path is None:
             return self._build_cv_splits(len(source_rows))
 
+        expected_fold_fingerprint = str(
+            getattr(self.task_cfg, "expected_cv_fold_fingerprint", "") or ""
+        ).strip().lower()
+        if expected_fold_fingerprint and not manifest_path.exists():
+            raise FileNotFoundError(
+                "The configured canonical drug-response CV fold manifest is missing: "
+                f"{manifest_path}. Refusing to recreate benchmark folds."
+            )
+
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             if manifest_path.exists():
-                splits = self._load_cv_fold_manifest(manifest_path, source_rows)
+                splits, fold_fingerprint = self._load_cv_fold_manifest(
+                    manifest_path,
+                    source_rows,
+                )
             else:
                 splits = self._build_cv_splits(len(source_rows))
                 assignments = self._fold_assignments_from_splits(len(source_rows), splits)
@@ -1094,15 +1154,23 @@ class DrugRespRunner:
                     os.replace(temporary_path, manifest_path)
                 finally:
                     temporary_path.unlink(missing_ok=True)
+                fold_fingerprint = hashlib.sha256(
+                    "\n".join(
+                        f"{row['cell_line_id']}\t{row['drug_id']}\t{int(fold)}"
+                        for row, fold in zip(source_rows, assignments)
+                    ).encode("utf-8")
+                ).hexdigest()
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
-        assignments = self._fold_assignments_from_splits(len(source_rows), splits)
-        fold_fingerprint = hashlib.sha256(
-            "\n".join(
-                f"{row['cell_line_id']}\t{row['drug_id']}\t{int(fold)}"
-                for row, fold in zip(source_rows, assignments)
-            ).encode("utf-8")
-        ).hexdigest()
+        if (
+            expected_fold_fingerprint
+            and fold_fingerprint != expected_fold_fingerprint
+        ):
+            raise ValueError(
+                f"Canonical drug-response CV fold manifest {manifest_path} has "
+                f"fingerprint {fold_fingerprint}; expected "
+                f"{expected_fold_fingerprint}."
+            )
         self._cv_fold_manifest_path = manifest_path
         self._cv_fold_fingerprint = fold_fingerprint
         log.info(

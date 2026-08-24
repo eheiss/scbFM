@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -41,6 +42,7 @@ from finetune.surv_pred_survboard.runner import (  # noqa: E402
     cox_partial_log_likelihood,
     d_calibration,
 )
+from finetune.canc_type_class.runner import CancTypeClassRunner  # noqa: E402
 
 
 class SurvivalSetupTest(unittest.TestCase):
@@ -131,6 +133,99 @@ class SurvivalSetupTest(unittest.TestCase):
         self.assertIn('"n_outer_splits": None', source)
         self.assertIn('"survboard_split_fingerprint": None', source)
 
+    def test_pan_delegated_loader_does_not_require_numeric_helper(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "sample_id": [f"sample_{index}" for index in range(5)],
+                "patient_id": [f"patient_{index}" for index in range(5)],
+                "project": ["BRCA"] * 5,
+                "OS.time": ["10", "20", "30", "40", "50"],
+                "OS": ["0", "1", "0", "1", "0"],
+            }
+        )
+        delegated_runner = SimpleNamespace(
+            task_cfg=SimpleNamespace(
+                tcga_data_dir=__file__,
+                project_col="project",
+                patient_col="patient_id",
+                cohorts=[],
+                merge_gbm_lgg=False,
+                survival_time_col="OS.time",
+                survival_event_col="OS",
+            )
+        )
+        fake_adata = SimpleNamespace(obs=frame)
+        with patch("finetune.surv_pred.runner.ad.read_h5ad", return_value=fake_adata):
+            with self.assertRaisesRegex(ValueError, "Only 5 TCGA samples"):
+                SurvPredRunner._load_tcga_survival_data(delegated_runner)
+
+    def test_binary_runner_binds_training_fold_mad_selector(self) -> None:
+        runner = object.__new__(SurvPredBinaryRunner)
+        runner.selected_gene_count = 2
+        runner.task_cfg = SimpleNamespace(hvg_selection_method="mad")
+        adata = SimpleNamespace(
+            X=np.asarray(
+                [
+                    [0.0, 1.0, 1.0],
+                    [0.0, 4.0, 2.0],
+                    [0.0, 7.0, 3.0],
+                ],
+                dtype=np.float32,
+            ),
+            n_vars=3,
+        )
+        np.testing.assert_array_equal(
+            runner._select_training_hvg_indices(adata),
+            np.asarray([1, 2]),
+        )
+
+    def test_binary_delegated_label_parser_does_not_require_numeric_helper(self) -> None:
+        delegated_runner = SimpleNamespace(
+            task_cfg=SimpleNamespace(survival_event_col="OS", cv_folds=5),
+            is_master=False,
+        )
+        adata = SimpleNamespace(
+            obs=pd.DataFrame({"OS": ["0", "1"] * 5}),
+            n_obs=10,
+        )
+        labels = SurvPredBinaryRunner._derive_binary_survival_labels(
+            delegated_runner,
+            adata,
+        )
+        np.testing.assert_array_equal(labels, np.asarray(["0", "1"] * 5))
+
+    def test_binary_pca_runners_delegate_label_parsing_safely(self) -> None:
+        for runner_class in (
+            SurvPredBinaryPCARFRunner,
+            SurvPredBinaryRawPCARFRunner,
+        ):
+            runner = object.__new__(runner_class)
+            runner.task_cfg = SimpleNamespace(survival_event_col="OS", cv_folds=5)
+            runner.is_master = False
+            runner._load_input_adata = lambda: SimpleNamespace(
+                obs=pd.DataFrame(
+                    {
+                        "OS": ["0", "1"] * 5,
+                        "patient_id": [f"patient_{index}" for index in range(10)],
+                    }
+                ),
+                n_obs=10,
+                n_vars=3,
+            )
+            runner._preprocess_adata = lambda adata: adata
+            _adata, labels, groups = runner._prepare_cv_data()
+            np.testing.assert_array_equal(labels, np.asarray(["0", "1"] * 5))
+            self.assertIsNone(groups)
+
+    def test_survival_pca_runner_delegates_checkpoint_validation(self) -> None:
+        runner = object.__new__(SurvPredPCARFRunner)
+        with patch.object(
+            CancTypeClassRunner,
+            "_validate_backbone_checkpoint",
+        ) as validator:
+            runner._validate_backbone_checkpoint({}, "checkpoint.pth")
+        validator.assert_called_once_with(runner, {}, "checkpoint.pth")
+
     def test_survboard_split_reader_skips_csv_header_and_hashes_splits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -164,6 +259,28 @@ class SurvivalSetupTest(unittest.TestCase):
             )
             self.assertEqual(
                 runner._get_checkpoint_paths(), {"pretrain_bulk": "checkpoint.pth"}
+            )
+
+    def test_survboard_bulkformer_accepts_signed_normalized_expression(self) -> None:
+        values = np.asarray([[-2.6, 0.0, 4.5], [1.0, -1.5, 3.0]], dtype=np.float32)
+        expression_min, expression_max = (
+            SurvPredSurvBoardBulkFormerPCARFRunner._validate_bulkformer_expression_scale(
+                values,
+                30.0,
+            )
+        )
+        self.assertAlmostEqual(expression_min, -2.6, places=5)
+        self.assertAlmostEqual(expression_max, 4.5, places=5)
+
+        with self.assertRaisesRegex(ValueError, "bounded magnitude"):
+            SurvPredSurvBoardBulkFormerPCARFRunner._validate_bulkformer_expression_scale(
+                np.asarray([[-30.1, 1.0]], dtype=np.float32),
+                30.0,
+            )
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            SurvPredSurvBoardBulkFormerPCARFRunner._validate_bulkformer_expression_scale(
+                np.asarray([[np.nan, 1.0]], dtype=np.float32),
+                30.0,
             )
 
     def test_config_and_container_contracts(self) -> None:
@@ -239,6 +356,12 @@ class SurvivalSetupTest(unittest.TestCase):
         ).read_text()
         self.assertIn("BLCA BRCA", common)
         self.assertIn("GBM READ", common)
+
+        for task in ("surv_pred", "surv_pred_binary"):
+            bulkformer_job = (
+                job_root / task / f"{task}_bulkformer_pca_rf-job.sh"
+            ).read_text()
+            self.assertIn("#SBATCH --mem=192G", bulkformer_job)
         self.assertIn("survboard_repeated_five_fold_cross_validation", common)
         self.assertIn("n_outer_splits", common)
 

@@ -10,5 +10,7 @@ defaults:
   - finetune@finetune.disease_class: disease_class
   - finetune@finetune.gene_essent: gene_essent
   - finetune@finetune.drug_resp: drug_resp
+  - finetune@finetune.batch_integration: batch_integration
+  - finetune@finetune.cell_type_annotation: cell_type_annotation
 
 task: pretrain

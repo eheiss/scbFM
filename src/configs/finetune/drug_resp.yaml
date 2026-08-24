@@ -48,9 +48,11 @@ head_bottleneck_dim: 256
 
 # Training
 cv_folds: 5
-# Persist canonical pair-to-fold assignments beside the IC50 table. Every
-# drug-response runner validates and reuses this manifest.
-cv_fold_manifest_path: auto
+# Canonical pair-to-fold assignments used by the completed benchmark runs.
+# Every drug-response runner joins this manifest by (cell line, drug) identity
+# and verifies the fingerprint before fitting or evaluating a model.
+cv_fold_manifest_path: /cluster/work/boeva/eheiss/datasets/GDSC/drug_response_prediction_IC50_drug_resp_6e86893658933c75_cv_folds.csv
+expected_cv_fold_fingerprint: f57411b49dbb865525cbf41f3b5975891654bbda63fee005dcec78fdb31996a8
 epochs: 20
 batch_size: 4
 num_workers: 2

@@ -169,10 +169,20 @@ class ScGPTBulkDataset(Dataset):
             np.float32,
             copy=False,
         )
+        expressed = np.flatnonzero(values)
+        if expressed.size == 0:
+            raise ValueError(
+                "scGPT pre-adaptation encountered a profile with no non-zero "
+                "vocabulary-matched genes: "
+                f"record_index={int(self.record_indices[index])}, "
+                f"source_id={int(self.source_ids[index])}, row_index={row_index}."
+            )
+        values = values[expressed]
+        vocab_gene_ids = self.vocab_gene_ids[file_index][expressed]
         genes = np.concatenate(
             (
                 np.asarray([self.cls_token_id], dtype=np.int64),
-                self.vocab_gene_ids[file_index],
+                vocab_gene_ids,
             )
         )
         expressions = np.concatenate(
@@ -379,6 +389,11 @@ class ScGPTPreadaptRunner:
         if int(self.pretrain_cfg.max_seq_len) != 1200:
             raise ValueError(
                 "scgpt_preadapt must use max_seq_len=1200 (1,199 genes plus CLS)."
+            )
+        if str(self.pretrain_cfg.input_gene_filter) != "nonzero_per_profile":
+            raise ValueError(
+                "scgpt_preadapt must use input_gene_filter=nonzero_per_profile "
+                "to match native scGPT foundation pretraining."
             )
         if not bool(self.pretrain_cfg.do_mvc):
             raise ValueError("scgpt_preadapt requires both MLM and MVC objectives.")
@@ -1293,6 +1308,7 @@ class ScGPTPreadaptRunner:
             "seed": int(self.pretrain_cfg.seed),
             "validation_split": float(self.pretrain_cfg.validation_split),
             "max_seq_len": int(self.pretrain_cfg.max_seq_len),
+            "input_gene_filter": str(self.pretrain_cfg.input_gene_filter),
             "expected_source_gene_count": int(
                 self.pretrain_cfg.expected_source_gene_count
             ),
@@ -1476,6 +1492,7 @@ class ScGPTPreadaptRunner:
                 if parameter.requires_grad
             ),
             "max_seq_len": int(self.pretrain_cfg.max_seq_len),
+            "input_gene_filter": str(self.pretrain_cfg.input_gene_filter),
             "source_gene_count": int(
                 self.pretrain_cfg.expected_source_gene_count
             ),
@@ -1515,7 +1532,8 @@ class ScGPTPreadaptRunner:
             "gene_mapping": gene_counts,
             "checkpoint_loading": self.load_report,
             "max_seq_len": int(self.pretrain_cfg.max_seq_len),
-            "selected_gene_count": int(self.pretrain_cfg.max_seq_len) - 1,
+            "input_gene_filter": str(self.pretrain_cfg.input_gene_filter),
+            "maximum_selected_gene_count": int(self.pretrain_cfg.max_seq_len) - 1,
             "do_mvc": bool(self.pretrain_cfg.do_mvc),
             "mvc_loss_weight": float(self.pretrain_cfg.mvc_loss_weight),
             "epochs": int(self.pretrain_cfg.epochs),

@@ -322,6 +322,9 @@ class DeconvRunner:
                 "head_only_backbone_eval": self._finetune_mode() == "head_only",
                 "output_suffix": self._output_suffix(),
                 "representation": "cls",
+                "training_objective": self._training_objective(),
+                "primary_evaluation_metric": "mae",
+                "dataset_audit": getattr(self, "_dataset_audit", {}),
                 "head_hidden_dim": int(getattr(self.task_cfg, "head_hidden_dim", 512)),
                 "head_bottleneck_dim": int(
                     getattr(self.task_cfg, "head_bottleneck_dim", 256)
@@ -343,6 +346,9 @@ class DeconvRunner:
             checkpoint_paths=checkpoint_paths,
             repo_dir=ROOT / "scbFM",
         )
+
+    def _training_objective(self) -> str:
+        return str(getattr(self.task_cfg, "loss", "mse")).lower()
 
     @staticmethod
     def _aggregate_numeric_rows(rows: list[dict[str, object]]) -> dict[str, object]:
@@ -571,6 +577,105 @@ class DeconvRunner:
             raise ValueError("Cell type proportions must be non-negative.")
         return targets
 
+    def _validate_broad_target_dataset(
+        self,
+        adata: ad.AnnData,
+        targets: np.ndarray,
+        groups: np.ndarray | None,
+    ) -> None:
+        if not bool(getattr(self.task_cfg, "validate_broad_targets", False)):
+            return
+
+        expected_schema = int(
+            getattr(self.task_cfg, "expected_generator_schema_version", 2)
+        )
+        observed_schema = int(adata.uns.get("deconv_generator_schema_version", -1))
+        if observed_schema != expected_schema:
+            raise ValueError(
+                "Deconvolution requires the regenerated broad-target pseudobulk "
+                f"(schema {expected_schema}), but the input reports schema "
+                f"{observed_schema}."
+            )
+        if not np.all(np.isfinite(targets)) or np.any(targets < 0):
+            raise ValueError("Deconvolution targets must be finite and non-negative.")
+        row_sums = targets.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-6):
+            raise ValueError(
+                "Deconvolution target rows must sum to one; observed range "
+                f"{row_sums.min():.8f}..{row_sums.max():.8f}."
+            )
+
+        target_count = targets.shape[1]
+        minimum_targets = int(getattr(self.task_cfg, "min_target_cell_types", 15))
+        maximum_targets = int(getattr(self.task_cfg, "max_target_cell_types", 30))
+        if not minimum_targets <= target_count <= maximum_targets:
+            raise ValueError(
+                f"Deconvolution input has {target_count} target cell types; expected "
+                f"{minimum_targets}..{maximum_targets}."
+            )
+        active_counts = np.count_nonzero(targets > 0, axis=1)
+        minimum_active = int(getattr(self.task_cfg, "min_active_cell_types", 2))
+        maximum_active = int(getattr(self.task_cfg, "max_active_cell_types", 8))
+        if active_counts.min() < minimum_active or active_counts.max() > maximum_active:
+            raise ValueError(
+                "Active target counts violate the configured pseudobulk design: "
+                f"observed {active_counts.min()}..{active_counts.max()}, expected "
+                f"{minimum_active}..{maximum_active}."
+            )
+
+        positive_samples = np.count_nonzero(targets > 0, axis=0)
+        minimum_positive = int(
+            getattr(self.task_cfg, "min_positive_samples_per_cell_type", 50)
+        )
+        rare = [
+            self.cell_types[index]
+            for index, count in enumerate(positive_samples)
+            if count < minimum_positive
+        ]
+        if rare:
+            raise ValueError(
+                "Broad target cell types occur in too few pseudobulk samples: "
+                f"{rare}. Minimum is {minimum_positive}."
+            )
+
+        positive_groups: dict[str, int] = {}
+        if groups is not None:
+            group_array = np.asarray(groups).astype(str)
+            positive_groups = {
+                cell_type: int(np.unique(group_array[targets[:, index] > 0]).size)
+                for index, cell_type in enumerate(self.cell_types)
+            }
+            insufficient = [
+                cell_type
+                for cell_type, count in positive_groups.items()
+                if count < int(getattr(self.task_cfg, "cv_folds", 5))
+            ]
+            if insufficient:
+                raise ValueError(
+                    "Broad target cell types occur in fewer context groups than CV folds: "
+                    f"{insufficient}."
+                )
+
+        self._dataset_audit = {
+            "generator_schema_version": observed_schema,
+            "samples": int(targets.shape[0]),
+            "target_cell_types": target_count,
+            "cell_types": list(self.cell_types),
+            "active_cell_types_min": int(active_counts.min()),
+            "active_cell_types_mean": float(active_counts.mean()),
+            "active_cell_types_max": int(active_counts.max()),
+            "zero_target_fraction": float(np.mean(targets == 0)),
+            "positive_samples_by_cell_type": dict(
+                zip(self.cell_types, positive_samples.astype(int).tolist())
+            ),
+            "positive_contexts_by_cell_type": positive_groups,
+            "cell_ontology_release": str(adata.uns.get("cell_ontology_release", "")),
+            "cell_ontology_sha256": str(adata.uns.get("cell_ontology_sha256", "")),
+            "broad_cell_type_config_sha256": str(
+                adata.uns.get("broad_cell_type_config_sha256", "")
+            ),
+        }
+
     def _prepare_cv_data(self) -> tuple[ad.AnnData, np.ndarray, np.ndarray | None]:
         adata = self._load_input_adata()
         if self._should_preprocess_input():
@@ -641,6 +746,9 @@ class DeconvRunner:
                     f"split_by_context=true but these context columns are missing: {missing_context}"
                 )
             groups = adata.obs[context_columns].astype(str).agg("||".join, axis=1).to_numpy()
+
+        self._validate_broad_target_dataset(adata, targets, groups)
+        self._cv_targets = targets
 
         return adata, targets, groups
 
@@ -718,6 +826,21 @@ class DeconvRunner:
                 raise ValueError(
                     f"cv_folds={n_splits} is larger than the number of context groups ({unique_groups.size})."
                 )
+            targets = getattr(self, "_cv_targets", None)
+            if (
+                bool(getattr(self.task_cfg, "balanced_group_folds", False))
+                and targets is not None
+            ):
+                assignments = self._balanced_group_fold_assignments(
+                    np.asarray(groups).astype(str),
+                    np.asarray(targets, dtype=np.float64),
+                    n_splits,
+                )
+                indices = np.arange(adata.n_obs, dtype=np.int64)
+                return [
+                    (indices[assignments != fold], indices[assignments == fold])
+                    for fold in range(1, n_splits + 1)
+                ]
             splitter = GroupKFold(n_splits=n_splits)
             return list(splitter.split(np.zeros(adata.n_obs), groups=groups))
 
@@ -729,6 +852,168 @@ class DeconvRunner:
             random_state=int(getattr(self.task_cfg, "random_seed", 42)),
         )
         return list(splitter.split(np.arange(adata.n_obs)))
+
+    def _balanced_group_fold_assignments(
+        self,
+        groups: np.ndarray,
+        targets: np.ndarray,
+        n_splits: int,
+    ) -> np.ndarray:
+        if targets.ndim != 2 or targets.shape[0] != groups.shape[0]:
+            raise ValueError("Balanced deconvolution folds require one target row per sample.")
+        unique_groups, group_inverse = np.unique(groups, return_inverse=True)
+        n_groups = unique_groups.size
+        n_targets = targets.shape[1]
+        group_sizes = np.bincount(group_inverse, minlength=n_groups).astype(np.float64)
+        group_presence = np.zeros((n_groups, n_targets), dtype=np.float64)
+        group_mass = np.zeros((n_groups, n_targets), dtype=np.float64)
+        np.add.at(group_presence, group_inverse, (targets > 0).astype(np.float64))
+        np.add.at(group_mass, group_inverse, targets)
+
+        groups_per_target = np.count_nonzero(group_presence > 0, axis=0)
+        impossible = [
+            self.cell_types[index]
+            for index, count in enumerate(groups_per_target)
+            if count < n_splits
+        ]
+        if impossible:
+            raise ValueError(
+                "Cannot place every target in every grouped test fold; fewer than "
+                f"{n_splits} positive context groups for: {impossible}."
+            )
+
+        target_size = group_sizes.sum() / n_splits
+        target_presence = group_presence.sum(axis=0) / n_splits
+        target_mass = group_mass.sum(axis=0) / n_splits
+        rarity = 1.0 / np.maximum(groups_per_target, 1)
+        rarity_score = (group_presence > 0) @ rarity
+        attempts = int(getattr(self.task_cfg, "fold_balance_attempts", 64))
+        seed = int(getattr(self.task_cfg, "random_seed", 42))
+        best_group_assignment: np.ndarray | None = None
+        best_score = float("inf")
+
+        for attempt in range(max(1, attempts)):
+            rng = np.random.default_rng(seed + attempt)
+            order = np.lexsort(
+                (
+                    rng.random(n_groups),
+                    -group_sizes,
+                    -rarity_score,
+                )
+            )
+            fold_sizes = np.zeros(n_splits, dtype=np.float64)
+            fold_presence = np.zeros((n_splits, n_targets), dtype=np.float64)
+            fold_mass = np.zeros((n_splits, n_targets), dtype=np.float64)
+            group_assignment = np.full(n_groups, -1, dtype=np.int64)
+
+            for group_index in order:
+                candidate_scores: list[tuple[float, float, int]] = []
+                for fold_index in rng.permutation(n_splits):
+                    fold_sizes[fold_index] += group_sizes[group_index]
+                    fold_presence[fold_index] += group_presence[group_index]
+                    fold_mass[fold_index] += group_mass[group_index]
+                    size_loss = np.mean(
+                        ((fold_sizes - target_size) / max(target_size, 1.0)) ** 2
+                    )
+                    presence_loss = np.mean(
+                        (
+                            (fold_presence - target_presence[None, :])
+                            / np.maximum(target_presence[None, :], 1.0)
+                        )
+                        ** 2
+                    )
+                    mass_loss = np.mean(
+                        (
+                            (fold_mass - target_mass[None, :])
+                            / np.maximum(target_mass[None, :], 1e-8)
+                        )
+                        ** 2
+                    )
+                    score = float(size_loss + presence_loss + 0.25 * mass_loss)
+                    candidate_scores.append((score, fold_sizes[fold_index], int(fold_index)))
+                    fold_sizes[fold_index] -= group_sizes[group_index]
+                    fold_presence[fold_index] -= group_presence[group_index]
+                    fold_mass[fold_index] -= group_mass[group_index]
+
+                _score, _fold_size, selected_fold = min(candidate_scores)
+                group_assignment[group_index] = selected_fold
+                fold_sizes[selected_fold] += group_sizes[group_index]
+                fold_presence[selected_fold] += group_presence[group_index]
+                fold_mass[selected_fold] += group_mass[group_index]
+
+            if np.any(fold_sizes == 0) or np.any(fold_presence == 0):
+                continue
+            final_score = float(
+                np.mean(((fold_sizes - target_size) / max(target_size, 1.0)) ** 2)
+                + np.mean(
+                    (
+                        (fold_presence - target_presence[None, :])
+                        / np.maximum(target_presence[None, :], 1.0)
+                    )
+                    ** 2
+                )
+                + 0.25
+                * np.mean(
+                    (
+                        (fold_mass - target_mass[None, :])
+                        / np.maximum(target_mass[None, :], 1e-8)
+                    )
+                    ** 2
+                )
+            )
+            if final_score < best_score:
+                best_score = final_score
+                best_group_assignment = group_assignment.copy()
+
+        if best_group_assignment is None:
+            raise ValueError(
+                "Could not construct grouped folds containing every broad cell type. "
+                "Inspect the pseudobulk target/context audit before training."
+            )
+        return best_group_assignment[group_inverse] + 1
+
+    def _validate_cv_target_coverage(
+        self,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+    ) -> None:
+        targets = getattr(self, "_cv_targets", None)
+        if targets is None:
+            return
+        targets = np.asarray(targets)
+        require_test = bool(
+            getattr(self.task_cfg, "require_target_in_each_test_fold", False)
+        )
+        fold_audit: list[dict[str, object]] = []
+        for fold, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_positive = np.count_nonzero(targets[train_idx] > 0, axis=0)
+            test_positive = np.count_nonzero(targets[test_idx] > 0, axis=0)
+            missing_train = [
+                self.cell_types[index]
+                for index, count in enumerate(train_positive)
+                if count == 0
+            ]
+            missing_test = [
+                self.cell_types[index]
+                for index, count in enumerate(test_positive)
+                if count == 0
+            ]
+            if missing_train or (require_test and missing_test):
+                raise ValueError(
+                    f"Deconvolution fold {fold} has incomplete target coverage: "
+                    f"missing_train={missing_train}, missing_test={missing_test}."
+                )
+            fold_audit.append(
+                {
+                    "fold": fold,
+                    "train_samples": int(len(train_idx)),
+                    "test_samples": int(len(test_idx)),
+                    "minimum_train_positive_samples": int(train_positive.min()),
+                    "minimum_test_positive_samples": int(test_positive.min()),
+                }
+            )
+        self._fold_target_audit = fold_audit
+        if hasattr(self, "_dataset_audit"):
+            self._dataset_audit["fold_target_coverage"] = fold_audit
 
     def _cv_manifest_source_rows(
         self,
@@ -776,6 +1061,13 @@ class DeconvRunner:
                 str(value) for value in getattr(self.task_cfg, "context_columns", [])
             ],
             "samples": source_rows,
+            "target_sha256": (
+                hashlib.sha256(
+                    np.ascontiguousarray(self._cv_targets, dtype=np.float32).tobytes()
+                ).hexdigest()
+                if getattr(self, "_cv_targets", None) is not None
+                else ""
+            ),
         }
         source_fingerprint = hashlib.sha256(
             json.dumps(
@@ -852,7 +1144,9 @@ class DeconvRunner:
         source_rows = self._cv_manifest_source_rows(adata, groups)
         manifest_path = self._resolve_cv_fold_manifest_path(source_rows)
         if manifest_path is None:
-            return self._build_cv_splits(adata, groups)
+            splits = self._build_cv_splits(adata, groups)
+            self._validate_cv_target_coverage(splits)
+            return splits
 
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
@@ -881,6 +1175,7 @@ class DeconvRunner:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
         assignments = self._fold_assignments_from_splits(adata.n_obs, splits)
+        self._validate_cv_target_coverage(splits)
         if groups is not None:
             groups_array = np.asarray(groups).astype(str)
             split_groups = [
@@ -1237,7 +1532,7 @@ class DeconvRunner:
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, float]:
-        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
+        loss_name = str(getattr(self.task_cfg, "loss", "mse")).lower()
         if loss_name == "kl":
             return (
                 F.kl_div(F.log_softmax(logits, dim=-1), targets, reduction="sum"),
@@ -1439,6 +1734,10 @@ class DeconvRunner:
         per_type_prediction_std = np.std(predictions_np, axis=0)
         per_type_truth_mean = np.mean(truths_np, axis=0)
         per_type_truth_std = np.std(truths_np, axis=0)
+        sample_total_variation = 0.5 * np.sum(
+            np.abs(predictions_np - truths_np),
+            axis=1,
+        )
         (
             cell_type_pearson_across_samples,
             cell_type_spearman_across_samples,
@@ -1472,10 +1771,15 @@ class DeconvRunner:
             mean_baseline_js_distance,
             mean_baseline_js_divergence,
         ) = self._distribution_metrics(mean_baseline, truths_np)
+        mean_baseline_total_variation = 0.5 * np.sum(
+            np.abs(mean_baseline - truths_np),
+            axis=1,
+        )
         return {
             "loss": float(test_loss),
             "mae": float(mean_absolute_error(truths_np, predictions_np)),
             "rmse": float(np.sqrt(mean_squared_error(truths_np, predictions_np))),
+            "total_variation_distance": float(np.mean(sample_total_variation)),
             "mean_cell_type_pearson_across_samples": mean_cell_type_pearson_across_samples,
             "mean_cell_type_spearman_across_samples": mean_cell_type_spearman_across_samples,
             "mean_sample_pearson_across_cell_types": mean_sample_pearson_across_cell_types,
@@ -1486,6 +1790,9 @@ class DeconvRunner:
             "mean_baseline_mae": float(mean_absolute_error(truths_np, mean_baseline)),
             "mean_baseline_rmse": float(
                 np.sqrt(mean_squared_error(truths_np, mean_baseline))
+            ),
+            "mean_baseline_total_variation_distance": float(
+                np.mean(mean_baseline_total_variation)
             ),
             "mean_baseline_kl_divergence": mean_baseline_kl_divergence,
             "mean_baseline_js_distance": mean_baseline_js_distance,
@@ -1519,6 +1826,7 @@ class DeconvRunner:
             "truths": truths_np,
             "sample_pearson_across_cell_types": sample_pearson_across_cell_types,
             "sample_spearman_across_cell_types": sample_spearman_across_cell_types,
+            "sample_total_variation_distance": sample_total_variation,
         }
 
     def _evaluate(self) -> dict:
@@ -1549,7 +1857,7 @@ class DeconvRunner:
 
         predictions_np = predictions.cpu().numpy()
         truths_np = truths.cpu().numpy()
-        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
+        loss_name = str(getattr(self.task_cfg, "loss", "mse")).lower()
         if loss_name == "kl":
             test_loss = F.kl_div(
                 predictions.clamp_min(1e-12).log(),
@@ -1622,6 +1930,10 @@ class DeconvRunner:
             test_metrics["sample_spearman_across_cell_types"],
             dtype=float,
         )
+        sample_total_variation = np.asarray(
+            test_metrics["sample_total_variation_distance"],
+            dtype=float,
+        )
         rows: list[dict[str, object]] = []
         context_columns = [
             col
@@ -1644,6 +1956,7 @@ class DeconvRunner:
                 "sample_id": sample_id,
                 "sample_pearson_across_cell_types": float(sample_pearson[sample_idx]),
                 "sample_spearman_across_cell_types": float(sample_spearman[sample_idx]),
+                "total_variation_distance": float(sample_total_variation[sample_idx]),
             }
             for col in context_columns:
                 row[col] = context_values[col][sample_idx]

@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 class DeconvPCARFRunner(DeconvRunner):
     """Frozen scbFM CLS embeddings followed by PCA and multi-output RF."""
 
+    def _training_objective(self) -> str:
+        return "random_forest_squared_error"
+
     def _finetune_mode(self) -> str:
         variant = str(getattr(self.task_cfg, "pca_rf_variant", "") or "").strip()
         return variant or "pca_rf"

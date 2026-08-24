@@ -3,6 +3,8 @@ import os
 import hydra
 from omegaconf import DictConfig
 
+from finetune.batch_integration import BatchIntegrationRunner
+from finetune.cell_type_annotation import CellTypeAnnotationRunner
 from finetune.canc_type_class import (
     CancTypeClassBulkFormerPCARFRunner,
     CancTypeClassPCARFRunner,
@@ -194,6 +196,10 @@ def main(cfg: DictConfig):
         runner = DrugRespBulkFormerPCARFRunner(cfg)
     elif task_name == "finetune.drug_resp_scgpt_pca_rf":
         runner = DrugRespScGPTPCARFRunner(cfg)
+    elif task_name == "finetune.batch_integration":
+        runner = BatchIntegrationRunner(cfg)
+    elif task_name == "finetune.cell_type_annotation":
+        runner = CellTypeAnnotationRunner(cfg)
     else:
         raise ValueError(
             f"Unsupported task '{task_name}'. "
@@ -238,7 +244,9 @@ def main(cfg: DictConfig):
             "'finetune.drug_resp_raw_mlp', 'finetune.drug_resp_raw_pca_rf', "
             "'finetune.drug_resp_pca_rf', "
             "'finetune.drug_resp_bulkformer_pca_rf', "
-            "'finetune.drug_resp_scgpt_pca_rf']."
+            "'finetune.drug_resp_scgpt_pca_rf', "
+            "'finetune.batch_integration', "
+            "'finetune.cell_type_annotation']."
         )
     results = runner.run()
 

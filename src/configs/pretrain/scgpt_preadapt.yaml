@@ -13,9 +13,10 @@ gene_info_path: ../data/bulkformer_gene_info.csv
 audit_only: false
 audit_sample_rows: 128
 
-# Input contract: all mapped genes are available to the native scGPT collator,
-# which samples 1,199 genes and preserves CLS at position zero.
+# Native scGPT input contract: retain vocabulary-matched genes with non-zero
+# expression per profile; sample at most 1,199 and preserve CLS at position zero.
 max_seq_len: 1200
+input_gene_filter: nonzero_per_profile
 expected_source_gene_count: 13004
 n_bins: 51
 mask_ratio: 0.4

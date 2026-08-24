@@ -99,8 +99,14 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
         if bool(getattr(self.task_cfg, "merge_gbm_lgg", False)):
             projects = np.asarray(["GBMLGG" if p in {"GBM", "LGG"} else p for p in projects])
 
-        times = self._numeric_obs(adata, str(getattr(self.task_cfg, "survival_time_col", "OS.time")))
-        events = self._numeric_obs(adata, str(getattr(self.task_cfg, "survival_event_col", "OS")))
+        times = SurvPredRunner._numeric_obs(
+            adata,
+            str(getattr(self.task_cfg, "survival_time_col", "OS.time")),
+        )
+        events = SurvPredRunner._numeric_obs(
+            adata,
+            str(getattr(self.task_cfg, "survival_event_col", "OS")),
+        )
         valid = np.isfinite(times) & np.isfinite(events) & (times > 0)
         if valid.sum() < 10:
             raise ValueError(f"Only {int(valid.sum())} TCGA samples have usable survival labels.")

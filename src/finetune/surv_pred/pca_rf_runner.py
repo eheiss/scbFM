@@ -9,6 +9,7 @@ import torch.distributed as dist
 from omegaconf import DictConfig
 
 from finetune.canc_type_class.pca_rf_runner import CancTypeClassPCARFRunner
+from finetune.canc_type_class.runner import CancTypeClassRunner
 from finetune.surv_pred.runner import SurvPredRunner
 from finetune.surv_pred_survboard.runner import harrell_c_index, ipcw_weighted_c_index
 from finetune.survival_regression import fit_pca_random_forest_regressor
@@ -53,6 +54,11 @@ class SurvPredPCARFRunner(SurvPredRunner):
 
     def _build_backbone(self, checkpoint_path):
         return CancTypeClassPCARFRunner._build_backbone(self, checkpoint_path)
+
+    def _validate_backbone_checkpoint(self, checkpoint, checkpoint_path):
+        return CancTypeClassRunner._validate_backbone_checkpoint(
+            self, checkpoint, checkpoint_path
+        )
 
     def _fit_survival_regressor(
         self, train_x, train_time, train_event, test_x, test_time, *, prefix="pca_rf"

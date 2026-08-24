@@ -1,0 +1,69 @@
+# scGPT zero-shot integration protocol. Reference/query splits are combined
+# only after one shared 1,199-gene set has been selected on reference cells.
+datasets:
+  covid19:
+    display_name: COVID-19
+    reference_path:
+    query_path:
+    gene_key: gene_name
+    label_key: celltype
+    batch_key: str_batch
+    preprocessing: none
+    expected_reference_cells: 15997
+    expected_query_cells: 4003
+    expected_total_cells: 20000
+    expected_batch_count: 18
+  lung_kim:
+    display_name: Lung-Kim
+    reference_path:
+    query_path:
+    gene_key: gene_name
+    label_key: cell_type
+    batch_key: sample
+    preprocessing: normalize_log1p
+    expected_reference_cells:
+    expected_query_cells:
+    expected_total_cells: 30472
+    expected_batch_count: 14
+dataset_keys: [covid19, lung_kim]
+
+gene_list_path: ../data/gene_list.txt
+gene_info_path: ../data/bulkformer_gene_info.csv
+gene_selection_method: mad
+
+pretrained_model_paths:
+  pretrain_sc:
+  pretrain_bulk:
+  preadapt_sc:
+  preadapt_bulk:
+model_keys:
+
+# These are the downloaded scGPT checkpoint and its bulk-preadapted counterpart.
+# Filenames are explicit because the downloaded checkpoint does not use the
+# local benchmark's last_model.pt naming convention.
+include_external_scgpt: true
+scgpt_repo_dir:
+external_scgpt_models:
+  scgpt:
+    model_dir:
+    args_filename: scgpt_args.json
+    vocab_filename: scgpt_vocab.json
+    checkpoint_filename: scgpt_best_model.pt
+  scgpt_preadapt:
+    model_dir:
+    args_filename: args.json
+    vocab_filename: vocab.json
+    checkpoint_filename: last_model.pt
+
+output_variant: zero_shot_scgpt
+batch_size: 4
+scgpt_batch_size: 4
+min_external_scgpt_gene_coverage: 0.9
+num_workers: 2
+random_seed: 42
+# Non-master ranks wait while rank 0 computes CPU-heavy scIB metrics and UMAPs.
+distributed_timeout_minutes: 360
+include_raw_pca: true
+raw_pca_components: 256
+benchmark_n_jobs: 8
+umap_n_neighbors: 15

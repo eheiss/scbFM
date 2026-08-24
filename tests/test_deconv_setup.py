@@ -26,6 +26,32 @@ from finetune.deconv.runner import DeconvDataset  # noqa: E402
 
 
 class DeconvSetupTest(unittest.TestCase):
+    def test_mse_and_mae_are_the_declared_deconvolution_defaults(self) -> None:
+        config = (SRC / "configs" / "finetune" / "deconv.yaml").read_text()
+        self.assertIn("loss: mse", config)
+        self.assertIn("validate_broad_targets: true", config)
+        self.assertIn("balanced_group_folds: true", config)
+
+        runner_source = (SRC / "finetune" / "deconv" / "runner.py").read_text()
+        self.assertIn('"training_objective": self._training_objective()', runner_source)
+        self.assertIn('"primary_evaluation_metric": "mae"', runner_source)
+
+        pca_rf_source = (
+            SRC / "finetune" / "deconv" / "pca_rf_runner.py"
+        ).read_text()
+        self.assertIn('return "random_forest_squared_error"', pca_rf_source)
+
+        generator_source = (REPO / "data" / "create_pseudo_bulk_data_RAW.py").read_text()
+        self.assertIn("rng.dirichlet(", generator_source)
+        self.assertNotIn("SPARSE_SAMPLE_PROB", generator_source)
+        broad_targets = pd.read_csv(REPO / "data" / "deconv_broad_cell_types.csv")
+        self.assertEqual(len(broad_targets), 27)
+        self.assertEqual(broad_targets["target_cell_type"].nunique(), 27)
+
+        notebook = (SRC / "analysis" / "task_performances.ipynb").read_text()
+        self.assertGreaterEqual(notebook.count('metric_mean = \\\"mae_mean\\\"'), 2)
+        self.assertNotIn('metric_mean = \\\"js_distance_mean\\\"', notebook)
+
     def test_all_evaluation_runners_use_deconv_identity(self) -> None:
         for runner_class in (
             DeconvRunner,
@@ -142,6 +168,50 @@ class DeconvSetupTest(unittest.TestCase):
                 np.testing.assert_array_equal(left[1], right[1])
             with manifest.open(newline="", encoding="utf-8") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 10)
+
+    def test_balanced_group_folds_cover_every_target_without_context_leakage(self) -> None:
+        n_groups = 20
+        groups = np.repeat([f"group-{index}" for index in range(n_groups)], 2)
+        targets = np.zeros((groups.size, 2), dtype=np.float32)
+        targets[: groups.size // 2, 0] = 1.0
+        targets[groups.size // 2 :, 1] = 1.0
+        runner = object.__new__(DeconvRunner)
+        runner.task_cfg = SimpleNamespace(
+            cv_folds=5,
+            random_seed=42,
+            balanced_group_folds=True,
+            fold_balance_attempts=16,
+            require_target_in_each_test_fold=True,
+        )
+        runner.cell_types = ["A", "B"]
+        runner._cv_targets = targets
+        adata = ad.AnnData(X=np.ones((groups.size, 2), dtype=np.float32))
+
+        splits = runner._build_cv_splits(adata, groups)
+        runner._validate_cv_target_coverage(splits)
+
+        for _train_idx, test_idx in splits:
+            self.assertTrue(np.all(np.count_nonzero(targets[test_idx] > 0, axis=0) > 0))
+            test_groups = set(groups[test_idx])
+            for group in test_groups:
+                self.assertEqual(set(np.where(groups == group)[0]).difference(test_idx), set())
+
+    def test_total_variation_is_reported_on_the_composition_scale(self) -> None:
+        runner = object.__new__(DeconvRunner)
+        runner.cell_types = ["A", "B"]
+        runner.target_columns = ["prop__A", "prop__B"]
+        runner.fold_train_target_mean = np.asarray([0.5, 0.5], dtype=np.float32)
+        truth = np.asarray([[0.8, 0.2], [0.1, 0.9]], dtype=np.float32)
+        prediction = np.asarray([[0.6, 0.4], [0.3, 0.7]], dtype=np.float32)
+
+        metrics = runner._evaluation_metrics_from_arrays(
+            prediction,
+            truth,
+            test_loss=0.04,
+        )
+
+        self.assertAlmostEqual(metrics["total_variation_distance"], 0.2, places=6)
+        np.testing.assert_allclose(metrics["sample_total_variation_distance"], [0.2, 0.2])
 
     def test_rf_predictions_are_projected_to_probability_simplex(self) -> None:
         predictions = np.asarray([[1.5, -0.5], [0.0, 0.0]], dtype=np.float32)

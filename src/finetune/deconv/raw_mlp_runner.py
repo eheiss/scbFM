@@ -10,7 +10,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig
 from scipy import sparse
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -279,7 +278,7 @@ class DeconvRawMLPRunner(DeconvRunner):
 
         predictions_np = predictions.cpu().numpy()
         truths_np = truths.cpu().numpy()
-        loss_name = str(getattr(self.task_cfg, "loss", "kl")).lower()
+        loss_name = str(getattr(self.task_cfg, "loss", "mse")).lower()
         if loss_name == "kl":
             test_loss = F.kl_div(
                 predictions.clamp_min(1e-12).log(),
@@ -291,48 +290,8 @@ class DeconvRawMLPRunner(DeconvRunner):
         else:
             test_loss = F.l1_loss(predictions, truths).item()
 
-        per_type_mae = np.mean(np.abs(predictions_np - truths_np), axis=0)
-        per_type_rmse = np.sqrt(np.mean((predictions_np - truths_np) ** 2, axis=0))
-        per_type_prediction_mean = np.mean(predictions_np, axis=0)
-        per_type_prediction_std = np.std(predictions_np, axis=0)
-        per_type_truth_mean = np.mean(truths_np, axis=0)
-        per_type_truth_std = np.std(truths_np, axis=0)
-        cell_p, cell_s, mean_cell_p, mean_cell_s = self._cell_type_correlation_across_samples_metrics(predictions_np, truths_np)
-        sample_p, sample_s, mean_sample_p, mean_sample_s = self._sample_correlation_across_cell_types_metrics(predictions_np, truths_np)
-        kl, jsd, js = self._distribution_metrics(predictions_np, truths_np)
-        mean_baseline = np.broadcast_to(self.fold_train_target_mean, predictions_np.shape)
-        mb_kl, mb_jsd, mb_js = self._distribution_metrics(mean_baseline, truths_np)
-        return {
-            "loss": float(test_loss),
-            "mae": float(mean_absolute_error(truths_np, predictions_np)),
-            "rmse": float(np.sqrt(mean_squared_error(truths_np, predictions_np))),
-            "mean_cell_type_pearson_across_samples": mean_cell_p,
-            "mean_cell_type_spearman_across_samples": mean_cell_s,
-            "mean_sample_pearson_across_cell_types": mean_sample_p,
-            "mean_sample_spearman_across_cell_types": mean_sample_s,
-            "kl_divergence": kl,
-            "js_distance": jsd,
-            "js_divergence": js,
-            "mean_baseline_mae": float(mean_absolute_error(truths_np, mean_baseline)),
-            "mean_baseline_rmse": float(np.sqrt(mean_squared_error(truths_np, mean_baseline))),
-            "mean_baseline_kl_divergence": mb_kl,
-            "mean_baseline_js_distance": mb_jsd,
-            "mean_baseline_js_divergence": mb_js,
-            "prediction_mae_from_train_mean": float(np.mean(np.abs(predictions_np - mean_baseline))),
-            "per_cell_type_mae": dict(zip(self.cell_types, map(float, per_type_mae))),
-            "per_cell_type_rmse": dict(zip(self.cell_types, map(float, per_type_rmse))),
-            "per_cell_type_prediction_mean": dict(zip(self.cell_types, map(float, per_type_prediction_mean))),
-            "per_cell_type_prediction_std": dict(zip(self.cell_types, map(float, per_type_prediction_std))),
-            "per_cell_type_truth_mean": dict(zip(self.cell_types, map(float, per_type_truth_mean))),
-            "per_cell_type_truth_std": dict(zip(self.cell_types, map(float, per_type_truth_std))),
-            "per_cell_type_train_mean": dict(zip(self.cell_types, map(float, self.fold_train_target_mean))),
-            "per_cell_type_pearson_across_samples": cell_p,
-            "per_cell_type_spearman_across_samples": cell_s,
-            "cell_types": self.cell_types,
-            "target_columns": self.target_columns,
-            "n_test_samples": int(len(truths_np)),
-            "predictions": predictions_np,
-            "truths": truths_np,
-            "sample_pearson_across_cell_types": sample_p,
-            "sample_spearman_across_cell_types": sample_s,
-        }
+        return self._evaluation_metrics_from_arrays(
+            predictions_np,
+            truths_np,
+            test_loss=float(test_loss),
+        )

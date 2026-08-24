@@ -1,0 +1,28 @@
+priority,target_cell_type,ontology_term_id
+1,T cell,CL:0000084
+2,B cell,CL:0000236
+3,plasma cell,CL:0000786
+4,natural killer cell,CL:0000623
+5,monocyte,CL:0000576
+6,macrophage,CL:0000235
+7,dendritic cell,CL:0000451
+8,granulocyte,CL:0000094
+9,mast cell,CL:0000097
+10,erythrocyte,CL:0000232
+11,platelet,CL:0000233
+12,other hematopoietic cell,CL:0000988
+13,hepatocyte,CL:0000182
+14,keratinocyte,CL:0000312
+15,other epithelial cell,CL:0000066
+16,endothelial cell,CL:0000115
+17,fibroblast,CL:0000057
+18,pericyte,CL:0000669
+19,muscle cell,CL:0000187
+20,neuron,CL:0000540
+21,glial cell,CL:0000125
+22,adipocyte,CL:0000136
+23,melanocyte,CL:0000148
+24,bone cell,CL:0001035
+25,stem cell,CL:0000034
+26,progenitor cell,CL:0011026
+27,germ line cell,CL:0000039
