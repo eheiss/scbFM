@@ -31,7 +31,7 @@ GENE_LIST_PATH = Path(os.getenv(
 
 OUT_DIR = Path(os.getenv(
     "SCBFM_PSEUDO_OUT_DIR",
-    "/cluster/work/boeva/eheiss/datasets/pseudo_bulk_broad",
+    "/cluster/work/boeva/eheiss/datasets/pseudo_bulk",
 ))
 CHUNK_DIR = OUT_DIR / "pseudo_bulk_RAW_chunks"
 SOURCE_CHUNK_DIR = OUT_DIR / "source_cell_chunks"

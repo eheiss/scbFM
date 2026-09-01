@@ -624,18 +624,15 @@ class DeconvRunner:
             )
 
         positive_samples = np.count_nonzero(targets > 0, axis=0)
-        minimum_positive = int(
-            getattr(self.task_cfg, "min_positive_samples_per_cell_type", 50)
-        )
-        rare = [
+        missing_targets = [
             self.cell_types[index]
             for index, count in enumerate(positive_samples)
-            if count < minimum_positive
+            if count == 0
         ]
-        if rare:
+        if missing_targets:
             raise ValueError(
-                "Broad target cell types occur in too few pseudobulk samples: "
-                f"{rare}. Minimum is {minimum_positive}."
+                "Broad target cell types never occur in the pseudobulk dataset: "
+                f"{missing_targets}."
             )
 
         positive_groups: dict[str, int] = {}

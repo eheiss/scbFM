@@ -31,6 +31,7 @@ class DeconvSetupTest(unittest.TestCase):
         self.assertIn("loss: mse", config)
         self.assertIn("validate_broad_targets: true", config)
         self.assertIn("balanced_group_folds: true", config)
+        self.assertNotIn("min_positive_samples_per_cell_type", config)
 
         runner_source = (SRC / "finetune" / "deconv" / "runner.py").read_text()
         self.assertIn('"training_objective": self._training_objective()', runner_source)
@@ -195,6 +196,34 @@ class DeconvSetupTest(unittest.TestCase):
             test_groups = set(groups[test_idx])
             for group in test_groups:
                 self.assertEqual(set(np.where(groups == group)[0]).difference(test_idx), set())
+
+    def test_broad_target_validation_uses_context_and_fold_coverage(self) -> None:
+        runner = object.__new__(DeconvRunner)
+        runner.task_cfg = SimpleNamespace(
+            validate_broad_targets=True,
+            expected_generator_schema_version=2,
+            min_target_cell_types=2,
+            max_target_cell_types=2,
+            min_active_cell_types=1,
+            max_active_cell_types=2,
+            cv_folds=5,
+        )
+        runner.cell_types = ["common", "rare"]
+        targets = np.zeros((50, 2), dtype=np.float32)
+        targets[:, 0] = 1.0
+        rare_indices = np.asarray([0, 10, 20, 30, 40])
+        targets[rare_indices, 0] = 0.5
+        targets[rare_indices, 1] = 0.5
+        groups = np.asarray([f"group-{index // 10}" for index in range(50)])
+        adata = ad.AnnData(X=np.ones((50, 1), dtype=np.float32))
+        adata.uns["deconv_generator_schema_version"] = 2
+
+        runner._validate_broad_target_dataset(adata, targets, groups)
+
+        self.assertEqual(
+            runner._dataset_audit["positive_samples_by_cell_type"]["rare"],
+            5,
+        )
 
     def test_total_variation_is_reported_on_the_composition_scale(self) -> None:
         runner = object.__new__(DeconvRunner)

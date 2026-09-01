@@ -40,7 +40,6 @@ min_target_cell_types: 15
 max_target_cell_types: 30
 min_active_cell_types: 2
 max_active_cell_types: 8
-min_positive_samples_per_cell_type: 50
 # Assign complete dataset/donor/tissue contexts while balancing broad target
 # presence and mass. The resulting manifest is shared by every runner.
 balanced_group_folds: true

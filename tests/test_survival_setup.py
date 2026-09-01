@@ -217,6 +217,16 @@ class SurvivalSetupTest(unittest.TestCase):
             np.testing.assert_array_equal(labels, np.asarray(["0", "1"] * 5))
             self.assertIsNone(groups)
 
+    def test_binary_controlled_pca_runner_uses_binary_checkpoint_keys(self) -> None:
+        self.assertEqual(
+            SurvPredBinaryPCARFRunner.checkpoint_model_keys,
+            SurvPredBinaryRunner.checkpoint_model_keys,
+        )
+        self.assertEqual(
+            SurvPredBinaryPCARFRunner.random_init_model_key,
+            SurvPredBinaryRunner.random_init_model_key,
+        )
+
     def test_survival_pca_runner_delegates_checkpoint_validation(self) -> None:
         runner = object.__new__(SurvPredPCARFRunner)
         with patch.object(

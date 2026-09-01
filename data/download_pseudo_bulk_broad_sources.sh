@@ -6,7 +6,7 @@ trap 'echo "Download interrupted. Rerun the same command to validate and resume 
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
-OUT_DIR=${1:-/Users/enricoheiss/Downloads/pseudo_bulk_broad_stage}
+OUT_DIR=${1:-/Users/enricoheiss/Downloads/pseudo_bulk}
 MODE=${2:-download}
 VENV_DIR=${SCBFM_CENSUS_VENV:-${HOME}/.venvs/scbfm-census-2025-11-08}
 PYTHON_BIN=${PYTHON_BIN:-${VENV_DIR}/bin/python}
@@ -123,4 +123,4 @@ if [ ! -d "${OUT_DIR}/source_cell_chunks" ]; then
 fi
 
 echo "Local source bundle is ready: ${OUT_DIR}"
-echo "Upload this directory to: /cluster/work/boeva/eheiss/datasets/pseudo_bulk_broad/"
+echo "Upload this directory to: /cluster/work/boeva/eheiss/datasets/pseudo_bulk/"

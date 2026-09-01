@@ -130,6 +130,8 @@ class BinarySurvivalRFMetricMixin:
 class SurvPredBinaryPCARFRunner(BinarySurvivalRFMetricMixin, CancTypeClassPCARFRunner):
     task_name = "surv_pred_binary"
     config_node = "surv_pred_binary"
+    checkpoint_model_keys = SurvPredBinaryRunner.checkpoint_model_keys
+    random_init_model_key = SurvPredBinaryRunner.random_init_model_key
 
     @staticmethod
     def _resolve_task_cfg(cfg: DictConfig) -> DictConfig:
