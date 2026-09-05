@@ -490,6 +490,7 @@ class CancTypeClassRunner:
         self.scheduler = None
         self.loss_fn: nn.Module | None = None
         self.train_class_weights: torch.Tensor | None = None
+        self.fold_gene_indices: np.ndarray | None = None
         self.backbone_optimizer_enabled = False
 
     @staticmethod
@@ -1233,6 +1234,7 @@ class CancTypeClassRunner:
         # Fit feature selection on the training fold only. Use the resulting
         # fixed vocabulary indices for both training and held-out samples.
         fold_hvg_indices = self._select_training_hvg_indices(train_adata)
+        self.fold_gene_indices = np.asarray(fold_hvg_indices, dtype=np.int64)
         train_dataset = CancTypeClassDataset(
             train_adata.X,
             train_labels,
@@ -1963,6 +1965,7 @@ class CancTypeClassRunner:
         self.scheduler = None
         self.loss_fn = None
         self.train_class_weights = None
+        self.fold_gene_indices = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
