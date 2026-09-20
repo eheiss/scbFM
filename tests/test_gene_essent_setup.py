@@ -165,36 +165,6 @@ class GeneEssentSetupTest(unittest.TestCase):
             self.assertLess(shutdown, cpu_fit, runner_class.__name__)
             self.assertNotIn("dist.all_reduce", source, runner_class.__name__)
 
-    def test_submission_matrix_has_expected_jobs(self) -> None:
-        job_dir = REPO.parent / "job_files" / "finetune" / "gene_essent"
-        expected = {
-            "gene_essent_head_only-job.sh",
-            "gene_essent_adapters-job.sh",
-            "gene_essent_full_ft-job.sh",
-            "gene_essent_pca_rf-job.sh",
-            "gene_essent_raw_mlp_all_genes-job.sh",
-            "gene_essent_raw_mlp_hvg1199-job.sh",
-            "gene_essent_raw_pca_rf_all_genes-job.sh",
-            "gene_essent_raw_pca_rf_hvg1199-job.sh",
-            "gene_essent_bulkformer_pca_rf-job.sh",
-            "gene_essent_scgpt_pca_rf-job.sh",
-            "gene_essent_scgpt_preadapt_pca_rf-job.sh",
-        }
-        expected.update(
-            f"gene_essent_head_only_pretrain_bulk_{size}-job.sh"
-            for size in ("10k", "50k", "100k", "200k", "400k")
-        )
-        observed = {path.name for path in job_dir.glob("*.sh")}
-        self.assertTrue(expected.issubset(observed))
-        self.assertFalse(
-            (job_dir / "gene_essent_raw_mlp_hvg1199_deep-job.sh").exists()
-        )
-        for path in job_dir.glob("*.sh"):
-            text = path.read_text(encoding="utf-8")
-            self.assertNotIn("\nsource ~/.bashrc\n", text, path.name)
-            if "source ~/.bashrc" in text:
-                self.assertIn("set +e", text, path.name)
-                self.assertIn("command -v singularity", text, path.name)
 
 
 if __name__ == "__main__":

@@ -146,7 +146,7 @@ def plot_downstream_convergence(
             "axes.labelweight": "normal",
             "xtick.labelsize": 7.2,
             "ytick.labelsize": 7.2,
-            "legend.fontsize": 8.2,
+            "legend.fontsize": 10.0,
             "axes.linewidth": 0.8,
             "lines.linewidth": 1.65,
             "savefig.facecolor": "white",
@@ -155,7 +155,7 @@ def plot_downstream_convergence(
         fig, axes = plt.subplots(
             len(TASK_SPECS),
             len(MODE_SPECS),
-            figsize=(6.8, 10.5),
+            figsize=(7.25, 10.4),
             sharex=True,
             squeeze=False,
         )
@@ -260,24 +260,15 @@ def plot_downstream_convergence(
             frameon=False,
             handlelength=2.4,
             columnspacing=1.8,
-            prop={"family": "DejaVu Sans", "size": 8.2, "weight": "normal"},
+            prop={"family": "DejaVu Sans", "size": 10.0, "weight": "normal"},
         )
         fig.supxlabel("Epoch", x=0.53, y=0.047, fontsize=9.5)
-        fig.text(
-            0.012,
-            0.5,
-            "Validation loss",
-            rotation=90,
-            va="center",
-            ha="left",
-            fontsize=9.5,
-        )
         fig.subplots_adjust(
-            left=0.15,
+            left=0.13,
             right=0.995,
-            top=0.985,
+            top=0.99,
             bottom=0.09,
-            hspace=0.35,
+            hspace=0.30,
             wspace=0.12,
         )
 

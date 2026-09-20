@@ -8,6 +8,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
+from paths import output_root
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -22,7 +23,6 @@ from finetune.single_cell import (
     DISPLAY_NAMES,
     RAW_PCA_MODEL_KEY,
     SCBFM_ROOT,
-    WORK_ROOT,
     FrozenSingleCellBenchmark,
     SingleCellDatasetBundle,
     plot_single_cell_benchmark_summary,
@@ -67,7 +67,7 @@ class CellTypeAnnotationRunner:
 
     def _output_dir(self) -> Path:
         variant = str(getattr(self.task_cfg, "output_variant", "zero_shot_scgpt"))
-        return WORK_ROOT / "output" / TASK_NAME / variant
+        return output_root(self.cfg) / TASK_NAME / variant
 
     @staticmethod
     def _majority_vote(neighbor_labels: np.ndarray) -> str:

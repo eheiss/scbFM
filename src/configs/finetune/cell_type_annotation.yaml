@@ -3,8 +3,8 @@
 datasets:
   covid19:
     display_name: COVID-19
-    reference_path:
-    query_path:
+    reference_path: ${root_dir}/datasets/scgpt_single_cell/covid/batch_covid_subsampled_train.h5ad
+    query_path: ${root_dir}/datasets/scgpt_single_cell/covid/batch_covid_subsampled_test.h5ad
     gene_key: gene_name
     label_key: celltype
     batch_key: str_batch
@@ -15,8 +15,8 @@ datasets:
     expected_batch_count: 18
   lung_kim:
     display_name: Lung-Kim
-    reference_path:
-    query_path:
+    reference_path: ${root_dir}/datasets/scgpt_single_cell/lung/sample_proc_lung_train.h5ad
+    query_path: ${root_dir}/datasets/scgpt_single_cell/lung/sample_proc_lung_test.h5ad
     gene_key: gene_name
     label_key: cell_type
     batch_key: sample
@@ -27,27 +27,27 @@ datasets:
     expected_batch_count: 14
 dataset_keys: [covid19, lung_kim]
 
-gene_list_path: ../data/gene_list.txt
-gene_info_path: ../data/bulkformer_gene_info.csv
+gene_list_path: ${repo_dir}/data/gene_list.txt
+gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 gene_selection_method: mad
 
 pretrained_model_paths:
-  pretrain_sc:
-  pretrain_bulk:
-  preadapt_sc:
-  preadapt_bulk:
+  pretrain_sc: ${output_dir}/pretrain_sc/pretrain_sc.pth
+  pretrain_bulk: ${output_dir}/pretrain_bulk/pretrain_bulk.pth
+  preadapt_sc: ${output_dir}/preadapt_sc/preadapt_sc.pth
+  preadapt_bulk: ${output_dir}/preadapt_bulk/preadapt_bulk.pth
 model_keys:
 
 include_external_scgpt: true
-scgpt_repo_dir:
+scgpt_repo_dir: ${root_dir}/other/scGPT
 external_scgpt_models:
   scgpt:
-    model_dir:
+    model_dir: ${root_dir}/other/models
     args_filename: scgpt_args.json
     vocab_filename: scgpt_vocab.json
     checkpoint_filename: scgpt_best_model.pt
   scgpt_preadapt:
-    model_dir:
+    model_dir: ${output_dir}/scgpt_preadapt
     args_filename: args.json
     vocab_filename: vocab.json
     checkpoint_filename: last_model.pt

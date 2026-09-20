@@ -13,7 +13,7 @@ from finetune.canc_type_class.bulkformer_pca_rf_runner import (
     CancTypeClassBulkFormerPCARFRunner,
 )
 from finetune.drug_resp.pca_rf_runner import DrugRespPCARFRunner
-from finetune.drug_resp.runner import ROOT
+from paths import REPO_ROOT, output_root
 from run_provenance import complete_run_metadata, start_run_metadata
 from utils import seed_all
 
@@ -42,7 +42,7 @@ class DrugRespBulkFormerPCARFRunner(DrugRespPCARFRunner):
         return variant or "bulkformer_pca_rf"
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"
@@ -215,7 +215,7 @@ class DrugRespBulkFormerPCARFRunner(DrugRespPCARFRunner):
                 "world_size": int(self.world_size),
             },
             checkpoint_paths={"bulkformer_147m": str(paths["checkpoint"])},
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     def run(self) -> dict:

@@ -40,20 +40,15 @@ class CellTypeAnnotationSetupTest(unittest.TestCase):
 
     def test_config_and_job_are_zero_shot(self) -> None:
         config = (SRC / "configs" / "finetune" / "cell_type_annotation.yaml").read_text()
-        job_dir = REPO.parent / "job_files" / "finetune" / "batch_integration"
-        job = (job_dir / "cell_type_annotation-job.sh").read_text()
+        job = (REPO / "cluster" / "run-job.sh").read_text()
         main = (SRC / "main.py").read_text()
         self.assertIn("n_neighbors: 10", config)
         self.assertIn("dataset_keys: [covid19, lung_kim]", config)
         self.assertIn("distributed_timeout_minutes: 360", config)
         self.assertNotIn("epochs:", config)
         self.assertNotIn("finetune_mode:", config)
-        self.assertIn("task=finetune.cell_type_annotation", job)
         self.assertIn("#SBATCH --gres=gpu:4", job)
-        self.assertIn(
-            "/cluster/customapps/biomed/boeva/eheiss/singularity/scbfm_single_cell.sif",
-            job,
-        )
+        self.assertIn("SCBFM_SIF", job)
         self.assertIn("python -m torch.distributed.run", job)
         self.assertNotIn("\n  torchrun ", job)
         self.assertIn("CellTypeAnnotationRunner", main)

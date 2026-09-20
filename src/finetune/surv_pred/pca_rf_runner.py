@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from paths import output_root
 
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ class SurvPredPCARFRunner(SurvPredRunner):
         return str(getattr(self.task_cfg, "pca_rf_variant", "") or "pca_rf")
 
     def _task_output_dir(self) -> Path:
-        return Path(__file__).resolve().parents[4] / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

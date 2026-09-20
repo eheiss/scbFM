@@ -28,7 +28,6 @@ from utils import SequentialDistributedSampler, distributed_concat, seed_all
 log = logging.getLogger(__name__)
 
 SCBFM_ROOT = Path(__file__).resolve().parents[2]
-WORK_ROOT = SCBFM_ROOT.parent
 
 CHECKPOINT_MODEL_KEYS = (
     "pretrain_sc",

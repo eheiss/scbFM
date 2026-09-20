@@ -11,13 +11,15 @@ import pandas as pd
 from scipy import sparse
 
 
+ROOT_DIR = Path(os.environ.get("SCBFM_ROOT_DIR", Path(__file__).resolve().parents[4])).expanduser().resolve()
+
 ARCHS4_IN = Path(os.getenv(
     "ARCHS4_INPUT",
-    "/cluster/work/boeva/eheiss/datasets/ARCHS4/human_gene_v2.latest.h5",
+    str(ROOT_DIR / "datasets/ARCHS4/human_gene_v2.latest.h5"),
 ))
 ARCHS4_OUT = Path(os.getenv(
     "ARCHS4_OUTPUT",
-    "/cluster/work/boeva/eheiss/datasets/ARCHS4/archs4.h5ad",
+    str(ROOT_DIR / "datasets/ARCHS4/archs4.h5ad"),
 ))
 SAMPLE_CHUNK_SIZE = int(os.getenv("ARCHS4_SAMPLE_CHUNK_SIZE", "1000"))
 COMPRESSION = os.getenv("ARCHS4_H5AD_COMPRESSION", "lzf") or None

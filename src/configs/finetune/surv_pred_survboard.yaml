@@ -1,12 +1,12 @@
 # Pretrained model checkpoints (all four required)
 pretrained_model_paths:
-  pretrain_sc:
-  pretrain_bulk:
-  preadapt_sc:
-  preadapt_bulk:
+  pretrain_sc: ${output_dir}/pretrain_sc/pretrain_sc.pth
+  pretrain_bulk: ${output_dir}/pretrain_bulk/pretrain_bulk.pth
+  preadapt_sc: ${output_dir}/preadapt_sc/preadapt_sc.pth
+  preadapt_bulk: ${output_dir}/preadapt_bulk/preadapt_bulk.pth
 
 # SurvBoard data (point at the data_reproduced/ folder from the Zenodo archive)
-survboard_data_dir:           # e.g. /path/to/survboard/data_reproduced
+survboard_data_dir: ${root_dir}/datasets/SurvBoard/data_reproduced
 project: TCGA                 # TCGA | ICGC | TARGET | METABRIC
 cancer:                       # e.g. BRCA
 eligible_cancers: [BLCA, BRCA, COAD, ESCA, HNSC, KIRC, KIRP, LGG, LUAD, PAAD, SARC, SKCM, STAD, UCEC, OV, LIHC, LUSC, LAML, CESC, GBM, READ]
@@ -20,9 +20,9 @@ os_col: OS
 os_days_col: OS_days
 
 # Data preprocessing (preprocess=true quantile-bins the raw float values)
-gene_list_path: ../data/gene_list.txt
+gene_list_path: ${repo_dir}/data/gene_list.txt
 # Maps HUGO symbols in SurvBoard gex columns to ENSG IDs used by the backbone
-gene_info_path: ../data/bulkformer_gene_info.csv
+gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 preprocess: true
 convert_log2_to_log1p: true
 # Fold-level HVGs are fitted on training samples only and reused for the held-out
@@ -95,13 +95,13 @@ pca_rf_bootstrap: true
 pca_rf_n_jobs: -1
 
 bulkformer_variant: bulkformer_pca_rf
-bulkformer_repo_dir:
-bulkformer_checkpoint_path:
-bulkformer_gene_info_path:
-bulkformer_graph_path:
-bulkformer_graph_weight_path:
-bulkformer_gene_emb_path:
-bulkformer_interested_gene_list_path:
+bulkformer_repo_dir: ${root_dir}/other/BulkFormer
+bulkformer_checkpoint_path: ${root_dir}/other/models/BulkFormer_147M.pt
+bulkformer_gene_info_path: ${root_dir}/other/BulkFormer/data/bulkformer_gene_info.csv
+bulkformer_graph_path: ${root_dir}/other/BulkFormer/data/G_tcga.pt
+bulkformer_graph_weight_path: ${root_dir}/other/BulkFormer/data/G_tcga_weight.pt
+bulkformer_gene_emb_path: ${root_dir}/other/BulkFormer/data/esm2_feature_concat.pt
+bulkformer_interested_gene_list_path: ${root_dir}/other/BulkFormer/data/interested_gene_list.pt
 bulkformer_expected_gene_count: 20010
 bulkformer_batch_size: 4
 bulkformer_aggregate_type: max
@@ -118,12 +118,12 @@ bulkformer_rf_n_jobs: -1
 
 scgpt_variant: scgpt_pca_rf
 scgpt_model_key: scgpt
-scgpt_repo_dir:
-scgpt_model_dir:
-scgpt_args_filename: args.json
-scgpt_vocab_filename: vocab.json
-scgpt_checkpoint_filename: last_model.pt
-scgpt_gene_info_path:
+scgpt_repo_dir: ${root_dir}/other/scGPT
+scgpt_model_dir: ${root_dir}/other/models
+scgpt_args_filename: scgpt_args.json
+scgpt_vocab_filename: scgpt_vocab.json
+scgpt_checkpoint_filename: scgpt_best_model.pt
+scgpt_gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 scgpt_expected_source_gene_count: 13004
 scgpt_batch_size: 4
 scgpt_max_seq_len: 1200

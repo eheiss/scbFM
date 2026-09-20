@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from paths import REPO_ROOT, output_root
 from scipy import sparse
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import KFold
@@ -55,7 +56,6 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[4]
 TASK_NAME = "drug_resp"
 CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 RANDOM_INIT_MODEL_KEY = "random_init"
@@ -290,7 +290,7 @@ class DrugRespRunner:
         mode = self._finetune_mode()
         suffix = self._output_suffix()
         directory = f"{mode}_{suffix}" if suffix else mode
-        return ROOT / "output" / TASK_NAME / directory
+        return output_root(self.cfg) / TASK_NAME / directory
 
     def _output_prefix(self) -> str:
         mode = self._finetune_mode()
@@ -301,7 +301,7 @@ class DrugRespRunner:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
         if gene_list_path:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
-        return ROOT / "scbFM" / "data" / "gene_list.txt"
+        return REPO_ROOT / "data" / "gene_list.txt"
 
     # ------------------------------------------------------------------
     # Runtime setup
@@ -351,7 +351,7 @@ class DrugRespRunner:
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=ROOT / "scbFM",
+                cwd=REPO_ROOT,
                 check=True, capture_output=True, text=True,
             )
             return result.stdout.strip()
@@ -402,7 +402,7 @@ class DrugRespRunner:
                 ),
             },
             checkpoint_paths=checkpoint_paths,
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     @staticmethod
@@ -678,7 +678,7 @@ class DrugRespRunner:
             hydra.utils.to_absolute_path(
                 str(
                     configured_gene_info
-                    or ROOT / "scbFM" / "data" / "bulkformer_gene_info.csv"
+                    or REPO_ROOT / "data" / "bulkformer_gene_info.csv"
                 )
             )
         )

@@ -201,18 +201,14 @@ class BatchIntegrationSetupTest(unittest.TestCase):
         self.assertAlmostEqual(summary[0]["overall"], 0.6)
 
     def test_submission_files_use_official_scgpt_inputs(self) -> None:
-        job_dir = REPO.parent / "job_files" / "finetune" / "batch_integration"
-        job = (job_dir / "batch_integration-job.sh").read_text()
-        prepare = (job_dir / "prepare_scgpt_single_cell_data.sh").read_text()
+        job = (REPO / "cluster" / "run-job.sh").read_text()
+        config = (REPO / "src" / "configs" / "finetune" / "batch_integration.yaml").read_text()
+        prepare = (REPO / "src" / "finetune" / "batch_integration" / "README.md").read_text()
         definition = (REPO / "cluster" / "scbfm_single_cell.def").read_text()
         self.assertIn("#SBATCH --gres=gpu:4", job)
-        self.assertIn("task=finetune.batch_integration", job)
-        self.assertIn(
-            "/cluster/customapps/biomed/boeva/eheiss/singularity/scbfm_single_cell.sif",
-            job,
-        )
-        self.assertIn("batch_covid_subsampled_train.h5ad", job)
-        self.assertIn("sample_proc_lung_test.h5ad", job)
+        self.assertIn("SCBFM_SIF", job)
+        self.assertIn("batch_covid_subsampled_train.h5ad", config)
+        self.assertIn("sample_proc_lung_test.h5ad", config)
         self.assertIn("1jSPoPunGQOmd71vDsK0FS7UvmDhGdhQS", prepare)
         self.assertIn("1gbfO7VqxCOkfzgHAih6hO88zFv6pd8wO", prepare)
         self.assertIn("scib-metrics==0.5.1", definition)

@@ -373,29 +373,6 @@ class DrugResponseSetupTest(unittest.TestCase):
             completed = runner._load_completed_model_results(checkpoint_paths)
             self.assertEqual(set(completed), {"pretrain_sc"})
 
-    def test_submission_matrix_has_expected_jobs(self) -> None:
-        job_dir = REPO.parent / "job_files" / "finetune" / "drug_resp"
-        expected = {
-            "drug_resp_head_only-job.sh",
-            "drug_resp_adapters-job.sh",
-            "drug_resp_full_ft-job.sh",
-            "drug_resp_pca_rf-job.sh",
-            "drug_resp_raw_mlp_all_genes-job.sh",
-            "drug_resp_raw_mlp_hvg1199-job.sh",
-            "drug_resp_raw_mlp_drug_only-job.sh",
-            "drug_resp_raw_pca_rf_all_genes-job.sh",
-            "drug_resp_raw_pca_rf_hvg1199-job.sh",
-            "drug_resp_bulkformer_pca_rf-job.sh",
-            "drug_resp_scgpt_pca_rf-job.sh",
-            "drug_resp_scgpt_preadapt_pca_rf-job.sh",
-        }
-        expected.update(
-            f"drug_resp_head_only_pretrain_bulk_{size}-job.sh"
-            for size in ("10k", "50k", "100k", "200k", "400k")
-        )
-        self.assertTrue(expected.issubset({path.name for path in job_dir.glob("*.sh")}))
-        self.assertTrue((job_dir / "drug_resp_raw_mlp_drug_only-job.sh").exists())
-        self.assertFalse((job_dir / "drug_resp_raw_mlp_hvg1199_deep-job.sh").exists())
 
 
 if __name__ == "__main__":

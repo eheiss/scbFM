@@ -20,11 +20,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 
-ROOT = Path(os.environ.get("SCBFM_CLUSTER_ROOT", "/cluster/work/boeva/eheiss"))
-SCBFM_ROOT = ROOT / "scbFM"
-SRC = SCBFM_ROOT / "src"
+SRC = Path(__file__).resolve().parents[2]
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from paths import REPO_ROOT, configure_paths, output_root, workspace_root
+
+ROOT = workspace_root()
+SCBFM_ROOT = REPO_ROOT
 
 from analysis.umap_pca.common import (
     MODEL_KEYS,
@@ -44,10 +47,10 @@ from utils import seed_all
 log = logging.getLogger("umap_pca")
 INITIAL_CHECKPOINT_PATHS = {
     "random_init": "",
-    "pretrain_sc": ROOT / "output" / "pretrain_sc" / "pretrain_sc.pth",
-    "preadapt_sc": ROOT / "output" / "preadapt_sc" / "preadapt_sc.pth",
-    "pretrain_bulk": ROOT / "output" / "pretrain_bulk" / "pretrain_bulk.pth",
-    "preadapt_bulk": ROOT / "output" / "preadapt_bulk" / "preadapt_bulk.pth",
+    "pretrain_sc": output_root() / "pretrain_sc" / "pretrain_sc.pth",
+    "preadapt_sc": output_root() / "preadapt_sc" / "preadapt_sc.pth",
+    "pretrain_bulk": output_root() / "pretrain_bulk" / "pretrain_bulk.pth",
+    "preadapt_bulk": output_root() / "preadapt_bulk" / "preadapt_bulk.pth",
 }
 TASK_RUNNERS = {
     "canc_type_class": CancTypeClassRunner,
@@ -97,13 +100,12 @@ def parse_args() -> argparse.Namespace:
 def output_path(args: argparse.Namespace) -> Path:
     if args.output is not None:
         return args.output
-    return ROOT / "output" / "umap_pca" / args.task / f"{args.task}_coordinates.npz"
+    return output_root() / "umap_pca" / args.task / f"{args.task}_coordinates.npz"
 
 
 def checkpoint_path(task: str, model_key: str, fold: int) -> Path:
     return (
-        ROOT
-        / "output"
+        output_root()
         / "umap_pca_backbones"
         / task
         / f"{task}_full_ft_{model_key}_fold_{fold}_backbone.pth"
@@ -120,10 +122,11 @@ def load_config(task: str):
     task_cfg = OmegaConf.load(SRC / "configs" / "finetune" / f"{task}.yaml")
     cfg = OmegaConf.create(
         {
-            "pretrain": OmegaConf.to_container(model_cfg, resolve=True),
-            "finetune": {task: OmegaConf.to_container(task_cfg, resolve=True)},
+            "pretrain": OmegaConf.to_container(model_cfg, resolve=False),
+            "finetune": {task: OmegaConf.to_container(task_cfg, resolve=False)},
         }
     )
+    configure_paths(cfg)
     node = cfg.finetune[task]
     node.gene_list_path = str(SCBFM_ROOT / "data" / "gene_list.txt")
     node.finetune_mode = "full_ft"

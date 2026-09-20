@@ -3,6 +3,8 @@ import os
 import hydra
 from omegaconf import DictConfig
 
+from paths import configure_paths, workspace_root
+
 from finetune.batch_integration import BatchIntegrationRunner
 from finetune.cell_type_annotation import CellTypeAnnotationRunner
 from finetune.canc_type_class import (
@@ -82,6 +84,9 @@ from pretrain import PreTrainRunner, ScGPTPreadaptRunner
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
+    # Set this variable here, pass root_dir=/path/to/workspace, or set SCBFM_ROOT_DIR.
+    root_dir = workspace_root(cfg)
+    configure_paths(cfg, root_dir)
     task_name = str(cfg.task)
 
     if task_name == "pretrain":

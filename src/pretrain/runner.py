@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
+from paths import REPO_ROOT, output_root
 from scipy import sparse
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -35,7 +36,6 @@ from utils import (
 )
 
 log = logging.getLogger(__name__)
-ROOT = Path(__file__).resolve().parents[3]
 
 
 def _digitize(x: np.ndarray, bins: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -246,7 +246,7 @@ class PreTrainRunner:
         gene_list_path = getattr(self.pretrain_cfg, "gene_list_path", None)
         if gene_list_path:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
-        return ROOT / "data" / "gene_list.txt"
+        return REPO_ROOT / "data" / "gene_list.txt"
 
     @staticmethod
     def _select_sample_indices(
@@ -738,7 +738,7 @@ class PreTrainRunner:
         }
 
     def _output_dir(self) -> Path:
-        return ROOT / "output" / self._model_name()
+        return output_root(self.cfg) / self._model_name()
 
     def _model_name(self) -> str:
         return str(self.pretrain_cfg.model_name)

@@ -28,7 +28,8 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from finetune.canc_type_class.runner import ROOT, CancTypeClassRunner
+from finetune.canc_type_class.runner import CancTypeClassRunner
+from paths import REPO_ROOT, output_root
 from run_provenance import complete_run_metadata, start_run_metadata
 from utils import SequentialDistributedSampler, distributed_concat, seed_all
 
@@ -55,7 +56,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
         return variant or "bulkformer_pca_rf"
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"
@@ -126,7 +127,7 @@ class CancTypeClassBulkFormerPCARFRunner(CancTypeClassRunner):
             checkpoint_paths={
                 "bulkformer": str(self._bulkformer_paths()["checkpoint"])
             },
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     def _required_path(self, attr: str) -> Path:

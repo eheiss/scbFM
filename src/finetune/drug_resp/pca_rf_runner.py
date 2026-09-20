@@ -14,7 +14,8 @@ from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
-from finetune.drug_resp.runner import ROOT, DrugRespRunner
+from finetune.drug_resp.runner import DrugRespRunner
+from paths import output_root
 from finetune.training_correctness import validate_backbone_checkpoint
 from utils import seed_all
 
@@ -29,7 +30,7 @@ class DrugRespPCARFRunner(DrugRespRunner):
         return variant or "pca_rf"
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

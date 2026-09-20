@@ -14,3 +14,17 @@ defaults:
   - finetune@finetune.cell_type_annotation: cell_type_annotation
 
 task: pretrain
+
+# Storage root containing datasets/, output/, and other/ (external models).
+# The default preserves the existing layout with scbFM/ beside these folders.
+root_dir: ${scbfm_root:}
+repo_dir: ${scbfm_repo:}
+output_dir: ${oc.env:SCBFM_OUTPUT_DIR,${root_dir}/output}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${output_dir}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}

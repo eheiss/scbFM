@@ -17,26 +17,28 @@ from scipy import sparse
 # Paths
 # =========================
 
+ROOT_DIR = Path(os.environ.get("SCBFM_ROOT_DIR", Path(__file__).resolve().parents[2])).expanduser().resolve()
+
 GENE_LIST_PATH = Path(os.getenv(
     "SCBFM_GENE_LIST_PATH",
     str(Path(__file__).resolve().parent / "gene_list.txt"),
 ))
 GTEX_PATH = Path(os.getenv(
     "SCBFM_GTEX_H5AD",
-    "/cluster/work/boeva/eheiss/datasets/GTEx/gtex.h5ad",
+    str(ROOT_DIR / "datasets/GTEx/gtex.h5ad"),
 ))
 ARCHS4_PATH = Path(os.getenv(
     "SCBFM_ARCHS4_H5AD",
-    "/cluster/work/boeva/eheiss/datasets/ARCHS4/archs4.h5ad",
+    str(ROOT_DIR / "datasets/ARCHS4/archs4.h5ad"),
 ))
 ARCHS4_METADATA_PATH = Path(os.getenv(
     "SCBFM_ARCHS4_METADATA_H5",
-    "/cluster/work/boeva/eheiss/datasets/ARCHS4/human_gene_v2.latest.h5",
+    str(ROOT_DIR / "datasets/ARCHS4/human_gene_v2.latest.h5"),
 ))
 
 OUT_DIR = Path(os.getenv(
     "SCBFM_BULK_OUT_DIR",
-    "/cluster/work/boeva/eheiss/datasets/bulk",
+    str(ROOT_DIR / "datasets/bulk"),
 ))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -65,14 +67,14 @@ GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
 METADATA_TOKEN_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9._:-]{2,}")
 
 DOWNSTREAM_DATASET_PATHS = {
-    "TCGA": Path("/cluster/work/boeva/eheiss/datasets/TCGA/tcga.h5ad"),
-    "DepMap": Path("/cluster/work/boeva/eheiss/datasets/DepMap/depmap.h5ad"),
-    "GDSC": Path("/cluster/work/boeva/eheiss/datasets/GDSC/gdsc.h5ad"),
-    "DiSignAtlas": Path("/cluster/work/boeva/eheiss/datasets/DiSignAtlas/disignatlas.h5ad"),
+    "TCGA": ROOT_DIR / "datasets/TCGA/tcga.h5ad",
+    "DepMap": ROOT_DIR / "datasets/DepMap/depmap.h5ad",
+    "GDSC": ROOT_DIR / "datasets/GDSC/gdsc.h5ad",
+    "DiSignAtlas": ROOT_DIR / "datasets/DiSignAtlas/disignatlas.h5ad",
 }
 
 DOWNSTREAM_GCTX_PATHS = {
-    "LINCS": Path("/cluster/work/boeva/eheiss/datasets/LINCS/level5_beta_all_n1201944x12328.gctx"),
+    "LINCS": ROOT_DIR / "datasets/LINCS/level5_beta_all_n1201944x12328.gctx",
 }
 
 DOWNSTREAM_DATASET_TERMS = {

@@ -21,6 +21,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
+from paths import output_root
 from scipy import sparse
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -32,7 +33,6 @@ from utils import seed_all
 
 
 log = logging.getLogger(__name__)
-ROOT = Path(__file__).resolve().parents[3]
 
 
 def _strip_ensembl_version(value: str) -> str:
@@ -339,7 +339,7 @@ class ScGPTPreadaptRunner:
             raise FileNotFoundError("Missing scGPT resources: " + ", ".join(missing))
 
     def _output_dir(self) -> Path:
-        return ROOT / "output" / str(self.pretrain_cfg.model_name)
+        return output_root(self.cfg) / str(self.pretrain_cfg.model_name)
 
     def _output_path(self, suffix: str) -> Path:
         return self._output_dir() / f"{self.pretrain_cfg.model_name}_{suffix}"

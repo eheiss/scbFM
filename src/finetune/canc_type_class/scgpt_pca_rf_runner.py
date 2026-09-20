@@ -27,7 +27,8 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
-from finetune.canc_type_class.runner import ROOT, CancTypeClassRunner
+from finetune.canc_type_class.runner import CancTypeClassRunner
+from paths import REPO_ROOT, output_root
 from run_provenance import complete_run_metadata, start_run_metadata
 from utils import SequentialDistributedSampler, distributed_concat, seed_all
 
@@ -117,7 +118,7 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
         return model_key or "scgpt"
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"
@@ -171,7 +172,7 @@ class CancTypeClassScGPTPCARFRunner(CancTypeClassRunner):
                 ),
             },
             checkpoint_paths={self._model_key(): str(self._scgpt_paths()["checkpoint"])},
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     @staticmethod

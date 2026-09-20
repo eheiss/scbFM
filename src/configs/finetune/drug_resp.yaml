@@ -1,9 +1,9 @@
 # Pretrained model checkpoints (all four required)
 pretrained_model_paths:
-  pretrain_sc:
-  pretrain_bulk:
-  preadapt_sc:
-  preadapt_bulk:
+  pretrain_sc: ${output_dir}/pretrain_sc/pretrain_sc.pth
+  pretrain_bulk: ${output_dir}/pretrain_bulk/pretrain_bulk.pth
+  preadapt_sc: ${output_dir}/preadapt_sc/preadapt_sc.pth
+  preadapt_bulk: ${output_dir}/preadapt_bulk/preadapt_bulk.pth
 # Optional subset of pretrain_sc, pretrain_bulk, preadapt_sc, preadapt_bulk,
 # and random_init. Null preserves the standard run over all five models.
 model_keys:
@@ -12,9 +12,9 @@ model_keys:
 resume_completed_models: false
 
 # Data paths
-expression_data_path: /cluster/work/boeva/eheiss/datasets/GDSC/gdsc.h5ad
-ic50_data_path: /cluster/work/boeva/eheiss/datasets/GDSC/drug_response_prediction_IC50.csv
-drug_features_path: /cluster/work/boeva/eheiss/datasets/GDSC/drug_features.npz
+expression_data_path: ${root_dir}/datasets/GDSC/gdsc.h5ad
+ic50_data_path: ${root_dir}/datasets/GDSC/drug_response_prediction_IC50.csv
+drug_features_path: ${root_dir}/datasets/GDSC/drug_features.npz
 gene_info_path:             # only needed when expression_data_path is a CSV; defaults to scbFM/data/bulkformer_gene_info.csv
 
 # Column names in IC50 CSV
@@ -25,7 +25,7 @@ dataset_col: Dataset Version
 
 # Raw values are aligned here; the selected 1,199-gene sequence is quantile-binned
 # deterministically for each cell line.
-gene_list_path: ../data/gene_list.txt
+gene_list_path: ${repo_dir}/data/gene_list.txt
 preprocess: true
 # Fold-level gene selection ranks genes by median absolute deviation across
 # distinct training-fold cell lines and reuses the selected genes for evaluation.
@@ -51,7 +51,7 @@ cv_folds: 5
 # Canonical pair-to-fold assignments used by the completed benchmark runs.
 # Every drug-response runner joins this manifest by (cell line, drug) identity
 # and verifies the fingerprint before fitting or evaluating a model.
-cv_fold_manifest_path: /cluster/work/boeva/eheiss/datasets/GDSC/drug_response_prediction_IC50_drug_resp_6e86893658933c75_cv_folds.csv
+cv_fold_manifest_path: ${root_dir}/datasets/GDSC/drug_response_prediction_IC50_drug_resp_6e86893658933c75_cv_folds.csv
 expected_cv_fold_fingerprint: f57411b49dbb865525cbf41f3b5975891654bbda63fee005dcec78fdb31996a8
 epochs: 20
 batch_size: 4
@@ -111,14 +111,14 @@ pca_rf_n_jobs: -1
 # to BulkFormer's 20,010-gene vocabulary and its max-pooled gene representation
 # is combined with the same fixed KPGT drug vectors.
 bulkformer_variant: bulkformer_pca_rf
-bulkformer_repo_dir:
-bulkformer_checkpoint_path:
-bulkformer_expression_data_path:
-bulkformer_gene_info_path:
-bulkformer_graph_path:
-bulkformer_graph_weight_path:
-bulkformer_gene_emb_path:
-bulkformer_interested_gene_list_path:
+bulkformer_repo_dir: ${root_dir}/other/BulkFormer
+bulkformer_checkpoint_path: ${root_dir}/other/models/BulkFormer_147M.pt
+bulkformer_expression_data_path: ${root_dir}/datasets/GDSC/drug_response_expr_data.csv
+bulkformer_gene_info_path: ${root_dir}/other/BulkFormer/data/bulkformer_gene_info.csv
+bulkformer_graph_path: ${root_dir}/other/BulkFormer/data/G_tcga.pt
+bulkformer_graph_weight_path: ${root_dir}/other/BulkFormer/data/G_tcga_weight.pt
+bulkformer_gene_emb_path: ${root_dir}/other/BulkFormer/data/esm2_feature_concat.pt
+bulkformer_interested_gene_list_path: ${root_dir}/other/BulkFormer/data/interested_gene_list.pt
 bulkformer_expected_gene_count: 20010
 bulkformer_max_expected_expression: 30.0
 bulkformer_batch_size: 4
@@ -138,12 +138,12 @@ bulkformer_rf_n_jobs: -1
 # the scGPT vocabulary before training-fold selection of 1,199 genes.
 scgpt_variant: scgpt_pca_rf
 scgpt_model_key: scgpt
-scgpt_repo_dir:
-scgpt_model_dir:
-scgpt_args_filename: args.json
-scgpt_vocab_filename: vocab.json
-scgpt_checkpoint_filename: last_model.pt
-scgpt_gene_info_path:
+scgpt_repo_dir: ${root_dir}/other/scGPT
+scgpt_model_dir: ${root_dir}/other/models
+scgpt_args_filename: scgpt_args.json
+scgpt_vocab_filename: scgpt_vocab.json
+scgpt_checkpoint_filename: scgpt_best_model.pt
+scgpt_gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 scgpt_expected_source_gene_count: 13004
 scgpt_batch_size: 4
 scgpt_max_seq_len: 1200

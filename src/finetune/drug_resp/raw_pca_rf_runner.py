@@ -6,7 +6,7 @@ import numpy as np
 from scipy import sparse
 
 from finetune.drug_resp.pca_rf_runner import DrugRespPCARFRunner
-from finetune.drug_resp.runner import ROOT
+from paths import output_root
 
 
 class DrugRespRawPCARFRunner(DrugRespPCARFRunner):
@@ -22,7 +22,7 @@ class DrugRespRawPCARFRunner(DrugRespPCARFRunner):
         return variant
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

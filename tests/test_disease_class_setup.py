@@ -93,30 +93,6 @@ class DiseaseClassSetupTest(unittest.TestCase):
             "head_only_pretrain_bulk_10k",
         )
 
-    def test_submission_matrix_has_expected_jobs(self) -> None:
-        job_dir = REPO.parent / "job_files" / "finetune" / "disease_class"
-        expected = {
-            "disease_class_head_only-job.sh",
-            "disease_class_adapters-job.sh",
-            "disease_class_full_ft-job.sh",
-            "disease_class_pca_rf-job.sh",
-            "disease_class_raw_mlp_all_genes-job.sh",
-            "disease_class_raw_mlp_hvg1199-job.sh",
-            "disease_class_raw_pca_rf_all_genes-job.sh",
-            "disease_class_raw_pca_rf_hvg1199-job.sh",
-            "disease_class_bulkformer_pca_rf-job.sh",
-            "disease_class_scgpt_pca_rf-job.sh",
-            "disease_class_scgpt_preadapt_pca_rf-job.sh",
-        }
-        expected.update(
-            f"disease_class_head_only_pretrain_bulk_{size}-job.sh"
-            for size in ("10k", "50k", "100k", "200k", "400k")
-        )
-        observed = {path.name for path in job_dir.glob("*.sh")}
-        self.assertTrue(expected.issubset(observed))
-        self.assertFalse(
-            (job_dir / "disease_class_raw_mlp_hvg1199_deep-job.sh").exists()
-        )
 
 
 if __name__ == "__main__":

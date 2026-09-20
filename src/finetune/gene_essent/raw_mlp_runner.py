@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from paths import output_root
 from scipy import sparse
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -16,7 +17,6 @@ from torch.utils.data.distributed import DistributedSampler
 from finetune.canc_type_class.raw_mlp_runner import solve_hidden_dim
 from finetune.canc_type_class.runner import GroupedCosineWarmupUpdateScheduler
 from finetune.gene_essent.runner import (
-    ROOT,
     GeneEssentRunner,
 )
 from utils import SequentialDistributedSampler
@@ -92,7 +92,7 @@ class GeneEssentRawMLPRunner(GeneEssentRunner):
         return variant
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

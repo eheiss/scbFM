@@ -30,25 +30,18 @@ primary lung adenocarcinoma samples:
 On the cluster, the required layout is:
 
 ```text
-/cluster/work/boeva/eheiss/datasets/scgpt_single_cell/
-├── covid/
-│   ├── batch_covid_subsampled_train.h5ad
-│   └── batch_covid_subsampled_test.h5ad
-└── lung/
-    ├── sample_proc_lung_train.h5ad
-    └── sample_proc_lung_test.h5ad
+$SCBFM_ROOT_DIR/datasets/scgpt_single_cell/
+  covid/
+    batch_covid_subsampled_train.h5ad
+    batch_covid_subsampled_test.h5ad
+  lung/
+    sample_proc_lung_train.h5ad
+    sample_proc_lung_test.h5ad
 ```
 
-The preparation script reproduces this layout:
-
-```bash
-python3 -m pip install --user gdown
-cd /cluster/work/boeva/eheiss/job_files/finetune/batch_integration
-bash prepare_scgpt_single_cell_data.sh
-```
-
-Manual downloads are also valid as long as the four files are stored at the
-paths above. The jobs validate every path before allocating model runtime.
+Download the four processed files on an internet-connected machine, then
+transfer them into the layout above. Do not substitute a different split or
+unprocessed source matrix. The runners validate the files before evaluation.
 
 ## Shared protocol
 
@@ -111,31 +104,18 @@ deltas are retained. Outputs are under
 
 ## Environment and submission
 
-Build the separate image once from the definition file. This does not modify
-`scbfm.sif` or `scgpt.sif`:
+Build the separate image following [cluster setup](../../../cluster/README.md).
+This does not modify `scbfm.sif` or `scgpt.sif`. With the controlled and published
+checkpoints in place, submit the two independent tasks from the checkout:
 
 ```bash
-cd /cluster/work/boeva/eheiss/scbFM
-singularity build --fakeroot \
-  /cluster/customapps/biomed/boeva/eheiss/singularity/scbfm_single_cell.sif \
-  cluster/scbfm_single_cell.def
+export SCBFM_SIF="$SCBFM_ROOT_DIR/singularity/scbfm_single_cell.sif"
+bash cluster/submit.sh task=finetune.cell_type_annotation
+bash cluster/submit.sh task=finetune.batch_integration
 ```
 
-The cluster image used by the submission files is:
-
-```text
-/cluster/customapps/biomed/boeva/eheiss/singularity/scbfm_single_cell.sif
-```
-
-Submit the two independent tasks:
-
-```bash
-sbatch cell_type_annotation-job.sh
-sbatch batch_integration-job.sh
-```
-
-The primary catastrophic-forgetting quantity in both tasks is
-`preadapt_sc - pretrain_sc`. Negative annotation deltas indicate worse
-performance. Integration must be interpreted from `AvgBIO` and `AvgBATCH`
+Compare `preadapt_sc - pretrain_sc` for the controlled model and the analogous
+pre-adapted-minus-native scGPT scores for the published model. Negative
+annotation deltas indicate worse performance. Integration must be interpreted from `AvgBIO` and `AvgBATCH`
 together because batch mixing alone can reward biologically collapsed
 embeddings.

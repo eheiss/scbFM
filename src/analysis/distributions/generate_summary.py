@@ -15,11 +15,11 @@ from pathlib import Path
 import anndata as ad
 
 
-ROOT = Path(os.environ.get("SCBFM_CLUSTER_ROOT", "/cluster/work/boeva/eheiss"))
-SCBFM_ROOT = ROOT / "scbFM"
-SRC = SCBFM_ROOT / "src"
+SRC = Path(__file__).resolve().parents[2]
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from paths import output_root, workspace_root
 
 from analysis.distributions.common import (
     MODALITY_KEYS,
@@ -36,24 +36,27 @@ log = logging.getLogger("distribution_summary")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root-dir", type=Path, default=workspace_root())
     parser.add_argument(
         "--bulk-path",
         type=Path,
-        default=ROOT / "datasets" / "bulk" / "pretraining_bulk_RAW.h5ad",
     )
     parser.add_argument(
         "--sc-path",
         type=Path,
-        default=ROOT / "datasets" / "sc" / "pretraining_sc_RAW.h5ad",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "output" / "distributions",
     )
     parser.add_argument("--chunk-size", type=int, default=5_000_000)
     parser.add_argument("--validate-only", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    root_dir = args.root_dir.expanduser().resolve()
+    args.bulk_path = args.bulk_path or root_dir / "datasets" / "bulk" / "pretraining_bulk_RAW.h5ad"
+    args.sc_path = args.sc_path or root_dir / "datasets" / "sc" / "pretraining_sc_RAW.h5ad"
+    args.output_dir = args.output_dir or output_root({"root_dir": str(root_dir)}) / "distributions"
+    return args
 
 
 def main() -> None:

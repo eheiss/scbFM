@@ -9,10 +9,10 @@ Pipeline:
 
 Usage:
     python generate_drug_features.py \
-        --ic50_path /cluster/work/boeva/eheiss/datasets/GDSC/drug_response_prediction_IC50.csv \
-        --output_dir /cluster/work/boeva/eheiss/datasets/GDSC \
-        --kpgt_root /cluster/work/boeva/eheiss/other/KPGT \
-        --model_path /cluster/work/boeva/eheiss/other/KPGT/pretrained/base/base.pth
+        --ic50_path "$SCBFM_ROOT_DIR/datasets/GDSC/drug_response_prediction_IC50.csv" \
+        --output_dir "$SCBFM_ROOT_DIR/datasets/GDSC" \
+        --kpgt_root "$SCBFM_ROOT_DIR/other/KPGT" \
+        --model_path "$SCBFM_ROOT_DIR/other/KPGT/pretrained/base/base.pth"
 
 Output:
     {output_dir}/drug_features.npz

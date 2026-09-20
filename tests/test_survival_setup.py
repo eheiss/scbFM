@@ -1,4 +1,5 @@
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,7 +82,8 @@ class SurvivalSetupTest(unittest.TestCase):
         hazards = torch.tensor([0.0, np.log(2.0), 0.0], dtype=torch.float64)
         times = torch.tensor([2.0, 2.0, 1.0], dtype=torch.float64)
         events = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float64)
-        expected = -(np.log(1.0) + np.log(2.0) - 2.0 * np.log(4.0)) / 2.0
+        # The censored observation at time 1 is no longer at risk at time 2.
+        expected = -(np.log(1.0) + np.log(2.0) - 2.0 * np.log(3.0)) / 2.0
         self.assertAlmostEqual(
             float(cox_partial_log_likelihood(hazards, times, events)),
             expected,
@@ -268,7 +270,7 @@ class SurvivalSetupTest(unittest.TestCase):
                 pretrained_model_paths={"pretrain_bulk": "checkpoint.pth"},
             )
             self.assertEqual(
-                runner._get_checkpoint_paths(), {"pretrain_bulk": "checkpoint.pth"}
+                runner._get_checkpoint_paths(), {"pretrain_bulk": str(Path("checkpoint.pth").resolve())}
             )
 
     def test_survboard_bulkformer_accepts_signed_normalized_expression(self) -> None:
@@ -328,61 +330,16 @@ class SurvivalSetupTest(unittest.TestCase):
         self.assertNotIn("sksurv", survival_source)
         self.assertNotIn("from pycox", survival_source)
 
-    def test_submission_matrices_are_complete_without_deep_mlp(self) -> None:
-        job_root = REPO.parent / "job_files" / "finetune"
-        common_variants = {
-            "head_only",
-            "adapters",
-            "full_ft",
-            "pca_rf",
-            "raw_mlp_all_genes",
-            "raw_mlp_hvg1199",
-            "raw_pca_rf_all_genes",
-            "raw_pca_rf_hvg1199",
-            "bulkformer_pca_rf",
-            "scgpt_pca_rf",
-            "scgpt_preadapt_pca_rf",
-        }
-        for task in ("surv_pred", "surv_pred_binary", "surv_pred_survboard"):
-            names = {path.name for path in (job_root / task).glob("*.sh")}
-            expected = {f"{task}_{variant}-job.sh" for variant in common_variants}
-            expected.update(
-                f"{task}_head_only_pretrain_bulk_{size}-job.sh"
-                for size in ("10k", "50k", "100k", "200k", "400k")
-            )
-            self.assertTrue(expected.issubset(names), expected.difference(names))
-            self.assertFalse(any("deep" in name for name in names))
-
-        array_job = (
-            job_root
-            / "surv_pred_survboard"
-            / "surv_pred_survboard_head_only-job.sh"
-        ).read_text()
-        self.assertIn("#SBATCH --array=0-20", array_job)
-        common = (
-            job_root
-            / "surv_pred_survboard"
-            / "surv_pred_survboard_common.sh"
-        ).read_text()
-        self.assertIn("BLCA BRCA", common)
-        self.assertIn("GBM READ", common)
-
-        for task in ("surv_pred", "surv_pred_binary"):
-            bulkformer_job = (
-                job_root / task / f"{task}_bulkformer_pca_rf-job.sh"
-            ).read_text()
-            self.assertIn("#SBATCH --mem=192G", bulkformer_job)
-        self.assertIn("survboard_repeated_five_fold_cross_validation", common)
-        self.assertIn("n_outer_splits", common)
 
     def test_notebook_has_all_three_survival_comparison_sections(self) -> None:
-        notebook = (SRC / "analysis" / "task_performances.ipynb").read_text()
+        data = json.loads((SRC / "analysis" / "task_performances.ipynb").read_text())
+        notebook = "\n".join("".join(cell.get("source", [])) for cell in data["cells"])
         for task in ("surv_pred", "surv_pred_binary", "surv_pred_survboard"):
-            self.assertIn(f'task = \\\\"{task}\\\\"', notebook)
-        self.assertIn("Raw PCA+RF", notebook)
-        self.assertIn("Raw PCA+RF", notebook)
+            self.assertIn(f'task = "{task}"', notebook)
+        self.assertIn("raw_pca_rf_all_genes", notebook)
+        self.assertIn("raw_pca_rf_hvg1199", notebook)
         self.assertIn("head-only performance by pretraining size", notebook)
-        self.assertIn("Held-out loss", notebook)
+        self.assertIn("validation_loss", notebook)
 
 
 if __name__ == "__main__":

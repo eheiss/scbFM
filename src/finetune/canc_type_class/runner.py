@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from cancerfoundation_backbone import CancerFoundationBackbone
+from paths import REPO_ROOT, output_root
 from finetune.training_correctness import (
     add_optimizer_parameter_group,
     validate_backbone_checkpoint,
@@ -58,7 +59,6 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_COHORTS = ["BRCA", "BLCA", "GBM", "LGG", "LUAD", "UCEC"]
 TASK_NAME = "canc_type_class"
 CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
@@ -570,7 +570,7 @@ class CancTypeClassRunner:
 
     @staticmethod
     def _get_git_commit() -> str | None:
-        repo_dir = ROOT / "scbFM"
+        repo_dir = REPO_ROOT
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -610,7 +610,7 @@ class CancTypeClassRunner:
                 ),
             },
             checkpoint_paths=checkpoint_paths,
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     @staticmethod
@@ -717,7 +717,7 @@ class CancTypeClassRunner:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
         if gene_list_path:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
-        return ROOT / "scbFM" / "data" / "gene_list.txt"
+        return REPO_ROOT / "data" / "gene_list.txt"
 
     def _should_preprocess_input(self) -> bool:
         return bool(getattr(self.task_cfg, "preprocess", False))
@@ -1904,7 +1904,7 @@ class CancTypeClassRunner:
         self._write_csv(path, rows)
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._output_variant()
+        return output_root(self.cfg) / self.task_name / self._output_variant()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._output_variant()}"

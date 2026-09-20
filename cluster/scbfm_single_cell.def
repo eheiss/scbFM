@@ -1,5 +1,5 @@
 Bootstrap: localimage
-From: /cluster/customapps/biomed/boeva/eheiss/singularity/scgpt.sif
+From: scgpt.sif
 
 %labels
     Author Enrico Heiss

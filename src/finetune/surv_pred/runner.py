@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from paths import output_root
 
 import anndata as ad
 import hydra
@@ -50,7 +51,7 @@ class SurvPredRunner(SurvPredSurvBoardRunner):
         )
 
     def _task_output_dir(self) -> Path:
-        return Path(__file__).resolve().parents[4] / "output" / TASK_NAME / self._output_variant()
+        return output_root(self.cfg) / TASK_NAME / self._output_variant()
 
     def _output_prefix(self) -> str:
         return f"{TASK_NAME}_{self._output_variant()}"

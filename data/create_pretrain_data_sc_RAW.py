@@ -22,6 +22,8 @@ cellxgene_census = None
 # Paths
 # =========================
 
+ROOT_DIR = Path(os.environ.get("SCBFM_ROOT_DIR", Path(__file__).resolve().parents[2])).expanduser().resolve()
+
 GENE_LIST_PATH = Path(os.getenv(
     "SCBFM_GENE_LIST_PATH",
     str(Path(__file__).resolve().parent / "gene_list.txt"),
@@ -29,7 +31,7 @@ GENE_LIST_PATH = Path(os.getenv(
 
 OUT_DIR = Path(os.getenv(
     "SCBFM_SC_OUT_DIR",
-    "/cluster/work/boeva/eheiss/datasets/sc",
+    str(ROOT_DIR / "datasets/sc"),
 ))
 CHUNK_DIR = OUT_DIR / "census_RAW_chunks"
 MERGE_TMP_DIR = OUT_DIR / "RAW_merge_tmp"

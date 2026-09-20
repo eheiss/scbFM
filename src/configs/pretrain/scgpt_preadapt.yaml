@@ -2,12 +2,12 @@
 model_name: scgpt_preadapt
 data_paths: []
 
-scgpt_repo_dir:
-scgpt_model_dir:
+scgpt_repo_dir: ${root_dir}/other/scGPT
+scgpt_model_dir: ${root_dir}/other/models
 scgpt_args_filename: scgpt_args.json
 scgpt_vocab_filename: scgpt_vocab.json
 scgpt_checkpoint_filename: scgpt_best_model.pt
-gene_info_path: ../data/bulkformer_gene_info.csv
+gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 
 # The audit performs all compatibility and data checks without optimization.
 audit_only: false

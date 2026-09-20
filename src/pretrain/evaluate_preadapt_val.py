@@ -14,6 +14,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from runner import PreTrainRunner
+from paths import configure_paths
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class PreadaptValEvaluator(PreTrainRunner):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    configure_paths(cfg)
     results = PreadaptValEvaluator(cfg).run()
     if int(os.environ.get("RANK", 0)) == 0:
         print("\n=== Final Results ===")

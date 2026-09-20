@@ -35,7 +35,7 @@ mask_value: -1.0
 # data
 preprocess: false
 reindex_genes: true
-gene_list_path: ../data/gene_list.txt
+gene_list_path: ${repo_dir}/data/gene_list.txt
 validation_split: 0.05
 mask_prob: 0.15
 mask_ignore_values: []

@@ -101,20 +101,6 @@ def test_representation_order_matches_six_by_two_layout() -> None:
     assert len(REPRESENTATION_KEYS) == 12
 
 
-def test_cluster_jobs_only_cover_three_classification_tasks() -> None:
-    job_dir = REPO.parent / "job_files" / "analysis"
-    expected_jobs = {
-        "umap_pca_canc_type_class-job.sh",
-        "umap_pca_canc_type_class_33-job.sh",
-        "umap_pca_disease_class-job.sh",
-    }
-    observed_jobs = {path.name for path in job_dir.glob("umap_pca_*-job.sh")}
-
-    assert observed_jobs == expected_jobs
-    for job_name in expected_jobs:
-        job = (job_dir / job_name).read_text(encoding="utf-8")
-        assert "#SBATCH --gres=gpu:4" in job
-        assert "torchrun --standalone --nproc_per_node=4" in job
 
 
 def test_notebook_renders_one_six_by_two_figure_per_task_and_method() -> None:
@@ -127,7 +113,7 @@ def test_notebook_renders_one_six_by_two_figure_per_task_and_method() -> None:
         if cell.get("cell_type") == "code"
     )
 
-    assert "plt.subplots(6, 2" in source
+    assert "axes = np.empty((6, 2)" in source
     assert "('canc_type_class', 'Five-type cancer classification')" in source
     assert "('canc_type_class_33', '33-type cancer classification')" in source
     assert "('disease_class', 'Disease classification')" in source

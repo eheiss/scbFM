@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from paths import REPO_ROOT, output_root
 from scipy import sparse
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import KFold
@@ -52,7 +53,6 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[4]
 TASK_NAME = "gene_essent"
 CHECKPOINT_MODEL_KEYS = ("pretrain_sc", "pretrain_bulk", "preadapt_sc", "preadapt_bulk")
 RANDOM_INIT_MODEL_KEY = "random_init"
@@ -262,7 +262,7 @@ class GeneEssentRunner:
         )
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / TASK_NAME / self._output_variant()
+        return output_root(self.cfg) / TASK_NAME / self._output_variant()
 
     def _output_prefix(self) -> str:
         return f"{TASK_NAME}_{self._output_variant()}"
@@ -271,7 +271,7 @@ class GeneEssentRunner:
         gene_list_path = getattr(self.task_cfg, "gene_list_path", None)
         if gene_list_path:
             return Path(hydra.utils.to_absolute_path(str(gene_list_path)))
-        return ROOT / "scbFM" / "data" / "gene_list.txt"
+        return REPO_ROOT / "data" / "gene_list.txt"
 
     # ------------------------------------------------------------------
     # Runtime setup
@@ -327,7 +327,7 @@ class GeneEssentRunner:
 
     @staticmethod
     def _get_git_commit() -> str | None:
-        repo_dir = ROOT / "scbFM"
+        repo_dir = REPO_ROOT
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -370,7 +370,7 @@ class GeneEssentRunner:
                 "selected_gene_count": self.selected_gene_count,
             },
             checkpoint_paths=checkpoint_paths,
-            repo_dir=ROOT / "scbFM",
+            repo_dir=REPO_ROOT,
         )
 
     @staticmethod

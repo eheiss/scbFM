@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
+from paths import output_root
 from scipy import sparse
 from sklearn.metrics import (
     accuracy_score,
@@ -25,7 +26,6 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from finetune.canc_type_class.runner import (
-    ROOT,
     CancTypeClassRunner,
     GroupedCosineWarmupUpdateScheduler,
 )
@@ -152,7 +152,7 @@ class CancTypeClassRawMLPRunner(CancTypeClassRunner):
         return variant
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

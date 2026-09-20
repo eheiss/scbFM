@@ -261,32 +261,6 @@ class DeconvSetupTest(unittest.TestCase):
         )
         self.assertEqual(set(runner._get_checkpoint_paths()), {"pretrain_bulk"})
 
-    def test_submission_matrix_has_expected_jobs(self) -> None:
-        job_dir = REPO.parent / "job_files" / "finetune" / "deconv"
-        expected = {
-            "deconv_head_only-job.sh",
-            "deconv_adapters-job.sh",
-            "deconv_full_ft-job.sh",
-            "deconv_pca_rf-job.sh",
-            "deconv_raw_mlp_all_genes-job.sh",
-            "deconv_raw_mlp_hvg1199-job.sh",
-            "deconv_raw_pca_rf_all_genes-job.sh",
-            "deconv_raw_pca_rf_hvg1199-job.sh",
-            "deconv_bulkformer_pca_rf-job.sh",
-            "deconv_scgpt_pca_rf-job.sh",
-            "deconv_scgpt_preadapt_pca_rf-job.sh",
-        }
-        expected.update(
-            f"deconv_head_only_pretrain_bulk_{size}-job.sh"
-            for size in ("10k", "50k", "100k", "200k", "400k")
-        )
-        observed = {path.name for path in job_dir.glob("*.sh")}
-        self.assertTrue(expected.issubset(observed))
-        self.assertFalse((job_dir / "deconv_raw_mlp_hvg1199_deep-job.sh").exists())
-        for path in job_dir.glob("*-job.sh"):
-            text = path.read_text(encoding="utf-8")
-            requested_memory = int(text.split("#SBATCH --mem=", 1)[1].split("G", 1)[0])
-            self.assertGreaterEqual(requested_memory, 128, path.name)
 
 
 if __name__ == "__main__":

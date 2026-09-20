@@ -37,8 +37,13 @@ genes and raw expression using the 1,199 training-selected MAD genes.
 From the cluster repository root:
 
 ```bash
-cd /cluster/work/boeva/eheiss/job_files/analysis
-bash submit_umap_pca_jobs.sh
+export SCBFM_ROOT_DIR=/path/to/experiment-workspace
+export SCBFM_SIF="$SCBFM_ROOT_DIR/singularity/scbfm.sif"
+export SCBFM_ENTRYPOINT="$PWD/src/analysis/umap_pca/generate_coordinates.py"
+export SCBFM_NPROC=4
+for task in canc_type_class canc_type_class_33 disease_class; do
+  bash cluster/submit.sh --task "$task"
+done
 ```
 
 The three jobs are independent. Compact coordinate archives, provenance JSON,
@@ -46,4 +51,7 @@ and fold-1 training curves are written to `output/umap_pca`. Only that directory
 needs to be synced to the local machine; retained backbones do not.
 
 After syncing, run `src/analysis/umap_pca.ipynb` locally. It writes PDF and PNG
-versions of all six figures to `Master_Thesis/figures`.
+versions of all six figures to `output/figures`, or `SCBFM_FIGURE_DIR` when set.
+The core environment also needs `umap-learn` (included in the development
+requirements). Set Slurm memory/time limits for the dataset sizes in use; the
+launcher defaults are not a guarantee that every analysis fits.

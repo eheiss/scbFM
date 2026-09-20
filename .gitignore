@@ -1,0 +1,43 @@
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local environments and settings
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode/
+.idea/
+
+# Experiment inputs and generated artifacts (never source/reference CSVs)
+/datasets/
+/output/
+/outputs/
+/multirun/
+/other/
+/singularity/
+/job_output/
+*.sif
+*.h5ad
+*.h5
+*.hdf5
+*.gctx
+*.parquet
+*.pt
+*.pth
+*.npz
+*.npy
+slurm-*.out
+slurm-*.err

@@ -12,7 +12,8 @@ import pandas as pd
 from scipy import sparse
 
 
-DEFAULT_DATA_DIR = Path("/cluster/work/boeva/eheiss/datasets/ARCHS4")
+ROOT_DIR = Path(os.environ.get("SCBFM_ROOT_DIR", Path(__file__).resolve().parents[4])).expanduser().resolve()
+DEFAULT_DATA_DIR = ROOT_DIR / "datasets/ARCHS4"
 GENE_LIST_PATH = Path(os.getenv(
     "GENE_LIST_PATH",
     str(Path(__file__).resolve().parents[2] / "gene_list.txt"),

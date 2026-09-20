@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
+from paths import output_root
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
@@ -24,7 +25,6 @@ from cancerfoundation_backbone import CancerFoundationBackbone
 from finetune.canc_type_class.runner import (
     CHECKPOINT_MODEL_KEYS,
     RANDOM_INIT_MODEL_KEY,
-    ROOT,
     CancTypeClassRunner,
 )
 from utils import seed_all
@@ -52,7 +52,7 @@ class CancTypeClassPCARFRunner(CancTypeClassRunner):
         return variant or "pca_rf"
 
     def _task_output_dir(self) -> Path:
-        return ROOT / "output" / self.task_name / self._finetune_mode()
+        return output_root(self.cfg) / self.task_name / self._finetune_mode()
 
     def _output_prefix(self) -> str:
         return f"{self.task_name}_{self._finetune_mode()}"

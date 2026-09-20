@@ -39,7 +39,6 @@ class _FakeVocab:
 class ExternalBaselineAlignmentTest(unittest.TestCase):
     def test_aligned_bulkformer_benchmarks_use_paper_max_pooling(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        workspace = repository.parent
         task_names = ("canc_type_class", "canc_type_class_33", "drug_resp")
 
         for task_name in task_names:
@@ -48,14 +47,6 @@ class ExternalBaselineAlignmentTest(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertIn("bulkformer_aggregate_type: max", config)
 
-            job = (
-                workspace
-                / "job_files"
-                / "finetune"
-                / task_name
-                / f"{task_name}_bulkformer_pca_rf-job.sh"
-            ).read_text(encoding="utf-8")
-            self.assertIn(f"finetune.{task_name}.bulkformer_aggregate_type=max", job)
 
     def test_scgpt_retains_selected_zero_genes_for_cls_only_profile(self) -> None:
         dataset = _ScGPTExpressionDataset(
