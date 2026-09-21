@@ -203,7 +203,7 @@ class BatchIntegrationSetupTest(unittest.TestCase):
     def test_submission_files_use_official_scgpt_inputs(self) -> None:
         job = (REPO / "cluster" / "run-job.sh").read_text()
         config = (REPO / "src" / "configs" / "finetune" / "batch_integration.yaml").read_text()
-        prepare = (REPO / "src" / "finetune" / "batch_integration" / "README.md").read_text()
+        prepare = (REPO / "data" / "README.md").read_text()
         definition = (REPO / "cluster" / "scbfm_single_cell.def").read_text()
         self.assertIn("#SBATCH --gres=gpu:4", job)
         self.assertIn("SCBFM_SIF", job)

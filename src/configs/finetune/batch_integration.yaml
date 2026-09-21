@@ -46,9 +46,9 @@ scgpt_repo_dir: ${root_dir}/other/scGPT
 external_scgpt_models:
   scgpt:
     model_dir: ${root_dir}/other/models
-    args_filename: scgpt_args.json
-    vocab_filename: scgpt_vocab.json
-    checkpoint_filename: scgpt_best_model.pt
+    args_filename: args.json
+    vocab_filename: vocab.json
+    checkpoint_filename: best_model.pt
   scgpt_preadapt:
     model_dir: ${output_dir}/scgpt_preadapt
     args_filename: args.json

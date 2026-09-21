@@ -138,9 +138,9 @@ scgpt_variant: scgpt_pca_rf
 scgpt_model_key: scgpt
 scgpt_repo_dir: ${root_dir}/other/scGPT
 scgpt_model_dir: ${root_dir}/other/models
-scgpt_args_filename: scgpt_args.json
-scgpt_vocab_filename: scgpt_vocab.json
-scgpt_checkpoint_filename: scgpt_best_model.pt
+scgpt_args_filename: args.json
+scgpt_vocab_filename: vocab.json
+scgpt_checkpoint_filename: best_model.pt
 scgpt_gene_info_path: ${repo_dir}/data/bulkformer_gene_info.csv
 scgpt_expected_source_gene_count: 13004
 # Per-GPU inference batch size; the four-GPU job has global batch size 16.

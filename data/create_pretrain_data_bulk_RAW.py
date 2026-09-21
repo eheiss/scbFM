@@ -73,10 +73,6 @@ DOWNSTREAM_DATASET_PATHS = {
     "DiSignAtlas": ROOT_DIR / "datasets/DiSignAtlas/disignatlas.h5ad",
 }
 
-DOWNSTREAM_GCTX_PATHS = {
-    "LINCS": ROOT_DIR / "datasets/LINCS/level5_beta_all_n1201944x12328.gctx",
-}
-
 DOWNSTREAM_DATASET_TERMS = {
     "TCGA": (
         "TCGA",
@@ -98,12 +94,6 @@ DOWNSTREAM_DATASET_TERMS = {
         "DiSignAtlas",
         "Disease Signature Atlas",
     ),
-    "LINCS": (
-        "LINCS",
-        "L1000",
-        "Connectivity Map",
-        "CMAP",
-    ),
 }
 
 DOWNSTREAM_ID_PATTERNS = {
@@ -112,9 +102,6 @@ DOWNSTREAM_ID_PATTERNS = {
     ),
     "DepMap": (
         re.compile(r"\bACH-\d{6}\b"),
-    ),
-    "LINCS": (
-        re.compile(r"\b(?:LINCS|L1000)[-_:][A-Z0-9._:-]+\b"),
     ),
 }
 
@@ -133,20 +120,6 @@ def read_gene_list(path: Path) -> list[str]:
     if not duplicated.empty:
         raise ValueError(f"gene_list contains duplicate genes. First duplicates: {duplicated.index[:20].tolist()}")
     return [str(gene) for gene in genes]
-
-
-def decode_value(value) -> str:
-    if hasattr(value, "decode"):
-        return value.decode("utf-8", errors="ignore")
-    return str(value)
-
-
-def hdf5_string_values(dataset: h5py.Dataset) -> list[str]:
-    try:
-        values = dataset.asstr()[:]
-    except (AttributeError, TypeError):
-        values = dataset[:]
-    return [decode_value(value) for value in values]
 
 
 def gtex_donor_id(sample_id: str) -> str:
@@ -222,47 +195,11 @@ def metadata_tokens_from_adata(path: Path) -> set[str]:
     return tokens
 
 
-def metadata_tokens_from_gctx(path: Path) -> set[str]:
-    if not path.exists():
-        print(f"Downstream GCTX not found, skipping ID extraction: {path}")
-        return set()
-
-    print(f"Loading downstream sample IDs from {path}...")
-    candidate_names = {"ID", "SIG_ID", "SAMPLE_ID", "SAMPLE", "GEO_ID", "DISTIL_ID"}
-    tokens: set[str] = set()
-
-    with h5py.File(path, "r") as handle:
-        dataset_names: list[str] = []
-
-        def collect_candidate(name: str, obj) -> None:
-            if not isinstance(obj, h5py.Dataset):
-                return
-            upper_name = name.upper()
-            base_name = upper_name.rsplit("/", 1)[-1]
-            if "META/COL" in upper_name and base_name in candidate_names and obj.ndim == 1:
-                dataset_names.append(name)
-
-        handle.visititems(collect_candidate)
-
-        for dataset_name in dataset_names:
-            values = hdf5_string_values(handle[dataset_name])
-            for value in values:
-                token = normalize_metadata_token(value)
-                if len(token) >= 4:
-                    tokens.add(token)
-
-    print(f"Loaded {len(tokens)} downstream sample IDs from {path.name}")
-    return tokens
-
-
 def build_downstream_id_tokens() -> dict[str, set[str]]:
-    tokens = {
+    return {
         dataset: metadata_tokens_from_adata(path)
         for dataset, path in DOWNSTREAM_DATASET_PATHS.items()
     }
-    for dataset, path in DOWNSTREAM_GCTX_PATHS.items():
-        tokens.setdefault(dataset, set()).update(metadata_tokens_from_gctx(path))
-    return tokens
 
 
 def extract_downstream_matches(
