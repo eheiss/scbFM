@@ -43,7 +43,6 @@ OUT_DIR = Path(os.getenv(
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PRETRAIN_OUT = OUT_DIR / "pretraining_bulk_RAW.h5ad"
-PREADAPT_OUT = OUT_DIR / "preadapt_bulk_RAW.h5ad"
 SUMMARY_OUT = OUT_DIR / "bulk_summary_RAW.json"
 ARCHS4_GTEX_DONOR_HITS_OUT = OUT_DIR / "archs4_gtex_donor_hits_RAW.csv"
 ARCHS4_DOWNSTREAM_HITS_OUT = OUT_DIR / "archs4_downstream_hits_RAW.csv"
@@ -55,12 +54,19 @@ ARCHS4_DOWNSTREAM_HITS_OUT = OUT_DIR / "archs4_downstream_hits_RAW.csv"
 
 MIN_GENES = int(os.getenv("SCBFM_BULK_MIN_GENES", "200"))
 ROW_CHUNK_SIZE = int(os.getenv("SCBFM_BULK_ROW_CHUNK_SIZE", "1000"))
-RANDOM_SEED = int(os.getenv("SCBFM_BULK_RANDOM_SEED", "42"))
-PRETRAIN_FRACTION = float(os.getenv("SCBFM_BULK_PRETRAIN_FRACTION", "0.9"))
-EXPECTED_PRETRAIN_SAMPLES = int(os.getenv(
-    "SCBFM_BULK_EXPECTED_PRETRAIN_SAMPLES",
-    "642406",
-))
+_EXPECTED_SAMPLES_RAW = os.getenv("SCBFM_BULK_EXPECTED_SAMPLES", "").strip()
+EXPECTED_SAMPLES = int(_EXPECTED_SAMPLES_RAW) if _EXPECTED_SAMPLES_RAW else None
+ALL_BULK_SOURCES = ("GTEx", "ARCHS4")
+BULK_SOURCES = tuple(
+    source
+    for source in ALL_BULK_SOURCES
+    if source.upper() in {
+        token.strip().upper()
+        for token in os.getenv("SCBFM_BULK_SOURCES", "GTEx,ARCHS4").split(",")
+        if token.strip()
+    }
+)
+LEAKAGE_FILTER = os.getenv("SCBFM_BULK_LEAKAGE_FILTER", "1") != "0"
 COMPRESSION = os.getenv("SCBFM_BULK_H5AD_COMPRESSION", "lzf") or None
 
 GTEX_DONOR_PATTERN = re.compile(r"GTEX-[A-Z0-9]+")
@@ -259,27 +265,67 @@ def collect_min_gene_keep_mask(path: Path, min_genes: int) -> np.ndarray:
     return keep
 
 
-def load_archs4_singlecell_probability(n_obs: int) -> np.ndarray | None:
+def decode_hdf5_values(values) -> np.ndarray:
+    array = np.asarray(values)
+    if array.dtype.kind in {"S", "O"}:
+        return np.asarray(
+            [
+                value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+                for value in array.tolist()
+            ],
+            dtype=object,
+        )
+    return array
+
+
+def load_archs4_sample_metadata(
+    field: str,
+    obs_names: pd.Index,
+) -> np.ndarray | None:
+    """Read meta/samples/<field> from the ARCHS4 HDF5, row-aligned with archs4.h5ad.
+
+    archs4.h5ad is written in the same row order as the metadata HDF5 with
+    geo_accession as the obs index (see data/notebooks/archs4/archs4.py), so the
+    alignment is checked against meta/samples/geo_accession when available.
+    """
     if not ARCHS4_METADATA_PATH.exists():
-        print(
-            "ARCHS4 metadata HDF5 not found; skipping singlecellprobability filter: "
-            f"{ARCHS4_METADATA_PATH}"
-        )
+        print(f"ARCHS4 metadata HDF5 not found; cannot load {field!r}: {ARCHS4_METADATA_PATH}")
         return None
 
+    key = f"meta/samples/{field}"
     with h5py.File(ARCHS4_METADATA_PATH, "r") as handle:
-        if "meta/samples/singlecellprobability" not in handle:
-            print("ARCHS4 metadata HDF5 has no meta/samples/singlecellprobability; skipping filter.")
+        if key not in handle:
+            print(f"ARCHS4 metadata HDF5 has no {key}; cannot load {field!r}.")
             return None
-        sc_prob = np.asarray(handle["meta/samples/singlecellprobability"][:], dtype=np.float32)
+        values = decode_hdf5_values(handle[key][:])
+        accession_key = "meta/samples/geo_accession"
+        accessions = (
+            decode_hdf5_values(handle[accession_key][:]) if accession_key in handle else None
+        )
 
-    if len(sc_prob) != n_obs:
+    if len(values) != len(obs_names):
         print(
-            "ARCHS4 singlecellprobability length does not match archs4.h5ad rows; "
-            f"skipping filter ({len(sc_prob)} vs {n_obs})."
+            f"ARCHS4 {field} length does not match archs4.h5ad rows "
+            f"({len(values)} vs {len(obs_names)}); ignoring it."
         )
         return None
-    return sc_prob
+    if accessions is not None and not np.array_equal(
+        np.asarray(accessions, dtype=str),
+        np.asarray(obs_names.astype(str), dtype=str),
+    ):
+        print(
+            "WARNING: ARCHS4 metadata geo_accession differs from archs4.h5ad obs_names; "
+            f"aligning {field!r} by row position (as archs4.py writes rows in HDF5 order)."
+        )
+    return values
+
+
+def load_archs4_singlecell_probability(obs_names: pd.Index) -> np.ndarray | None:
+    values = load_archs4_sample_metadata("singlecellprobability", obs_names)
+    if values is None:
+        print("Skipping ARCHS4 singlecellprobability filter.")
+        return None
+    return np.asarray(values, dtype=np.float32)
 
 
 def scan_archs4_metadata_hits(
@@ -366,112 +412,113 @@ def scan_archs4_metadata_hits(
     return gtex_hit, downstream_hit
 
 
-def build_filtered_records(gene_list: list[str]) -> tuple[pd.DataFrame, dict]:
-    gtex_shape = validate_h5ad_gene_order(GTEX_PATH, gene_list)
-    archs4_shape = validate_h5ad_gene_order(ARCHS4_PATH, gene_list)
-    print(f"GTEx input: {gtex_shape[0]:,} samples x {gtex_shape[1]:,} genes")
-    print(f"ARCHS4 input: {archs4_shape[0]:,} samples x {archs4_shape[1]:,} genes")
-
+def load_gtex_donor_ids() -> set[str]:
+    if not GTEX_PATH.exists():
+        print(f"GTEx h5ad not found; skipping GTEx donor leakage scan: {GTEX_PATH}")
+        return set()
     gtex_backed = ad.read_h5ad(GTEX_PATH, backed="r")
     try:
         gtex_obs_names = gtex_backed.obs_names.astype(str).tolist()
     finally:
         gtex_backed.file.close()
-    gtex_donors = {gtex_donor_id(sample_id) for sample_id in gtex_obs_names}
-    print(f"GTEx donor IDs: {len(gtex_donors):,}")
+    donors = {gtex_donor_id(sample_id) for sample_id in gtex_obs_names}
+    print(f"GTEx donor IDs: {len(donors):,}")
+    return donors
 
-    downstream_id_tokens = build_downstream_id_tokens()
 
-    gtex_min_gene_keep = collect_min_gene_keep_mask(GTEX_PATH, MIN_GENES)
+def build_filtered_records(gene_list: list[str]) -> tuple[pd.DataFrame, dict]:
+    print(f"Bulk sources: {', '.join(BULK_SOURCES)}")
+    print(f"Leakage filter (GTEx donors + downstream benchmarks): {LEAKAGE_FILTER}")
 
-    archs4_backed = ad.read_h5ad(ARCHS4_PATH, backed="r")
-    try:
-        archs4_obs = archs4_backed.obs.copy()
-        archs4_n_obs = archs4_backed.n_obs
-    finally:
-        archs4_backed.file.close()
+    record_parts: list[pd.DataFrame] = []
+    filters: dict[str, dict] = {}
+    inputs: dict[str, str] = {}
 
-    archs4_min_gene_keep = collect_min_gene_keep_mask(ARCHS4_PATH, MIN_GENES)
-    sc_prob = load_archs4_singlecell_probability(archs4_n_obs)
-    if sc_prob is None:
-        archs4_bulk_like_keep = np.ones(archs4_n_obs, dtype=bool)
-        excluded_single_cell_like = 0
-    else:
-        archs4_bulk_like_keep = sc_prob < 0.5
-        excluded_single_cell_like = int((~archs4_bulk_like_keep).sum())
+    if "GTEx" in BULK_SOURCES:
+        gtex_shape = validate_h5ad_gene_order(GTEX_PATH, gene_list)
+        print(f"GTEx input: {gtex_shape[0]:,} samples x {gtex_shape[1]:,} genes")
+        gtex_min_gene_keep = collect_min_gene_keep_mask(GTEX_PATH, MIN_GENES)
+        gtex_idx = np.flatnonzero(gtex_min_gene_keep)
+        record_parts.append(
+            pd.DataFrame({"source": "GTEx", "source_order": 0, "row_idx": gtex_idx})
+        )
+        inputs["GTEx"] = str(GTEX_PATH)
+        filters["GTEx"] = {
+            "input_samples": int(gtex_shape[0]),
+            "kept_min_genes": int(gtex_min_gene_keep.sum()),
+            "final_kept": int(len(gtex_idx)),
+        }
 
-    archs4_gtex_hit, archs4_downstream_hit = scan_archs4_metadata_hits(
-        archs4_obs,
-        gtex_donors,
-        downstream_id_tokens,
-    )
+    if "ARCHS4" in BULK_SOURCES:
+        archs4_shape = validate_h5ad_gene_order(ARCHS4_PATH, gene_list)
+        print(f"ARCHS4 input: {archs4_shape[0]:,} samples x {archs4_shape[1]:,} genes")
 
-    archs4_keep = (
-        archs4_min_gene_keep
-        & archs4_bulk_like_keep
-        & ~archs4_gtex_hit
-        & ~archs4_downstream_hit
-    )
+        archs4_backed = ad.read_h5ad(ARCHS4_PATH, backed="r")
+        try:
+            archs4_obs = archs4_backed.obs.copy()
+            archs4_n_obs = archs4_backed.n_obs
+        finally:
+            archs4_backed.file.close()
 
-    gtex_idx = np.flatnonzero(gtex_min_gene_keep)
-    archs4_idx = np.flatnonzero(archs4_keep)
+        archs4_min_gene_keep = collect_min_gene_keep_mask(ARCHS4_PATH, MIN_GENES)
+        sc_prob = load_archs4_singlecell_probability(archs4_obs.index)
+        if sc_prob is None:
+            archs4_bulk_like_keep = np.ones(archs4_n_obs, dtype=bool)
+            excluded_single_cell_like = 0
+        else:
+            archs4_bulk_like_keep = sc_prob < 0.5
+            excluded_single_cell_like = int((~archs4_bulk_like_keep).sum())
 
-    records = pd.concat(
-        [
-            pd.DataFrame({"source": "GTEx", "source_order": 0, "row_idx": gtex_idx}),
-            pd.DataFrame({"source": "ARCHS4", "source_order": 1, "row_idx": archs4_idx}),
-        ],
-        ignore_index=True,
-    )
+        if LEAKAGE_FILTER:
+            gtex_donors = load_gtex_donor_ids()
+            downstream_id_tokens = build_downstream_id_tokens()
+            archs4_gtex_hit, archs4_downstream_hit = scan_archs4_metadata_hits(
+                archs4_obs,
+                gtex_donors,
+                downstream_id_tokens,
+            )
+        else:
+            print("Leakage filter disabled: keeping ARCHS4 samples that match GTEx donors or downstream datasets.")
+            archs4_gtex_hit = np.zeros(archs4_n_obs, dtype=bool)
+            archs4_downstream_hit = np.zeros(archs4_n_obs, dtype=bool)
+
+        archs4_keep = (
+            archs4_min_gene_keep
+            & archs4_bulk_like_keep
+            & ~archs4_gtex_hit
+            & ~archs4_downstream_hit
+        )
+        archs4_idx = np.flatnonzero(archs4_keep)
+        record_parts.append(
+            pd.DataFrame({"source": "ARCHS4", "source_order": 1, "row_idx": archs4_idx})
+        )
+        inputs["ARCHS4"] = str(ARCHS4_PATH)
+        inputs["ARCHS4_metadata"] = str(ARCHS4_METADATA_PATH)
+        filters["ARCHS4"] = {
+            "input_samples": int(archs4_shape[0]),
+            "kept_min_genes": int(archs4_min_gene_keep.sum()),
+            "excluded_single_cell_like": int(excluded_single_cell_like),
+            "excluded_gtex_donor_hits": int(archs4_gtex_hit.sum()),
+            "excluded_downstream_hits": int(archs4_downstream_hit.sum()),
+            "final_kept": int(len(archs4_idx)),
+        }
+        del archs4_obs
+        gc.collect()
+
+    records = pd.concat(record_parts, ignore_index=True)
 
     summary = {
         "gene_list_path": str(GENE_LIST_PATH),
         "n_genes": len(gene_list),
         "min_genes": MIN_GENES,
-        "random_seed": RANDOM_SEED,
-        "inputs": {
-            "GTEx": str(GTEX_PATH),
-            "ARCHS4": str(ARCHS4_PATH),
-            "ARCHS4_metadata": str(ARCHS4_METADATA_PATH),
-        },
-        "filters": {
-            "GTEx": {
-                "input_samples": int(gtex_shape[0]),
-                "kept_min_genes": int(gtex_min_gene_keep.sum()),
-                "final_kept": int(len(gtex_idx)),
-            },
-            "ARCHS4": {
-                "input_samples": int(archs4_shape[0]),
-                "kept_min_genes": int(archs4_min_gene_keep.sum()),
-                "excluded_single_cell_like": int(excluded_single_cell_like),
-                "excluded_gtex_donor_hits": int(archs4_gtex_hit.sum()),
-                "excluded_downstream_hits": int(archs4_downstream_hit.sum()),
-                "final_kept": int(len(archs4_idx)),
-            },
-        },
+        "bulk_sources": list(BULK_SOURCES),
+        "leakage_filter": LEAKAGE_FILTER,
+        "inputs": inputs,
+        "filters": filters,
         "post_filter_samples": int(len(records)),
     }
     print(f"Post-filter bulk samples: {len(records):,}")
     return records, summary
-
-
-def split_pretrain_preadapt_records(records: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not 0 < PRETRAIN_FRACTION < 1:
-        raise ValueError("SCBFM_BULK_PRETRAIN_FRACTION must be between 0 and 1.")
-    if len(records) < 2:
-        raise ValueError("Need at least two post-filter bulk samples to create pretraining/preadapt datasets.")
-
-    rng = np.random.default_rng(RANDOM_SEED)
-    shuffled_positions = rng.permutation(len(records))
-    n_pretrain = int(round(len(records) * PRETRAIN_FRACTION))
-    n_pretrain = min(max(n_pretrain, 1), len(records) - 1)
-
-    pretrain_positions = np.sort(shuffled_positions[:n_pretrain])
-    preadapt_positions = np.sort(shuffled_positions[n_pretrain:])
-
-    pretrain_records = records.iloc[pretrain_positions].copy().reset_index(drop=True)
-    preadapt_records = records.iloc[preadapt_positions].copy().reset_index(drop=True)
-    return pretrain_records, preadapt_records
 
 
 # =========================
@@ -482,16 +529,28 @@ def read_obs_for_records(records: pd.DataFrame, dataset_label: str) -> pd.DataFr
     source_paths = {"GTEx": GTEX_PATH, "ARCHS4": ARCHS4_PATH}
     obs_parts = []
 
-    for source in ("GTEx", "ARCHS4"):
+    for source in BULK_SOURCES:
         source_records = records[records["source"] == source]
         if source_records.empty:
             continue
         row_idx = source_records["row_idx"].to_numpy(dtype=np.int64)
         backed = ad.read_h5ad(source_paths[source], backed="r")
         try:
+            all_obs_names = backed.obs_names
             obs = backed.obs.iloc[row_idx].copy()
         finally:
             backed.file.close()
+        if source == "ARCHS4":
+            instrument_model = load_archs4_sample_metadata("instrument_model", all_obs_names)
+            if instrument_model is None:
+                print("WARNING: ARCHS4 instrument_model unavailable; filling 'unknown'.")
+                obs["instrument_model"] = "unknown"
+            else:
+                obs["instrument_model"] = pd.Series(
+                    np.asarray(instrument_model, dtype=object)[row_idx],
+                    index=obs.index,
+                    dtype=object,
+                ).fillna("unknown").replace("", "unknown")
         obs["dataset"] = source
         obs["bulk_source"] = source
         obs["bulk_dataset"] = dataset_label
@@ -686,7 +745,7 @@ def write_bulk_h5ad(
 
         output_row_offset = 0
         nnz_total = 0
-        for source in ("GTEx", "ARCHS4"):
+        for source in BULK_SOURCES:
             source_records = records[records["source"] == source]
             row_idx = source_records["row_idx"].to_numpy(dtype=np.int64)
             output_row_offset, nnz_total = stream_source_rows_to_output(
@@ -719,7 +778,7 @@ def write_bulk_h5ad(
         "shape": [int(len(records)), int(len(gene_list))],
         "source_counts": {
             source: int((records["source"] == source).sum())
-            for source in ("GTEx", "ARCHS4")
+            for source in BULK_SOURCES
         },
     }
 
@@ -731,64 +790,48 @@ def write_bulk_h5ad(
 def main() -> None:
     if ROW_CHUNK_SIZE <= 0:
         raise ValueError("SCBFM_BULK_ROW_CHUNK_SIZE must be positive.")
-    if EXPECTED_PRETRAIN_SAMPLES <= 0:
-        raise ValueError("SCBFM_BULK_EXPECTED_PRETRAIN_SAMPLES must be positive.")
+    if EXPECTED_SAMPLES is not None and EXPECTED_SAMPLES <= 0:
+        raise ValueError("SCBFM_BULK_EXPECTED_SAMPLES must be positive when set.")
+    requested_sources = {
+        token.strip().upper()
+        for token in os.getenv("SCBFM_BULK_SOURCES", "GTEx,ARCHS4").split(",")
+        if token.strip()
+    }
+    unknown_sources = requested_sources - {source.upper() for source in ALL_BULK_SOURCES}
+    if unknown_sources:
+        raise ValueError(
+            f"SCBFM_BULK_SOURCES contains unknown sources {sorted(unknown_sources)}; "
+            f"allowed: {list(ALL_BULK_SOURCES)}."
+        )
+    if not BULK_SOURCES:
+        raise ValueError("SCBFM_BULK_SOURCES selects no bulk source.")
 
     gene_list = read_gene_list(GENE_LIST_PATH)
     print(f"Gene list length: {len(gene_list):,}")
 
     records, summary = build_filtered_records(gene_list)
-    pretrain_records, preadapt_records = split_pretrain_preadapt_records(records)
-    if len(pretrain_records) != EXPECTED_PRETRAIN_SAMPLES:
+    if EXPECTED_SAMPLES is not None and len(records) != EXPECTED_SAMPLES:
         raise ValueError(
-            "The controlled benchmark requires exactly "
-            f"{EXPECTED_PRETRAIN_SAMPLES:,} bulk pretraining profiles, but the "
-            f"current filtering and split produced {len(pretrain_records):,}. "
-            "Resolve the source-data or filtering discrepancy before pretraining."
+            f"Expected exactly {EXPECTED_SAMPLES:,} bulk profiles (SCBFM_BULK_EXPECTED_SAMPLES), "
+            f"but filtering produced {len(records):,}."
         )
-    print(
-        "Writing post-filter bulk datasets: "
-        f"pretraining={len(pretrain_records):,} samples, "
-        f"preadapt={len(preadapt_records):,} samples "
-        f"(fraction={PRETRAIN_FRACTION:.3f}, seed={RANDOM_SEED})."
-    )
+    print(f"Writing post-filter bulk dataset: {len(records):,} samples (no pretrain/preadapt split).")
 
-    summary["pretrain_fraction"] = PRETRAIN_FRACTION
-    summary["preadapt_fraction"] = 1 - PRETRAIN_FRACTION
-    summary["expected_pretraining_samples"] = EXPECTED_PRETRAIN_SAMPLES
-
+    summary["expected_samples"] = EXPECTED_SAMPLES
     summary["pretraining_dataset"] = write_bulk_h5ad(
-        pretrain_records,
+        records,
         PRETRAIN_OUT,
         dataset_label="pretraining_bulk_RAW",
         gene_list=gene_list,
-    )
-    summary["preadapt_dataset"] = write_bulk_h5ad(
-        preadapt_records,
-        PREADAPT_OUT,
-        dataset_label="preadapt_bulk_RAW",
-        gene_list=gene_list,
-    )
-    summary["runner_split_note"] = (
-        "This script creates pretraining/preadapt datasets only. "
-        "The pretrain runner separately performs its own train/validation split "
-        "inside whichever dataset is passed through pretrain.data_path, using "
-        "pretrain.validation_split."
     )
 
     with open(SUMMARY_OUT, "w") as handle:
         json.dump(summary, handle, indent=2)
     print(f"Wrote summary: {SUMMARY_OUT}")
-    print("Final bulk dataset dimensions:")
     print(
-        "  pretraining_bulk_RAW.h5ad: "
+        "Final bulk dataset dimensions: "
         f"{summary['pretraining_dataset']['samples']:,} samples x "
         f"{summary['pretraining_dataset']['genes']:,} genes"
-    )
-    print(
-        "  preadapt_bulk_RAW.h5ad: "
-        f"{summary['preadapt_dataset']['samples']:,} samples x "
-        f"{summary['preadapt_dataset']['genes']:,} genes"
     )
 
 

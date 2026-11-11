@@ -55,7 +55,7 @@ CENSUS_VERSION = os.getenv("SCBFM_SC_CENSUS_VERSION", "2025-11-08")
 MIN_GENES = 200
 TARGET_TOTAL_CELLS = int(os.getenv(
     "SCBFM_SC_TARGET_TOTAL_CELLS",
-    os.getenv("SCBFM_TARGET_TOTAL_CELLS", "642406"),
+    os.getenv("SCBFM_TARGET_TOTAL_CELLS", "1000000"),
 ))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv(
     "SCBFM_SC_DOWNLOAD_CHUNK_SIZE",
@@ -92,6 +92,7 @@ OBS_SAMPLE_COLUMNS = [
     "cell_type",
     "tissue_general",
     "donor_id",
+    "assay",
 ]
 
 ATTEMPT_CHUNK_RE = re.compile(r"cellxgene_RAW_a(\d+)_chunk_\d+\.h5ad$")
@@ -119,8 +120,13 @@ def validate_cached_final(gene_list: list[str], target_total: int) -> bool:
     try:
         cached_gene_list = list(cached_final.var_names)
         cached_shape = tuple(map(int, cached_final.shape))
+        cached_has_assay = "assay" in cached_final.obs.columns
     finally:
         close_backed_adata(cached_final)
+
+    if not cached_has_assay:
+        print(f"Ignoring cached single-cell file at {FINAL_OUT}: obs has no 'assay' column.")
+        return False
 
     if cached_gene_list == gene_list and cached_shape == (target_total, len(gene_list)):
         print(
@@ -231,7 +237,9 @@ def write_sampling_plan(sampled_meta: pd.DataFrame, attempt_id: int) -> None:
 
 def load_sampled_meta(path: Path) -> pd.DataFrame:
     sampled_meta = pd.read_csv(path)
-    sampled_meta = normalize_obs_chunk(sampled_meta, OBS_SAMPLE_COLUMNS)
+    # Older cached plans may predate the "assay" column; it is fetched at download time anyway.
+    present_columns = [col for col in OBS_SAMPLE_COLUMNS if col in sampled_meta.columns]
+    sampled_meta = normalize_obs_chunk(sampled_meta, present_columns)
     return sampled_meta.sort_values("soma_joinid").reset_index(drop=True)
 
 
@@ -373,6 +381,7 @@ def reservoir_sample_cells(census, group_quotas: dict[tuple[str, str, str], int]
                 "tissue_general": row.tissue_general,
                 "cell_type": row.cell_type,
                 "donor_id": row.donor_id,
+                "assay": row.assay,
             }
             reservoir = reservoirs[group]
 
@@ -413,7 +422,17 @@ def download_and_preprocess_chunks(
 
         end = min(start + DOWNLOAD_CHUNK_SIZE, sampled_meta.shape[0])
         out_path = CHUNK_DIR / f"cellxgene_RAW_a{attempt_id:02d}_chunk_{chunk_id:05d}.h5ad"
+        cached_needs_refresh = False
         if RESUME and out_path.exists():
+            cached = ad.read_h5ad(out_path, backed="r")
+            cached_needs_refresh = "assay" not in cached.obs.columns
+            if cached_needs_refresh:
+                close_backed_adata(cached)
+                print(
+                    f"Cached chunk {out_path.name} has no 'assay' column; "
+                    "redownloading it (same sampled cells)."
+                )
+        if RESUME and out_path.exists() and not cached_needs_refresh:
             cached = ad.read_h5ad(out_path, backed="r")
             cached_gene_list = list(cached.var_names)
             if cached_gene_list != gene_list:

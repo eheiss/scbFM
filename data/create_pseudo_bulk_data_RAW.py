@@ -58,6 +58,17 @@ TARGET_AUDIT_OUT = OUT_DIR / "broad_cell_type_audit.csv"
 DATASET_AUDIT_OUT = OUT_DIR / "pseudo_bulk_dataset_audit.json"
 METADATA_MANIFEST_OUT = OUT_DIR / "metadata_audit_manifest.json"
 SAMPLING_MANIFEST_OUT = OUT_DIR / "sampling_plan_manifest.json"
+MEMBERSHIP_OUT = OUT_DIR / "pseudo_bulk_source_membership.csv"
+
+MERGE_INTO_SC = os.getenv("SCBFM_PSEUDO_MERGE_INTO_SC", "0") == "1"
+SC_FINAL_H5AD = Path(os.getenv(
+    "SCBFM_SC_FINAL_H5AD",
+    str(ROOT_DIR / "datasets/sc/pretraining_sc_RAW.h5ad"),
+))
+MERGED_SC_OUT = Path(os.getenv(
+    "SCBFM_PSEUDO_MERGED_SC_OUT",
+    str(SC_FINAL_H5AD.parent / "pretraining_sc_with_pb_sources_RAW.h5ad"),
+))
 
 
 # =========================
@@ -91,6 +102,11 @@ WRITE_CHUNK_SIZE = int(os.getenv("SCBFM_PSEUDO_WRITE_CHUNK_SIZE", "500"))
 MERGE_BATCH_SIZE = int(os.getenv("SCBFM_PSEUDO_MERGE_BATCH_SIZE", "8"))
 RANDOM_SEED = int(os.getenv("SCBFM_PSEUDO_RANDOM_SEED", "2021"))
 GENERATOR_SCHEMA_VERSION = 2
+# Version of the *output* layout (obs columns such as pseudobulk_id / assay and the
+# membership sidecars). Kept separate from GENERATOR_SCHEMA_VERSION so that bumping it
+# invalidates cached chunks/final outputs without discarding cached plans or downloads.
+OUTPUT_SCHEMA_VERSION = 3
+PSEUDOBULK_ID_BASE = 1
 
 DEFAULT_CELL_ONTOLOGY_RELEASE = "2026-06-08"
 CELL_ONTOLOGY_RELEASE = os.getenv(
@@ -160,6 +176,10 @@ OBS_CONTEXT_COLUMNS = [
     "cell_type",
     "cell_type_ontology_term_id",
 ]
+
+# Per-cell technical metadata carried along with source cells but not part of the
+# context key, so it does not affect eligibility or sampling.
+OBS_SOURCE_COLUMNS = OBS_CONTEXT_COLUMNS + ["assay"]
 
 
 # =========================
@@ -489,6 +509,8 @@ def source_chunk_matches(
         try:
             if "soma_joinid" not in cached.obs:
                 return False, "missing soma_joinid metadata", shape
+            if "assay" not in cached.obs:
+                return False, "missing assay metadata", shape
             observed_ids = cached.obs["soma_joinid"].to_numpy(dtype=np.int64)
         finally:
             close_backed_adata(cached)
@@ -547,6 +569,33 @@ def validate_cached_final(gene_list: list[str]) -> bool:
     summary_schema = int(summary.get("generator_schema_version", -1))
     summary_ontology = str(summary.get("cell_ontology_sha256", ""))
     summary_targets = str(summary.get("broad_cell_type_config_sha256", ""))
+    summary_output_schema = int(summary.get("output_schema_version", -1))
+    if (
+        summary_output_schema != OUTPUT_SCHEMA_VERSION
+        or not MEMBERSHIP_OUT.exists()
+        or not SOURCE_ADATA_OUT.exists()
+    ):
+        print(
+            f"Ignoring cached pseudo-bulk final at {FINAL_OUT}: output schema "
+            f"differs (found {summary_output_schema}, expected {OUTPUT_SCHEMA_VERSION}) "
+            "or membership/source outputs are missing."
+        )
+        return False
+    try:
+        source_backed = ad.read_h5ad(SOURCE_ADATA_OUT, backed="r")
+        try:
+            source_annotated = "pseudobulk_ids" in source_backed.obs.columns
+        finally:
+            close_backed_adata(source_backed)
+    except Exception as exc:
+        source_annotated = False
+        print(f"Cannot inspect {SOURCE_ADATA_OUT}: {exc}")
+    if not source_annotated:
+        print(
+            f"Ignoring cached pseudo-bulk final at {FINAL_OUT}: {SOURCE_ADATA_OUT} "
+            "has no pseudobulk tracking columns."
+        )
+        return False
     if (
         summary_target != TARGET_PSEUDO_BULKS
         or summary_cells != CELLS_PER_PSEUDO_BULK
@@ -713,6 +762,9 @@ def store_proportion_metadata(adata: ad.AnnData, proportion_column_map: dict[str
     )
     adata.uns["cell_type_proportion_columns"] = proportion_column_map
     adata.uns["deconv_generator_schema_version"] = GENERATOR_SCHEMA_VERSION
+    adata.uns["output_schema_version"] = OUTPUT_SCHEMA_VERSION
+    adata.uns["pseudobulk_id_base"] = PSEUDOBULK_ID_BASE
+    adata.uns["pseudobulk_source_membership_csv"] = MEMBERSHIP_OUT.name
     adata.uns["cell_ontology_release"] = CELL_ONTOLOGY_RELEASE
     adata.uns["cell_ontology_sha256"] = sha256_file(CELL_ONTOLOGY_PATH)
     adata.uns["broad_cell_type_config_sha256"] = sha256_file(
@@ -805,7 +857,9 @@ def load_sample_plan_from_csv(
 
 def load_sampled_source_meta(path: Path) -> pd.DataFrame:
     sampled_meta = pd.read_csv(path)
-    return normalize_obs_chunk(sampled_meta, OBS_CONTEXT_COLUMNS)
+    # Older cached CSVs predate the "assay" column; it is fetched again at download time.
+    present_columns = [col for col in OBS_SOURCE_COLUMNS if col in sampled_meta.columns]
+    return normalize_obs_chunk(sampled_meta, present_columns)
 
 
 RETRYABLE_CENSUS_ERROR_MARKERS = (
@@ -1163,8 +1217,8 @@ def reservoir_sample_source_cells(
         key: [] for key, quota in reservoir_quotas.items() if quota > 0
     }
 
-    for table in iter_obs_tables(census, OBS_CONTEXT_COLUMNS):
-        df = normalize_obs_chunk(table.to_pandas(), OBS_CONTEXT_COLUMNS)
+    for table in iter_obs_tables(census, OBS_SOURCE_COLUMNS):
+        df = normalize_obs_chunk(table.to_pandas(), OBS_SOURCE_COLUMNS)
         df = map_obs_to_broad_cell_types(
             df,
             parents=parents,
@@ -1193,6 +1247,7 @@ def reservoir_sample_source_cells(
                 "cell_type": str(row.cell_type),
                 "source_cell_type": str(row.source_cell_type),
                 "cell_type_ontology_term_id": str(row.cell_type_ontology_term_id),
+                "assay": str(row.assay),
             }
             reservoir = reservoirs[quota_key]
             if len(reservoir) < quota:
@@ -1255,7 +1310,7 @@ def download_source_cells(
             organism=ORGANISM,
             obs_coords=obs_coords,
             var_coords=var_coords,
-            obs_column_names=OBS_CONTEXT_COLUMNS,
+            obs_column_names=OBS_SOURCE_COLUMNS,
             var_column_names=["feature_id"],
         )
         t1 = time.perf_counter()
@@ -1271,7 +1326,7 @@ def download_source_cells(
 
         adata = adata[:, reorder_idx].copy()
         adata.var_names = pd.Index(gene_list, dtype=str)
-        adata.obs = normalize_obs_chunk(adata.obs.reset_index(drop=True), OBS_CONTEXT_COLUMNS)
+        adata.obs = normalize_obs_chunk(adata.obs.reset_index(drop=True), OBS_SOURCE_COLUMNS)
         broad_by_joinid = meta_chunk.set_index("soma_joinid")["cell_type"].astype(str)
         source_by_joinid = meta_chunk.set_index("soma_joinid")["source_cell_type"].astype(str)
         adata.obs["source_cell_type"] = adata.obs["soma_joinid"].map(source_by_joinid)
@@ -1463,6 +1518,108 @@ def aggregate_selected_cached_cells(
     return sparse.csr_matrix(aggregated)
 
 
+def membership_path_for(chunk_path: Path) -> Path:
+    return chunk_path.with_name(
+        chunk_path.name.replace("pseudo_bulk_RAW_chunk_", "pseudo_bulk_membership_chunk_")
+    ).with_suffix(".csv")
+
+
+def pseudo_bulk_chunk_reusable(out_path: Path, gene_list: list[str], chunk_id: int) -> bool:
+    if not (RESUME and out_path.exists()):
+        return False
+    if not validate_cached_h5ad(
+        out_path,
+        gene_list,
+        label=f"pseudo-bulk chunk {chunk_id}",
+        allow_recompute=True,
+    ):
+        return False
+    if not membership_path_for(out_path).exists():
+        print(f"Pseudo-bulk chunk {chunk_id}: membership sidecar missing; regenerating.")
+        return False
+    cached = ad.read_h5ad(out_path, backed="r")
+    try:
+        columns = set(cached.obs.columns)
+    finally:
+        close_backed_adata(cached)
+    if not {"pseudobulk_id", "assay"}.issubset(columns):
+        print(f"Pseudo-bulk chunk {chunk_id}: missing pseudobulk_id/assay columns; regenerating.")
+        return False
+    return True
+
+
+def build_pseudo_bulk_obs_record(
+    row: dict[str, object],
+    pseudobulk_id: int,
+    assay_label: str,
+    proportion_column_map: dict[str, str],
+) -> dict[str, object]:
+    obs_record = {
+        "pseudobulk_id": int(pseudobulk_id),
+        "dataset": "CELLxGENE_Census_pseudobulk",
+        "dataset_id": row["dataset_id"],
+        "donor_id": row["donor_id"],
+        TISSUE_COLUMN: row[TISSUE_COLUMN],
+        "assay": assay_label,
+        "total_cells": int(row["total_cells"]),
+        "n_cell_types": int(row["n_cell_types"]),
+    }
+    for column in proportion_column_map.values():
+        obs_record[column] = np.float32(0.0)
+    for cell_type, proportion in row["cell_type_proportions"].items():
+        obs_record[proportion_column_map[cell_type]] = np.float32(proportion)
+    return obs_record
+
+
+def selection_membership(
+    pseudobulk_id: int,
+    selected_soma_ids: np.ndarray,
+) -> pd.DataFrame:
+    unique_ids, counts = np.unique(np.asarray(selected_soma_ids, dtype=np.int64), return_counts=True)
+    return pd.DataFrame(
+        {
+            "pseudobulk_id": np.full(unique_ids.shape[0], int(pseudobulk_id), dtype=np.int64),
+            "soma_joinid": unique_ids,
+            "n_times": counts.astype(np.int64),
+        }
+    )
+
+
+def write_pseudo_bulk_chunk(
+    out_path: Path,
+    chunk_plan: list[dict[str, object]],
+    aggregated_rows: list[sparse.csr_matrix],
+    obs_records: list[dict[str, object]],
+    membership_parts: list[pd.DataFrame],
+    proportion_column_map: dict[str, str],
+    gene_list: list[str],
+) -> bool:
+    raw_chunk = sparse.vstack(aggregated_rows, format="csr")
+    x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
+    x_raw, keep_mask = filter_raw_dense_block(x_dense)
+    if x_raw.shape[0] == 0:
+        return False
+
+    obs = pd.DataFrame(
+        obs_records,
+        index=pd.Index([row["sample_id"] for row in chunk_plan], name="sample_id"),
+    )
+    obs = obs.iloc[np.where(keep_mask)[0]].copy()
+    var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
+
+    out = ad.AnnData(X=sparse.csr_matrix(x_raw), obs=obs, var=var)
+    out.var_names = pd.Index(gene_list, dtype=str)
+    store_proportion_metadata(out, proportion_column_map)
+
+    membership = pd.concat(membership_parts, ignore_index=True)
+    kept_ids = set(obs["pseudobulk_id"].astype(np.int64).tolist())
+    membership = membership[membership["pseudobulk_id"].isin(kept_ids)]
+
+    write_h5ad_compat(out, out_path)
+    membership.to_csv(membership_path_for(out_path), index=False)
+    return True
+
+
 def generate_pseudo_bulk_chunks(
     source_adata: ad.AnnData,
     plan_rows: list[dict[str, object]],
@@ -1470,29 +1627,27 @@ def generate_pseudo_bulk_chunks(
     gene_list: list[str],
 ) -> list[Path]:
     source_index = build_source_row_index(source_adata)
+    source_soma_ids = source_adata.obs["soma_joinid"].to_numpy(dtype=np.int64)
+    source_assays = source_adata.obs["assay"].astype(str).to_numpy()
     chunk_paths: list[Path] = []
 
     for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
         end = min(start + WRITE_CHUNK_SIZE, len(plan_rows))
         chunk_plan = plan_rows[start:end]
         out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
-        if RESUME and out_path.exists():
-            if validate_cached_h5ad(
-                out_path,
-                gene_list,
-                label=f"pseudo-bulk chunk {chunk_id}",
-                allow_recompute=True,
-            ):
-                print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
-                chunk_paths.append(out_path)
-                continue
+        if pseudo_bulk_chunk_reusable(out_path, gene_list, chunk_id):
+            print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
+            chunk_paths.append(out_path)
+            continue
 
         rng = np.random.default_rng(RANDOM_SEED + chunk_id)
 
         aggregated_rows: list[sparse.csr_matrix] = []
         obs_records: list[dict[str, object]] = []
+        membership_parts: list[pd.DataFrame] = []
 
-        for row in chunk_plan:
+        for offset, row in enumerate(chunk_plan):
+            pseudobulk_id = start + offset + PSEUDOBULK_ID_BASE
             context_key = (row["dataset_id"], row["donor_id"], row[TISSUE_COLUMN])
             selected_row_indices: list[np.ndarray] = []
 
@@ -1509,38 +1664,25 @@ def generate_pseudo_bulk_chunks(
             aggregated = source_adata.X[selected_indices].sum(axis=0)
             aggregated_rows.append(sparse.csr_matrix(aggregated))
 
-            obs_record = {
-                "dataset": "CELLxGENE_Census_pseudobulk",
-                "dataset_id": row["dataset_id"],
-                "donor_id": row["donor_id"],
-                TISSUE_COLUMN: row[TISSUE_COLUMN],
-                "total_cells": int(row["total_cells"]),
-                "n_cell_types": int(row["n_cell_types"]),
-            }
-            for column in proportion_column_map.values():
-                obs_record[column] = np.float32(0.0)
-            for cell_type, proportion in row["cell_type_proportions"].items():
-                obs_record[proportion_column_map[cell_type]] = np.float32(proportion)
-            obs_records.append(obs_record)
+            assay_label = ";".join(sorted(set(source_assays[selected_indices].tolist())))
+            obs_records.append(
+                build_pseudo_bulk_obs_record(row, pseudobulk_id, assay_label, proportion_column_map)
+            )
+            membership_parts.append(
+                selection_membership(pseudobulk_id, source_soma_ids[selected_indices])
+            )
 
-        raw_chunk = sparse.vstack(aggregated_rows, format="csr")
-        x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
-        x_raw, keep_mask = filter_raw_dense_block(x_dense)
-        if x_raw.shape[0] == 0:
+        if not write_pseudo_bulk_chunk(
+            out_path,
+            chunk_plan,
+            aggregated_rows,
+            obs_records,
+            membership_parts,
+            proportion_column_map,
+            gene_list,
+        ):
             continue
-
-        obs = pd.DataFrame(obs_records, index=pd.Index([row["sample_id"] for row in chunk_plan], name="sample_id"))
-        obs = obs.iloc[np.where(keep_mask)[0]].copy()
-        var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
-
-        out = ad.AnnData(X=sparse.csr_matrix(x_raw), obs=obs, var=var)
-        out.var_names = pd.Index(gene_list, dtype=str)
-        store_proportion_metadata(out, proportion_column_map)
-
-        write_h5ad_compat(out, out_path)
         chunk_paths.append(out_path)
-
-        del raw_chunk, x_dense, x_raw, obs, var, out
         gc.collect()
 
         print(
@@ -1551,6 +1693,22 @@ def generate_pseudo_bulk_chunks(
     return chunk_paths
 
 
+def load_cached_source_obs(source_chunk_paths: list[Path]) -> pd.DataFrame:
+    obs_parts: list[pd.DataFrame] = []
+    for path in source_chunk_paths:
+        backed = ad.read_h5ad(path, backed="r")
+        try:
+            obs_parts.append(
+                backed.obs[["soma_joinid", "assay"]].reset_index(drop=True).copy()
+            )
+        finally:
+            close_backed_adata(backed)
+    obs = pd.concat(obs_parts, ignore_index=True)
+    obs["soma_joinid"] = obs["soma_joinid"].astype(np.int64)
+    obs["assay"] = obs["assay"].astype(str)
+    return obs
+
+
 def generate_pseudo_bulk_chunks_from_cached_sources(
     sampled_meta: pd.DataFrame,
     source_chunk_paths: list[Path],
@@ -1559,28 +1717,29 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
     gene_list: list[str],
 ) -> list[Path]:
     source_index = build_source_chunk_index(sampled_meta, source_chunk_paths)
+    # Chunks are written from sampled_meta in order, so absolute row
+    # chunk_id * DOWNLOAD_CHUNK_SIZE + row_idx addresses this table.
+    source_obs = load_cached_source_obs(source_chunk_paths)
+    source_soma_ids = source_obs["soma_joinid"].to_numpy(dtype=np.int64)
+    source_assays = source_obs["assay"].to_numpy()
     chunk_paths: list[Path] = []
 
     for chunk_id, start in enumerate(range(0, len(plan_rows), WRITE_CHUNK_SIZE)):
         end = min(start + WRITE_CHUNK_SIZE, len(plan_rows))
         chunk_plan = plan_rows[start:end]
         out_path = CHUNK_DIR / f"pseudo_bulk_RAW_chunk_{chunk_id:05d}.h5ad"
-        if RESUME and out_path.exists():
-            if validate_cached_h5ad(
-                out_path,
-                gene_list,
-                label=f"pseudo-bulk chunk {chunk_id}",
-                allow_recompute=True,
-            ):
-                print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
-                chunk_paths.append(out_path)
-                continue
+        if pseudo_bulk_chunk_reusable(out_path, gene_list, chunk_id):
+            print(f"Pseudo-bulk chunk {chunk_id}: reusing existing {out_path.name}")
+            chunk_paths.append(out_path)
+            continue
 
         rng = np.random.default_rng(RANDOM_SEED + chunk_id)
         aggregated_rows: list[sparse.csr_matrix] = []
         obs_records: list[dict[str, object]] = []
+        membership_parts: list[pd.DataFrame] = []
 
-        for row in chunk_plan:
+        for offset, row in enumerate(chunk_plan):
+            pseudobulk_id = start + offset + PSEUDOBULK_ID_BASE
             context_key = (row["dataset_id"], row["donor_id"], row[TISSUE_COLUMN])
             selected_locations: list[tuple[int, int]] = []
 
@@ -1597,41 +1756,29 @@ def generate_pseudo_bulk_chunks_from_cached_sources(
                 aggregate_selected_cached_cells(source_chunk_paths, selected_locations)
             )
 
-            obs_record = {
-                "dataset": "CELLxGENE_Census_pseudobulk",
-                "dataset_id": row["dataset_id"],
-                "donor_id": row["donor_id"],
-                TISSUE_COLUMN: row[TISSUE_COLUMN],
-                "total_cells": int(row["total_cells"]),
-                "n_cell_types": int(row["n_cell_types"]),
-            }
-            for column in proportion_column_map.values():
-                obs_record[column] = np.float32(0.0)
-            for cell_type, proportion in row["cell_type_proportions"].items():
-                obs_record[proportion_column_map[cell_type]] = np.float32(proportion)
-            obs_records.append(obs_record)
+            absolute_rows = np.asarray(
+                [chunk * DOWNLOAD_CHUNK_SIZE + row_idx for chunk, row_idx in selected_locations],
+                dtype=np.int64,
+            )
+            assay_label = ";".join(sorted(set(source_assays[absolute_rows].tolist())))
+            obs_records.append(
+                build_pseudo_bulk_obs_record(row, pseudobulk_id, assay_label, proportion_column_map)
+            )
+            membership_parts.append(
+                selection_membership(pseudobulk_id, source_soma_ids[absolute_rows])
+            )
 
-        raw_chunk = sparse.vstack(aggregated_rows, format="csr")
-        x_dense = raw_chunk.toarray().astype(np.float32, copy=False)
-        x_raw, keep_mask = filter_raw_dense_block(x_dense)
-        if x_raw.shape[0] == 0:
-            continue
-
-        obs = pd.DataFrame(
+        if not write_pseudo_bulk_chunk(
+            out_path,
+            chunk_plan,
+            aggregated_rows,
             obs_records,
-            index=pd.Index([row["sample_id"] for row in chunk_plan], name="sample_id"),
-        )
-        obs = obs.iloc[np.where(keep_mask)[0]].copy()
-        var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
-
-        out = ad.AnnData(X=sparse.csr_matrix(x_raw), obs=obs, var=var)
-        out.var_names = pd.Index(gene_list, dtype=str)
-        store_proportion_metadata(out, proportion_column_map)
-
-        write_h5ad_compat(out, out_path)
+            membership_parts,
+            proportion_column_map,
+            gene_list,
+        ):
+            continue
         chunk_paths.append(out_path)
-
-        del raw_chunk, x_dense, x_raw, obs, var, out
         gc.collect()
 
         print(
@@ -1687,6 +1834,193 @@ def merge_chunks(
     gc.collect()
     print(f"Saved {FINAL_OUT}")
     return FINAL_OUT
+
+
+def write_membership_table(chunk_paths: list[Path]) -> pd.DataFrame:
+    parts = [pd.read_csv(membership_path_for(path)) for path in chunk_paths]
+    membership = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+        columns=["pseudobulk_id", "soma_joinid", "n_times"]
+    )
+    membership = membership.astype(
+        {"pseudobulk_id": np.int64, "soma_joinid": np.int64, "n_times": np.int64}
+    ).sort_values(["pseudobulk_id", "soma_joinid"]).reset_index(drop=True)
+    membership.to_csv(MEMBERSHIP_OUT, index=False)
+    print(
+        f"Wrote pseudo-bulk source membership: {MEMBERSHIP_OUT} "
+        f"({membership.shape[0]} rows, {membership['soma_joinid'].nunique()} distinct cells)"
+    )
+    return membership
+
+
+def load_source_adata_from_chunks(
+    source_chunk_paths: list[Path],
+    gene_list: list[str],
+) -> ad.AnnData:
+    source_chunks = [ad.read_h5ad(path) for path in source_chunk_paths]
+    source_adata = ad.concat(
+        source_chunks,
+        axis=0,
+        join="outer",
+        merge="same",
+        index_unique=None,
+    )
+    source_adata.obs_names_make_unique()
+    source_adata.var_names = pd.Index(gene_list, dtype=str)
+    del source_chunks
+    gc.collect()
+    return source_adata
+
+
+def annotate_source_cells(
+    source_adata: ad.AnnData,
+    membership: pd.DataFrame,
+) -> ad.AnnData:
+    """Add pseudobulk tracking columns to the source cells and write SOURCE_ADATA_OUT.
+
+    A source cell can contribute to many pseudobulks, so the full list is kept in
+    ``pseudobulk_ids`` (";"-joined, ascending). ``pseudobulk_id`` holds the smallest
+    ID (0 = sampled but never used) and ``n_pseudobulks`` the number of pseudobulks.
+    """
+    ids_by_cell = (
+        membership.sort_values(["soma_joinid", "pseudobulk_id"])
+        .groupby("soma_joinid", sort=False)["pseudobulk_id"]
+        .agg(list)
+    )
+    soma_ids = source_adata.obs["soma_joinid"].astype(np.int64)
+    id_lists = soma_ids.map(ids_by_cell)
+    id_lists = id_lists.apply(lambda value: value if isinstance(value, list) else [])
+
+    obs = source_adata.obs.copy()
+    obs["pseudobulk_ids"] = id_lists.apply(
+        lambda ids: ";".join(str(int(i)) for i in ids)
+    ).astype(object).to_numpy()
+    obs["pseudobulk_id"] = id_lists.apply(
+        lambda ids: int(ids[0]) if ids else 0
+    ).astype(np.int64).to_numpy()
+    obs["n_pseudobulks"] = id_lists.apply(len).astype(np.int64).to_numpy()
+    obs["is_pseudobulk_source"] = True
+    source_adata.obs = obs
+    source_adata.uns["pseudobulk_id_base"] = PSEUDOBULK_ID_BASE
+    source_adata.uns["pseudobulk_source_membership_csv"] = MEMBERSHIP_OUT.name
+    source_adata.uns["output_schema_version"] = OUTPUT_SCHEMA_VERSION
+
+    used = int((obs["n_pseudobulks"] > 0).sum())
+    print(
+        f"Annotated {source_adata.n_obs} source cells with pseudobulk IDs "
+        f"({used} used in at least one kept pseudobulk)."
+    )
+    write_h5ad_compat(source_adata, SOURCE_ADATA_OUT)
+    print(f"Saved annotated source cells at {SOURCE_ADATA_OUT}")
+    return source_adata
+
+
+SC_TRACKING_COLUMNS = ("pseudobulk_id", "pseudobulk_ids", "n_pseudobulks", "is_pseudobulk_source")
+
+
+def merge_source_cells_into_sc(
+    source_adata: ad.AnnData,
+    gene_list: list[str],
+) -> dict[str, object]:
+    """Merge pseudobulk source cells into the single-cell pretraining file.
+
+    Rows are deduplicated by soma_joinid; when a cell is in both files, the source
+    row (with its pseudobulk IDs) is kept. Non-source cells get pseudobulk_id = 0.
+    The result goes to MERGED_SC_OUT so the original single-cell file stays intact.
+    """
+    if not SC_FINAL_H5AD.exists():
+        raise FileNotFoundError(
+            f"SCBFM_PSEUDO_MERGE_INTO_SC=1 requires the single-cell file at {SC_FINAL_H5AD} "
+            "(set SCBFM_SC_FINAL_H5AD)."
+        )
+    missing_tracking = [col for col in SC_TRACKING_COLUMNS if col not in source_adata.obs]
+    if missing_tracking:
+        raise ValueError(f"Source cells are missing tracking columns {missing_tracking}.")
+
+    print(f"Merging {source_adata.n_obs} source cells into {SC_FINAL_H5AD}")
+    sc_adata = ad.read_h5ad(SC_FINAL_H5AD)
+    if list(sc_adata.var_names.astype(str)) != gene_list:
+        raise ValueError(f"{SC_FINAL_H5AD} is not aligned to the current gene list.")
+
+    sc_obs = sc_adata.obs.copy()
+    if "assay" not in sc_obs:
+        print(f"WARNING: {SC_FINAL_H5AD} has no 'assay' column; filling 'unknown'.")
+        sc_obs["assay"] = "unknown"
+    sc_obs["broad_cell_type"] = ""
+    sc_obs["pseudobulk_id"] = np.int64(0)
+    sc_obs["pseudobulk_ids"] = ""
+    sc_obs["n_pseudobulks"] = np.int64(0)
+    sc_obs["is_pseudobulk_source"] = False
+    sc_adata.obs = sc_obs
+
+    src_obs = source_adata.obs
+    harmonized = pd.DataFrame(
+        {
+            "soma_joinid": src_obs["soma_joinid"].astype(np.int64).to_numpy(),
+            "dataset_id": src_obs["dataset_id"].astype(str).to_numpy(),
+            "cell_type": src_obs["source_cell_type"].astype(str).to_numpy(),
+            "tissue_general": src_obs[TISSUE_COLUMN].astype(str).to_numpy(),
+            "donor_id": src_obs["donor_id"].astype(str).to_numpy(),
+            "assay": src_obs["assay"].astype(str).to_numpy(),
+            "dataset": "CELLxGENE_Census",
+            "broad_cell_type": src_obs["cell_type"].astype(str).to_numpy(),
+            "pseudobulk_id": src_obs["pseudobulk_id"].astype(np.int64).to_numpy(),
+            "pseudobulk_ids": src_obs["pseudobulk_ids"].astype(str).to_numpy(),
+            "n_pseudobulks": src_obs["n_pseudobulks"].astype(np.int64).to_numpy(),
+            "is_pseudobulk_source": True,
+        },
+        index=pd.Index(
+            [f"cellxgene:{int(sid)}" for sid in src_obs["soma_joinid"]],
+            name="cell_id",
+        ),
+    )
+    source_for_merge = ad.AnnData(
+        X=sparse.csr_matrix(source_adata.X, dtype=np.float32),
+        obs=harmonized,
+        var=pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id")),
+    )
+
+    source_ids = set(harmonized["soma_joinid"].tolist())
+    sc_soma = sc_adata.obs["soma_joinid"].astype(np.int64)
+    duplicate_mask = sc_soma.isin(source_ids).to_numpy()
+    n_duplicates = int(duplicate_mask.sum())
+    sc_kept = sc_adata[~duplicate_mask].copy()
+    del sc_adata
+    gc.collect()
+
+    merged = ad.concat(
+        [sc_kept, source_for_merge],
+        axis=0,
+        join="outer",
+        merge="same",
+        index_unique=None,
+    )
+    merged.var = pd.DataFrame(index=pd.Index(gene_list, name="ensembl_id"))
+    merged.obs_names_make_unique()
+    merged.obs["pseudobulk_id"] = merged.obs["pseudobulk_id"].astype(np.int64)
+    merged.obs["n_pseudobulks"] = merged.obs["n_pseudobulks"].astype(np.int64)
+    merged.obs["is_pseudobulk_source"] = merged.obs["is_pseudobulk_source"].astype(bool)
+    merged.obs["pseudobulk_ids"] = merged.obs["pseudobulk_ids"].fillna("").astype(str)
+    merged.uns["pseudobulk_id_base"] = PSEUDOBULK_ID_BASE
+    merged.uns["pseudobulk_source_membership_csv"] = str(MEMBERSHIP_OUT)
+
+    stats = {
+        "merged_sc_h5ad": str(MERGED_SC_OUT),
+        "sc_input_h5ad": str(SC_FINAL_H5AD),
+        "sc_cells_kept": int(sc_kept.n_obs),
+        "sc_duplicates_replaced_by_source": n_duplicates,
+        "source_cells_added": int(source_for_merge.n_obs),
+        "merged_cells": int(merged.n_obs),
+    }
+    MERGED_SC_OUT.parent.mkdir(parents=True, exist_ok=True)
+    write_h5ad_compat(merged, MERGED_SC_OUT)
+    print(
+        f"Saved merged single-cell file {MERGED_SC_OUT}: {merged.n_obs} cells "
+        f"({stats['sc_cells_kept']} sc + {stats['source_cells_added']} source; "
+        f"{n_duplicates} duplicates replaced)"
+    )
+    del merged, sc_kept, source_for_merge
+    gc.collect()
+    return stats
 
 
 def audit_pseudobulk_dataset(
@@ -1805,7 +2139,15 @@ def main() -> None:
     print(f"Download-only mode: {DOWNLOAD_ONLY}")
     print(f"Transfer-validation-only mode: {VALIDATE_TRANSFER_ONLY}")
 
+    print(f"Merge source cells into single-cell file: {MERGE_INTO_SC}")
+
     if RESUME and validate_cached_final(gene_list):
+        if MERGE_INTO_SC:
+            annotated_sources = ad.read_h5ad(SOURCE_ADATA_OUT)
+            merge_stats = merge_source_cells_into_sc(annotated_sources, gene_list)
+            summary = read_json(SUMMARY_OUT)
+            summary["merged_single_cell"] = merge_stats
+            write_json(summary, SUMMARY_OUT)
         return
 
     missing_genes = read_json(MISSING_GENES_OUT) if RESUME and MISSING_GENES_OUT.exists() else None
@@ -1854,8 +2196,15 @@ def main() -> None:
             label="aligned source cells",
             allow_recompute=True,
         ):
-            print(f"Reusing downloaded source cells from {SOURCE_ADATA_OUT}")
             source_adata = ad.read_h5ad(SOURCE_ADATA_OUT)
+            if "assay" not in source_adata.obs:
+                print(
+                    f"Ignoring cached source cells at {SOURCE_ADATA_OUT}: no 'assay' column "
+                    "(source chunks will be revalidated/redownloaded)."
+                )
+                source_adata = None
+            else:
+                print(f"Reusing downloaded source cells from {SOURCE_ADATA_OUT}")
         else:
             source_adata = None
     else:
@@ -2043,6 +2392,13 @@ def main() -> None:
     final_path = merge_chunks(chunk_paths, proportion_column_map, gene_list)
     dataset_audit = audit_pseudobulk_dataset(final_path, proportion_column_map)
 
+    membership = write_membership_table(chunk_paths)
+    if source_adata is None:
+        source_adata = load_source_adata_from_chunks(source_chunk_paths, gene_list)
+    source_adata = annotate_source_cells(source_adata, membership)
+    del membership
+    gc.collect()
+
     final = ad.read_h5ad(final_path, backed="r")
     try:
         print(f"Final pseudo-bulk dataset dimensions: {final.n_obs} samples x {final.n_vars} genes")
@@ -2051,6 +2407,8 @@ def main() -> None:
 
     summary = {
         "generator_schema_version": GENERATOR_SCHEMA_VERSION,
+        "output_schema_version": OUTPUT_SCHEMA_VERSION,
+        "pseudobulk_id_base": PSEUDOBULK_ID_BASE,
         "census_version": CENSUS_VERSION,
         "organism": ORGANISM,
         "cell_ontology_release": CELL_ONTOLOGY_RELEASE,
@@ -2097,6 +2455,9 @@ def main() -> None:
         "resume_enabled": RESUME,
         "offline_enabled": OFFLINE,
     }
+    summary["outputs"]["source_membership_csv"] = str(MEMBERSHIP_OUT)
+    if MERGE_INTO_SC:
+        summary["merged_single_cell"] = merge_source_cells_into_sc(source_adata, gene_list)
     write_json(summary, SUMMARY_OUT)
 
 

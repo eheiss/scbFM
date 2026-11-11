@@ -34,7 +34,7 @@ contents or order of the controlled vocabulary breaks checkpoint compatibility.
 | `notebooks/create_gene_list.ipynb` | Audit source vocabularies and regenerate the shared gene list |
 | `notebooks/archs4/archs4.py` and `archs4_2.py` | Convert ARCHS4 HDF5 data to the required AnnData intermediate |
 | `preprocess_raw_h5ad.py` | Apply gene reindexing, filtering, and expression binning to a raw-count AnnData file |
-| `create_pretrain_data_bulk_RAW.py` | Build leakage-filtered bulk pretraining and pre-adaptation corpora |
+| `create_pretrain_data_bulk_RAW.py` | Build the (optionally leakage-filtered) bulk pretraining corpus |
 | `create_pretrain_data_sc_RAW.py` | Sample the matched scRNA-seq pretraining corpus from CELLxGENE Census |
 | `create_pseudo_bulk_data_RAW.py` | Generate the cell-type deconvolution dataset |
 | `generate_drug_features.py` | Generate KPGT molecular representations for GDSC drugs |
@@ -77,14 +77,22 @@ python data/create_pretrain_data_bulk_RAW.py
 ```
 
 The builder combines GTEx and ARCHS4, excludes GTEx donors and downstream
-dataset identifiers from the pretraining source, and writes:
+dataset identifiers from the pretraining source, and writes a single file (no
+pretrain/preadapt split):
 
 ```text
 datasets/bulk/pretraining_bulk_RAW.h5ad
-datasets/bulk/preadapt_bulk_RAW.h5ad
 ```
 
-It also writes leakage-audit artifacts and validates the expected corpus size.
+ARCHS4 rows carry `instrument_model` from the ARCHS4 metadata HDF5. Options:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SCBFM_BULK_SOURCES` | `GTEx,ARCHS4` | Set to `ARCHS4` to build an ARCHS4-only corpus |
+| `SCBFM_BULK_LEAKAGE_FILTER` | `1` | Set to `0` to keep GTEx-donor and TCGA/DepMap/GDSC/DiSignAtlas matches |
+| `SCBFM_BULK_EXPECTED_SAMPLES` | unset | If set, fail unless exactly this many profiles survive |
+
+With the leakage filter on, it also writes leakage-audit artifacts.
 Input and output paths can be overridden through the `SCBFM_GTEX_H5AD`,
 `SCBFM_ARCHS4_H5AD`, `SCBFM_ARCHS4_METADATA_H5`, and `SCBFM_BULK_OUT_DIR`
 environment variables defined near the top of the script.
@@ -144,6 +152,20 @@ active broad cell types. Candidate ontology mappings are defined in
 `deconv_broad_cell_types.csv`; support filters and the generated manifest define
 the final target set. Mixture proportions use a symmetric Dirichlet draw,
 followed by multinomial cell sampling and minimum-support checks.
+
+Each pseudobulk has a 1-based `pseudobulk_id`. The cells summed into each one are
+listed in `pseudo_bulk_source_membership.csv` (`pseudobulk_id`, `soma_joinid`,
+`n_times`), and `sampled_source_cells_aligned.h5ad` gets the per-cell columns
+`pseudobulk_ids` (";"-joined), `pseudobulk_id` (smallest ID, 0 if unused),
+`n_pseudobulks` and `is_pseudobulk_source`. Source cells are reused across
+pseudobulks, so one cell usually has several IDs.
+
+To also merge the source cells into the single-cell corpus, set
+`SCBFM_PSEUDO_MERGE_INTO_SC=1`. This reads `SCBFM_SC_FINAL_H5AD` (default
+`datasets/sc/pretraining_sc_RAW.h5ad`) and writes `SCBFM_PSEUDO_MERGED_SC_OUT`
+(default `datasets/sc/pretraining_sc_with_pb_sources_RAW.h5ad`). Rows are
+deduplicated by `soma_joinid` with the source row winning, and non-source cells
+get `pseudobulk_id = 0`.
 
 ## Drug features
 
